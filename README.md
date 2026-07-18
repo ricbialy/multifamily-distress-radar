@@ -1,6 +1,7 @@
 # Multifamily Distress Radar — collector starter
 
-Version 0.13 adds a persistent acquisition workflow with lead stages, assignee,
+Version 0.14 adds authorized contact-research CSV import with source,
+verification status, and confidence. Version 0.13 added a persistent acquisition workflow with lead stages, assignee,
 follow-up date, disposition, notes, dashboard export, and CRM CSV export.
 Version 0.12 added conservative owner-name normalization, target portfolio
 property/unit totals, and related-property evidence. Version 0.11 added durable,
@@ -109,6 +110,15 @@ distress-radar export-leads --city hialeah_fl \
 
 Stages are `new`, `researching`, `qualified`, `contacted`, `negotiating`,
 `won`, `lost`, and `paused`.
+
+Contact research must come from an authorized business/public-record source.
+Import columns such as folio, contact name, role, email, phone, mailing address,
+verification status, confidence (0–1), and source URL:
+
+```bash
+distress-radar import-contacts --city hialeah_fl \
+  --input exports/authorized_contacts.csv
+```
 
 ## Delinquent-tax import
 

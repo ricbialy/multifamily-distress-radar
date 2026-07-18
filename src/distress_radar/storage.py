@@ -11,7 +11,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from distress_radar.models import CodeCase, OfficialRecord, PropertyRecord, RawDocument, TaxDelinquency
+from distress_radar.models import CodeCase, OfficialRecord, PropertyContact, PropertyRecord, RawDocument, TaxDelinquency
 
 
 def utc_now() -> str:
@@ -199,6 +199,18 @@ class RadarStore:
             );
             CREATE INDEX IF NOT EXISTS idx_property_leads_follow_up
                 ON property_leads(city_slug, stage, next_follow_up_date);
+            CREATE TABLE IF NOT EXISTS property_contacts (
+                city_slug TEXT NOT NULL, source_name TEXT NOT NULL,
+                source_record_id TEXT NOT NULL, folio TEXT NOT NULL,
+                contact_name TEXT NOT NULL, role TEXT, email TEXT, phone TEXT,
+                verification_status TEXT NOT NULL, confidence REAL NOT NULL,
+                source_url TEXT NOT NULL, normalized_json TEXT NOT NULL,
+                payload_hash TEXT NOT NULL, first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                PRIMARY KEY(city_slug,source_name,source_record_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_property_contacts_folio
+                ON property_contacts(city_slug,folio);
             """
         )
         self.connection.commit()
@@ -491,6 +503,41 @@ class RadarStore:
             writer.writeheader()
             writer.writerows({key: row[key] for key in fields} for row in rows)
         return len(rows)
+
+    def upsert_property_contacts(self, records: tuple[PropertyContact, ...]) -> UpsertStats:
+        counts = {"new": 0, "changed": 0, "unchanged": 0}
+        for record in records:
+            normalized = json.dumps(record.stable_dict(), sort_keys=True, separators=(",", ":"))
+            digest = hashlib.sha256(normalized.encode()).hexdigest()
+            key = (record.city_slug, record.source_name, record.source_record_id)
+            current = self.connection.execute(
+                "SELECT payload_hash,first_seen_at FROM property_contacts WHERE city_slug=? AND source_name=? AND source_record_id=?", key
+            ).fetchone()
+            if current is None:
+                counts["new"] += 1; first_seen = record.fetched_at
+            elif current["payload_hash"] != digest:
+                counts["changed"] += 1; first_seen = current["first_seen_at"]
+            else:
+                counts["unchanged"] += 1; first_seen = current["first_seen_at"]
+            self.connection.execute(
+                """INSERT INTO property_contacts
+                (city_slug,source_name,source_record_id,folio,contact_name,role,email,phone,verification_status,confidence,source_url,normalized_json,payload_hash,first_seen_at,last_seen_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(city_slug,source_name,source_record_id) DO UPDATE SET
+                folio=excluded.folio,contact_name=excluded.contact_name,role=excluded.role,email=excluded.email,
+                phone=excluded.phone,verification_status=excluded.verification_status,confidence=excluded.confidence,
+                source_url=excluded.source_url,normalized_json=excluded.normalized_json,payload_hash=excluded.payload_hash,
+                last_seen_at=excluded.last_seen_at""",
+                (*key, record.folio, record.contact_name, record.role, record.email, record.phone,
+                 record.verification_status, record.confidence, record.source_url, normalized, digest, first_seen, record.fetched_at),
+            )
+        self.connection.commit()
+        return UpsertStats(**counts)
+
+    def property_contacts(self, city_slug: str, folio: str) -> list[dict[str, Any]]:
+        return [json.loads(row["normalized_json"]) for row in self.connection.execute(
+            "SELECT normalized_json FROM property_contacts WHERE city_slug=? AND folio=? ORDER BY confidence DESC,contact_name",
+            (city_slug, folio),
+        )]
 
     def _insert_change(
         self,
@@ -1158,6 +1205,7 @@ class RadarStore:
             ]
             events = self.official_record_events(city_slug, folio)
             lead = self.get_property_lead(city_slug, folio)
+            contacts = self.property_contacts(city_slug, folio)
             owner_key = str(prop.get("owner_canonical_key") or "")
             related = [
                 {"folio": item.get("folio"), "address": item.get("address"), "unit_count": item.get("unit_count")}
@@ -1173,6 +1221,7 @@ class RadarStore:
                     "clerk_queried": bool(events),
                     "related_properties": related,
                     "lead": lead,
+                    "contacts": contacts,
                 }
             )
         output.parent.mkdir(parents=True, exist_ok=True)

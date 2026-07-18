@@ -13,6 +13,7 @@ from distress_radar.storage import RadarStore
 from distress_radar.pipeline import run_refresh
 from distress_radar.tax_import import import_tax_csv
 from distress_radar.alerts import deliver_webhook
+from distress_radar.contact_import import import_contacts_csv
 
 
 def _collector(config: CityConfig) -> TylerEnerGovCollector:
@@ -122,6 +123,10 @@ def build_parser() -> argparse.ArgumentParser:
     export_leads.add_argument("--city", required=True)
     export_leads.add_argument("--database", type=Path, default=Path("data/radar.sqlite3"))
     export_leads.add_argument("--output", type=Path, required=True)
+    contacts = subparsers.add_parser("import-contacts", help="Import authorized contact research CSV")
+    contacts.add_argument("--city", required=True)
+    contacts.add_argument("--database", type=Path, default=Path("data/radar.sqlite3"))
+    contacts.add_argument("--input", type=Path, required=True)
     return parser
 
 
@@ -208,6 +213,13 @@ def main(argv: list[str] | None = None) -> None:
             with RadarStore(args.database) as store:
                 count = store.export_leads_csv(config.slug, args.output)
             print(f"Exported {count} acquisition leads to {args.output}")
+            return
+
+        if args.command == "import-contacts":
+            records = import_contacts_csv(config.slug, args.input)
+            with RadarStore(args.database) as store:
+                stats = store.upsert_property_contacts(records)
+            print(f"Imported {len(records)} contacts (new={stats.new}, changed={stats.changed}, unchanged={stats.unchanged})")
             return
 
         if args.command == "scrape-properties":

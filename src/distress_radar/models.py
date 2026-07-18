@@ -147,3 +147,25 @@ class TaxDelinquency:
         result = asdict(self)
         result.pop("fetched_at")
         return result
+
+
+@dataclass(frozen=True)
+class PropertyContact:
+    city_slug: str
+    source_name: str
+    source_record_id: str
+    folio: str
+    contact_name: str
+    role: str | None
+    email: str | None
+    phone: str | None
+    mailing_address: str | None
+    verification_status: str
+    confidence: float
+    source_url: str
+    fetched_at: str
+
+    def stable_dict(self) -> dict[str, Any]:
+        result = asdict(self)
+        result.pop("fetched_at")
+        return result
