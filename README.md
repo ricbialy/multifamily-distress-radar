@@ -1,1 +1,182 @@
-# multifamily-distress-radar
+# Multifamily Distress Radar — collector starter
+
+Version 0.12 adds conservative owner-name normalization, target portfolio
+property/unit totals, and related-property evidence. Version 0.11 added durable,
+retry-safe webhook alerts for new lis pendens,
+liens, delinquent taxes, and significant code-enforcement changes. Version 0.10
+added deduplicated Clerk instrument lifecycle events with
+first-seen, last-seen, active, and resolved state. It also supports unattended
+import of an authorized delinquent-tax CSV before each scheduled refresh and a
+separate acquisition-opportunity score with a compliant,
+optional Miami-Dade Clerk Official Records API connector. The connector is
+disabled by default because the Clerk requires an enabled developer account
+and purchased API units. It never stores the API key in configuration, raw
+documents, or source URLs.
+
+The priority score is `verified code-enforcement distress + property
+opportunity`. Opportunity uses ownership duration, building age, absentee
+mailing, and target-portfolio size. These are screening indicators—not claims
+of financial distress.
+
+This repository implements the ingestion and first ranking layer described in
+the project specification. Hialeah and Surfside use live-tested Tyler EnerGov
+code-enforcement collection. Hialeah also uses Miami-Dade County's authoritative
+weekly Property Point View to build its 10–80-unit multifamily universe.
+
+## What works
+
+- Discovers the portal tenant instead of hard-coding tenant headers.
+- Resolves human-readable case statuses to portal IDs.
+- Paginates public code-enforcement searches.
+- Optionally fetches case details and structured violation rows.
+- Stores every raw response with source URL and collection timestamp.
+- Normalizes current code cases into SQLite.
+- Deduplicates records and logs new/changed versions by content hash.
+- Exports a clean CSV for analysis.
+- Keeps city-specific URLs and active-status rules in YAML.
+- Collects the Hialeah 10–80-unit multifamily parcel universe.
+- Joins open cases to properties by normalized folio and exports a transparent
+  code-enforcement ranking.
+
+No login, CAPTCHA bypass, or private endpoint is used. Keep request rates low
+and review each jurisdiction's terms before running on a schedule.
+
+After obtaining Clerk developer access, enable `official_records_source` in
+the Hialeah configuration, set `MIAMI_DADE_CLERK_AUTH_KEY` in the environment,
+and run `distress-radar scrape-official-records --city hialeah_fl --limit 25`.
+Successful folio responses are cached for 30 days by default. Use
+`--refresh-days N` to change the interval or `--force` for an intentional paid
+refresh. Existing mortgages are informational and do not increase financial
+distress; only unmatched explicit lien or lis-pendens codes do.
+The tax-report vendor currently presents human verification, so this project
+does not automate around that control; use a licensed/API feed or a manually
+exported CSV instead.
+
+## Dashboard
+
+`dashboard/` is a responsive React/Vite evidence explorer generated from the
+live Hialeah snapshot. It provides ranked-property search and filtering,
+score decomposition, case evidence, grouped Clerk instruments, and source
+links. Run `cd dashboard && npm install && npm run dev`, or deploy `dashboard/dist`.
+
+## Scheduled refresh
+
+`distress-radar refresh` orchestrates property inventory, code cases, targeted
+detail enrichment, cache-aware Clerk collection, CSV exports, dashboard JSON,
+and a machine-readable `refresh_summary.json`. Clerk is skipped safely when its
+environment credential is absent.
+
+```bash
+distress-radar refresh --city hialeah_fl \
+  --database data/radar.sqlite3 --top-limit 50 \
+  --output-dir exports --dashboard-json dashboard/src/data.json
+```
+
+For unattended execution, `scripts/refresh_hialeah.sh` prevents overlapping
+runs, honors `RADAR_DATABASE`, `RADAR_OUTPUT_DIR`, `RADAR_TOP_LIMIT`,
+`RADAR_TAX_CSV`, and `CLERK_REFRESH_DAYS`, and rebuilds the dashboard after a
+successful refresh. If `RADAR_TAX_CSV` is set, it must name a readable,
+authorized CSV and the run fails early otherwise. When it is unset, the script
+automatically imports `exports/delinquent_taxes.csv` when that file exists and
+otherwise continues without tax data.
+Schedule that script on the fixed-egress host that is authorized by the Clerk.
+When `RADAR_INGEST_URL` and `RADAR_INGEST_TOKEN` are set, the final bounded JSON
+snapshot is sent to the published dashboard only after every required refresh
+and export stage succeeds. The token is sent in an Authorization header and is
+never written to the refresh summary.
+Private hosted apps also require `RADAR_SITES_BYPASS_TOKEN`, which is sent only
+in the platform authorization header and is likewise excluded from logs.
+
+## Change alerts
+
+Set `RADAR_ALERT_WEBHOOK_URL` to a Slack/Teams automation, Zapier/Make hook, or
+your own receiver. `RADAR_ALERT_TOKEN` optionally adds bearer authentication.
+Alerts are persisted before delivery, deduplicated by source revision, and
+marked delivered only after a successful webhook response. A notification
+failure does not block collection and is retried on the next refresh.
+
+## Delinquent-tax import
+
+Use an authorized Miami-Dade report export rather than automating around its
+human-verification page. The importer accepts common aliases for folio, tax
+year, balance due, status, certificate, owner, and address:
+
+```bash
+distress-radar import-tax --city hialeah_fl \
+  --database data/hialeah.sqlite3 --input exports/delinquent_taxes.csv
+```
+
+Verified unpaid tax rows add a separate 35-point financial signal plus a
+capped multi-year bonus. Paid rows do not score.
+
+## Quick start
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -e .
+
+# See the statuses exposed by Surfside.
+distress-radar statuses --city surfside_fl
+
+# Fast proof: one page, search results only.
+distress-radar scrape --city surfside_fl --max-pages 1 --skip-details
+
+# Production-oriented active-case collection, including case descriptions.
+distress-radar scrape --city surfside_fl
+
+# Build Hialeah's property backbone and collect all configured active cases.
+distress-radar scrape-properties --city hialeah_fl
+distress-radar scrape --city hialeah_fl --skip-details
+
+# Enrich only the cases driving the current top 25 with descriptions and
+# structured violation rows.
+distress-radar enrich-top --city hialeah_fl --limit 25
+
+# Export the property universe and the first ranked top 25.
+distress-radar export-properties --city hialeah_fl --output data/hialeah_properties.csv
+distress-radar export-opportunities --city hialeah_fl --output data/hialeah_top_25.csv
+
+# Also request structured violation rows for every case.
+distress-radar scrape --city surfside_fl --include-violations
+
+# Export the latest normalized records.
+distress-radar export --city surfside_fl --output data/surfside_cases.csv
+```
+
+The default database is `data/radar.sqlite3`. Raw JSON responses are stored in
+the `raw_documents` table, while `code_cases` holds current normalized state and
+`case_changes` is the append-only change log.
+
+Run the dependency-free test suite with:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+## City configuration
+
+Add a YAML file under `config/cities/`. The implemented adapter is
+`tyler_energov`; other municipal systems should become separate adapters rather
+than city-specific conditionals in this one.
+
+`active_statuses` is a research policy, not a universal legal definition of an
+open violation. Surfside's configuration includes unresolved and enforcement
+statuses and excludes closed/canceled statuses. Adjust it as the acquisition
+strategy develops.
+
+## Ranking boundary
+
+`code_enforcement_score` is deliberately narrow and explainable: liens receive
+the highest weight, followed by special-master/hearing stages, notices,
+re-inspections/appeals, and warnings, with a capped repeat-case bonus. It is not
+the final distress or opportunity score and should not be presented as one.
+
+## Important MVP gaps
+
+This now creates the Hialeah 10–80-unit property universe and a code-enforcement
+ranking with optional imported tax delinquency. It does not yet add eviction,
+utility, vacancy, or permit signals; resolve related LLCs; verify contacts;
+calculate separate full distress/opportunity scores; or operate a CRM. Those
+layers should consume the stable normalized store rather than adding logic to
+the collectors.

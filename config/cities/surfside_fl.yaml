@@ -1,0 +1,25 @@
+slug: surfside_fl
+name: Town of Surfside
+state: FL
+enabled: true
+source:
+  name: surfside_tyler_energov
+  adapter: tyler_energov
+  base_url: https://surfsidefl-energovpub.tylerhost.net/apps/selfservice
+  public_search_url: https://surfsidefl-energovpub.tylerhost.net/apps/selfservice
+  record_url_template: https://surfsidefl-energovpub.tylerhost.net/apps/selfservice#/code/{record_id}
+  page_size: 100
+  request_delay_seconds: 0.25
+  timeout_seconds: 45
+  max_retries: 3
+  active_statuses:
+    - Code Lien
+    - Court Pending
+    - Escalated
+    - Fees Due
+    - In Progress
+    - Lien
+    - Lien Document Pending
+    - On Hold
+    - Post Court Action
+    - Service Lien

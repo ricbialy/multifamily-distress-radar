@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "multifamily-distress-radar"
+version = "0.12.0"
+description = "City-configurable public-record collectors for multifamily distress research"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["PyYAML>=6.0"]
+
+[project.scripts]
+distress-radar = "distress_radar.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
