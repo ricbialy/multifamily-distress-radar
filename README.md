@@ -1,6 +1,8 @@
 # Multifamily Distress Radar — collector starter
 
-Version 0.12 adds conservative owner-name normalization, target portfolio
+Version 0.13 adds a persistent acquisition workflow with lead stages, assignee,
+follow-up date, disposition, notes, dashboard export, and CRM CSV export.
+Version 0.12 added conservative owner-name normalization, target portfolio
 property/unit totals, and related-property evidence. Version 0.11 added durable,
 retry-safe webhook alerts for new lis pendens,
 liens, delinquent taxes, and significant code-enforcement changes. Version 0.10
@@ -94,6 +96,19 @@ your own receiver. `RADAR_ALERT_TOKEN` optionally adds bearer authentication.
 Alerts are persisted before delivery, deduplicated by source revision, and
 marked delivered only after a successful webhook response. A notification
 failure does not block collection and is retried on the next refresh.
+
+## Acquisition workflow
+
+```bash
+distress-radar set-lead --city hialeah_fl --folio 0123456789012 \
+  --stage qualified --assignee ricardo --follow-up 2026-08-01 \
+  --notes "Confirm ownership and call broker"
+distress-radar export-leads --city hialeah_fl \
+  --output exports/hialeah_leads.csv
+```
+
+Stages are `new`, `researching`, `qualified`, `contacted`, `negotiating`,
+`won`, `lost`, and `paused`.
 
 ## Delinquent-tax import
 

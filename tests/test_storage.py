@@ -67,6 +67,32 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(RadarStore.owner_key("Hudson Park Partners, L.L.C."), "hudson park partners")
         self.assertEqual(RadarStore.owner_key("OWNER LLC"), RadarStore.owner_key("Owner, Inc."))
 
+    def test_property_lead_workflow_and_export(self) -> None:
+        with TemporaryDirectory() as temp:
+            database = Path(temp) / "radar.sqlite3"
+            output = Path(temp) / "leads.csv"
+            with RadarStore(database) as store:
+                run = store.start_run("surfside_fl", "property_source", ())
+                store.upsert_properties(run, (sample_property(),))
+                lead = store.set_property_lead(
+                    "surfside_fl", "1422350010020", stage="qualified",
+                    assignee="ricardo", next_follow_up_date="2026-08-01",
+                    notes="Confirm ownership",
+                )
+                self.assertEqual(lead["stage"], "qualified")
+                self.assertEqual(store.export_leads_csv("surfside_fl", output), 1)
+            with output.open(encoding="utf-8", newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(row["assignee"], "ricardo")
+            self.assertEqual(row["next_follow_up_date"], "2026-08-01")
+
+    def test_property_lead_rejects_unknown_stage(self) -> None:
+        with TemporaryDirectory() as temp, RadarStore(Path(temp) / "radar.sqlite3") as store:
+            run = store.start_run("surfside_fl", "property_source", ())
+            store.upsert_properties(run, (sample_property(),))
+            with self.assertRaises(ValueError):
+                store.set_property_lead("surfside_fl", "1422350010020", stage="maybe")
+
     def test_deduplicates_and_records_changes(self) -> None:
         with TemporaryDirectory() as temp:
             database = Path(temp) / "radar.sqlite3"

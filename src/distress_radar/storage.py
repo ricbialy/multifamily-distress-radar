@@ -190,6 +190,15 @@ class RadarStore:
             );
             CREATE INDEX IF NOT EXISTS idx_alerts_pending
                 ON alerts(city_slug, delivered_at, created_at);
+            CREATE TABLE IF NOT EXISTS property_leads (
+                city_slug TEXT NOT NULL, folio TEXT NOT NULL,
+                stage TEXT NOT NULL DEFAULT 'new', assignee TEXT,
+                next_follow_up_date TEXT, disposition TEXT, notes TEXT,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                PRIMARY KEY(city_slug, folio)
+            );
+            CREATE INDEX IF NOT EXISTS idx_property_leads_follow_up
+                ON property_leads(city_slug, stage, next_follow_up_date);
             """
         )
         self.connection.commit()
@@ -431,6 +440,57 @@ class RadarStore:
             (utc_now(), *alert_ids),
         )
         self.connection.commit()
+
+    def set_property_lead(
+        self, city_slug: str, folio: str, *, stage: str, assignee: str | None = None,
+        next_follow_up_date: str | None = None, disposition: str | None = None,
+        notes: str | None = None,
+    ) -> dict[str, Any]:
+        allowed = {"new", "researching", "qualified", "contacted", "negotiating", "won", "lost", "paused"}
+        if stage not in allowed:
+            raise ValueError(f"Invalid lead stage '{stage}'; choose from {', '.join(sorted(allowed))}")
+        exists = self.connection.execute(
+            "SELECT 1 FROM properties WHERE city_slug=? AND folio=?", (city_slug, folio)
+        ).fetchone()
+        if not exists:
+            raise ValueError(f"Unknown property folio '{folio}' for {city_slug}")
+        now = utc_now()
+        self.connection.execute(
+            """INSERT INTO property_leads
+               (city_slug,folio,stage,assignee,next_follow_up_date,disposition,notes,created_at,updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(city_slug,folio) DO UPDATE SET
+               stage=excluded.stage,assignee=excluded.assignee,
+               next_follow_up_date=excluded.next_follow_up_date,
+               disposition=excluded.disposition,notes=excluded.notes,
+               updated_at=excluded.updated_at""",
+            (city_slug, folio, stage, assignee, next_follow_up_date, disposition, notes, now, now),
+        )
+        self.connection.commit()
+        return self.get_property_lead(city_slug, folio)
+
+    def get_property_lead(self, city_slug: str, folio: str) -> dict[str, Any]:
+        row = self.connection.execute(
+            "SELECT * FROM property_leads WHERE city_slug=? AND folio=?", (city_slug, folio)
+        ).fetchone()
+        return dict(row) if row else {"stage": "new", "assignee": None, "next_follow_up_date": None, "disposition": None, "notes": None}
+
+    def export_leads_csv(self, city_slug: str, output: Path) -> int:
+        rows = self.connection.execute(
+            """SELECT l.*,p.address,p.owner_name,p.unit_count
+               FROM property_leads l JOIN properties p
+                 ON p.city_slug=l.city_slug AND p.folio=l.folio
+               WHERE l.city_slug=? ORDER BY
+                 CASE WHEN l.next_follow_up_date IS NULL THEN 1 ELSE 0 END,
+                 l.next_follow_up_date,l.updated_at DESC""", (city_slug,)
+        ).fetchall()
+        output.parent.mkdir(parents=True, exist_ok=True)
+        fields = ["city_slug","folio","address","owner_name","unit_count","stage","assignee","next_follow_up_date","disposition","notes","created_at","updated_at"]
+        with output.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows({key: row[key] for key in fields} for row in rows)
+        return len(rows)
 
     def _insert_change(
         self,
@@ -1097,6 +1157,7 @@ class RadarStore:
                 )
             ]
             events = self.official_record_events(city_slug, folio)
+            lead = self.get_property_lead(city_slug, folio)
             owner_key = str(prop.get("owner_canonical_key") or "")
             related = [
                 {"folio": item.get("folio"), "address": item.get("address"), "unit_count": item.get("unit_count")}
@@ -1111,6 +1172,7 @@ class RadarStore:
                     "official_record_events": events,
                     "clerk_queried": bool(events),
                     "related_properties": related,
+                    "lead": lead,
                 }
             )
         output.parent.mkdir(parents=True, exist_ok=True)

@@ -109,6 +109,19 @@ def build_parser() -> argparse.ArgumentParser:
     alerts.add_argument("--city", required=True)
     alerts.add_argument("--database", type=Path, default=Path("data/radar.sqlite3"))
     alerts.add_argument("--limit", type=int, default=100)
+    lead = subparsers.add_parser("set-lead", help="Create or update acquisition workflow state")
+    lead.add_argument("--city", required=True)
+    lead.add_argument("--database", type=Path, default=Path("data/radar.sqlite3"))
+    lead.add_argument("--folio", required=True)
+    lead.add_argument("--stage", required=True)
+    lead.add_argument("--assignee")
+    lead.add_argument("--follow-up")
+    lead.add_argument("--disposition")
+    lead.add_argument("--notes")
+    export_leads = subparsers.add_parser("export-leads", help="Export acquisition workflow CSV")
+    export_leads.add_argument("--city", required=True)
+    export_leads.add_argument("--database", type=Path, default=Path("data/radar.sqlite3"))
+    export_leads.add_argument("--output", type=Path, required=True)
     return parser
 
 
@@ -180,6 +193,21 @@ def main(argv: list[str] | None = None) -> None:
                 receipt = deliver_webhook(url, alerts, os.environ.get("RADAR_ALERT_TOKEN"))
                 store.mark_alerts_delivered([int(alert["id"]) for alert in alerts])
             print(json.dumps({"delivered": len(alerts), "receipt": receipt}))
+            return
+
+        if args.command == "set-lead":
+            with RadarStore(args.database) as store:
+                lead = store.set_property_lead(
+                    config.slug, args.folio, stage=args.stage, assignee=args.assignee,
+                    next_follow_up_date=args.follow_up, disposition=args.disposition, notes=args.notes,
+                )
+            print(json.dumps(lead, indent=2))
+            return
+
+        if args.command == "export-leads":
+            with RadarStore(args.database) as store:
+                count = store.export_leads_csv(config.slug, args.output)
+            print(f"Exported {count} acquisition leads to {args.output}")
             return
 
         if args.command == "scrape-properties":
