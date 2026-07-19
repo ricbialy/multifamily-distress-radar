@@ -1,0 +1,27 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "6",
+      "when": 1784341780156,
+      "tag": "0000_glorious_falcon",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1784348796697,
+      "tag": "0001_redundant_stick",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1784390718379,
+      "tag": "0002_messy_darkstar",
+      "breakpoints": true
+    }
+  ]
+}
