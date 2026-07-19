@@ -1,7 +1,12 @@
 import { drizzle } from "drizzle-orm/d1";
 import * as schema from "./schema";
 
-type RadarEnv = { DB?: D1Database; INGEST_TOKEN?: string };
+export type RadarEnv = {
+  DB?: D1Database;
+  INGEST_TOKEN?: string;
+  ALLOWED_EMAILS?: string;
+  ALLOWED_EMAIL_DOMAINS?: string;
+};
 
 export function getRadarEnv(): RadarEnv {
   return (globalThis as unknown as { __RADAR_ENV?: RadarEnv }).__RADAR_ENV ?? {};
