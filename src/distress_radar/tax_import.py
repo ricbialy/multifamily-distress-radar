@@ -32,6 +32,18 @@ def _money(value: object) -> float:
     return float(text.strip("()")) * (-1 if text.startswith("(") else 1)
 
 
+def is_unpaid_status(value: object) -> bool:
+    status = str(value or "").casefold().strip()
+    if not status:
+        return False
+    if status in {"paid", "satisfied", "released", "redeemed", "cancelled", "canceled"}:
+        return False
+    return any(
+        marker in status
+        for marker in ("unpaid", "delinquent", "outstanding", "past due", "open")
+    )
+
+
 def import_tax_csv(city_slug: str, path: Path) -> tuple[TaxDelinquency, ...]:
     fetched_at = datetime.now(timezone.utc).isoformat()
     with path.open(encoding="utf-8-sig", newline="") as handle:
