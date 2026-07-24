@@ -18,6 +18,7 @@ from distress_radar.identity.address_validation import (
     AddressValidationStatus,
     CountyAddressValidator,
 )
+from distress_radar.identity.folio_resolver import normalize_folio
 from distress_radar.models import PropertyRecord
 from distress_radar.recommendations.features import (
     RecommendationFeatures,
@@ -146,6 +147,11 @@ def run_fixture_demo(
         off_market_path, fetched_at=generated_at
     )
     address_validator = CountyAddressValidator(property_records)
+    county_records_by_folio = {
+        normalized: record
+        for record in property_records
+        if (normalized := normalize_folio(record.folio))
+    }
     properties: dict[str, dict[str, Any]] = {}
     for listing in listings:
         key = _identity(listing.folio, listing.address, listing.municipality)
@@ -200,6 +206,7 @@ def run_fixture_demo(
             candidates=address_candidates,
             checked_at=generated_at,
         )
+        county_record = county_records_by_folio.get(normalize_folio(folio))
         evidence = (
             (_listing_evidence(listing, generated_at) if listing else ())
             + (off_market.evidence if off_market else ())
@@ -331,7 +338,9 @@ def run_fixture_demo(
                         else "unknown"
                     ),
                     "advertised_units": listing.units if listing else None,
-                    "public_record_units": off_market.units if off_market else None,
+                    "public_record_units": (
+                        county_record.unit_count if county_record else None
+                    ),
                     "recommended_action": recommendation.action,
                     "recommendation_score": recommendation_score,
                     "owner_motivation_score": motivation,
