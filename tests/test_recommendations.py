@@ -30,6 +30,10 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual(
             SUPPORTED_ACTIONS,
             {
+                "contact_broker_for_documents",
+                "investigate_owner",
+                "human_municipal_review",
+                "dismiss",
                 "contact_owner",
                 "contact_broker",
                 "excluded",
