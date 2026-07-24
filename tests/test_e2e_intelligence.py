@@ -33,6 +33,10 @@ class EndToEndIntelligenceTests(unittest.TestCase):
         self.assertEqual(
             both[0]["preliminary_offer_range"]["status"], "complete"
         )
+        incomplete = next(item for item in records if item["address"] == "905 West 20 Street")
+        self.assertEqual(
+            incomplete["preliminary_offer_range"]["status"], "insufficient_data"
+        )
         self.assertIn("Top 10 actionable opportunities", brief)
         self.assertIn("recommended_action", csv_text.splitlines()[0])
 
