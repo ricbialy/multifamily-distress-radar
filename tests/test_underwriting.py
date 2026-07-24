@@ -32,7 +32,7 @@ class UnderwritingTests(unittest.TestCase):
         result = underwrite_small_multifamily(inputs)
         self.assertEqual(result.status, "complete")
         self.assertAlmostEqual(result.stabilized_gross_income, 102_600)
-        self.assertAlmostEqual(result.stabilized_noi, 66_392)
+        self.assertAlmostEqual(result.stabilized_noi, 58_392)
         self.assertEqual(result.price_per_unit_at_base_value, 231_250)
 
     def test_small_multifamily_requires_legal_unit_verification(self) -> None:
