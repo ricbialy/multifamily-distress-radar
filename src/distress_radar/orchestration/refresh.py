@@ -192,7 +192,13 @@ def run_fixture_demo(
         recommendation = recommend(features)
         offer = calculate_offer_range(
             OfferInputs(
-                stabilized_value=off_market.estimated_value if off_market else None,
+                stabilized_value=(
+                    off_market.estimated_value
+                    if off_market
+                    and off_market.estimated_value
+                    and off_market.stabilized_noi
+                    else None
+                ),
                 required_margin_rate=0.10,
                 repairs=off_market.repairs or 0 if off_market else 0,
                 capital_expenditures=off_market.capex or 0 if off_market else 0,
