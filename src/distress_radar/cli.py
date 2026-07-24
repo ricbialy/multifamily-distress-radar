@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 from distress_radar.collectors import ArcGisPropertyCollector, MiamiDadeClerkCollector, TylerEnerGovCollector
@@ -14,6 +15,7 @@ from distress_radar.pipeline import run_refresh
 from distress_radar.tax_import import import_tax_csv
 from distress_radar.alerts import deliver_webhook
 from distress_radar.contact_import import import_contacts_csv
+from distress_radar.orchestration.refresh import run_fixture_demo
 
 
 def _collector(config: CityConfig) -> TylerEnerGovCollector:
@@ -127,6 +129,18 @@ def build_parser() -> argparse.ArgumentParser:
     contacts.add_argument("--city", required=True)
     contacts.add_argument("--database", type=Path, default=Path("data/radar.sqlite3"))
     contacts.add_argument("--input", type=Path, required=True)
+    fixture_demo = subparsers.add_parser(
+        "fixture-demo",
+        help="Run the combined acquisition-intelligence flow against authorized fixtures",
+    )
+    fixture_demo.add_argument("--matrix", type=Path, required=True)
+    fixture_demo.add_argument("--off-market", type=Path, required=True)
+    fixture_demo.add_argument("--output-dir", type=Path, required=True)
+    fixture_demo.add_argument(
+        "--generated-at",
+        default=None,
+        help="ISO-8601 timestamp for deterministic fixture output",
+    )
     return parser
 
 
@@ -137,6 +151,27 @@ def main(argv: list[str] | None = None) -> None:
         format="%(levelname)s %(name)s: %(message)s",
     )
     try:
+        if args.command == "fixture-demo":
+            result = run_fixture_demo(
+                matrix_path=args.matrix,
+                off_market_path=args.off_market,
+                output_dir=args.output_dir,
+                generated_at=args.generated_at
+                or datetime.now(timezone.utc).isoformat(),
+            )
+            print(
+                json.dumps(
+                    {
+                        "canonical_property_count": result.canonical_property_count,
+                        "json_path": str(result.json_path),
+                        "csv_path": str(result.csv_path),
+                        "brief_path": str(result.brief_path),
+                    },
+                    indent=2,
+                )
+            )
+            return
+
         config = load_city_config(args.city)
         if args.command == "statuses":
             for status in _collector(config).list_statuses():
