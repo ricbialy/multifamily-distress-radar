@@ -15,6 +15,10 @@ class IdentityTests(unittest.TestCase):
             normalize_address("123 North Main Street, Apt #2"),
             "123 n main st unit 2",
         )
+        self.assertEqual(
+            normalize_address("1440 SW 4th St"),
+            normalize_address("1440 SW 4 ST"),
+        )
 
     def test_folio_match_has_priority_over_address(self) -> None:
         existing = CanonicalProperty(
