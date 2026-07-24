@@ -318,6 +318,8 @@ class IntelligenceStore:
                 fetched_at=previous_row["fetched_at"],
                 raw_payload=json.loads(previous_row["raw_payload_json"]),
             )
+        if previous is not None and previous.stable_dict() == snapshot.stable_dict():
+            return ()
         changes = detect_listing_changes(previous, snapshot)
         self.connection.execute(
             """

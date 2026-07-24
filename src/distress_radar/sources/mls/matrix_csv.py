@@ -3,8 +3,9 @@ from __future__ import annotations
 import csv
 from collections import OrderedDict
 from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 from distress_radar.domain.listing import ListingChange, ListingSnapshot
 from distress_radar.identity.address_normalizer import normalize_address
@@ -16,13 +17,19 @@ class MatrixSchemaChangedError(ValueError):
 
 
 _ALIASES = {
-    "mls_number": ("mls number", "mls#", "mls", "listing id"),
+    "mls_number": ("mls number", "mls # link", "mls#", "mls", "listing id"),
     "address": ("property address", "address", "street address"),
     "municipality": ("city", "municipality"),
-    "state": ("state", "state code"),
+    "state": ("state", "st", "state code"),
     "postal_code": ("zip code", "zip", "postal code"),
     "folio": ("folio number", "folio", "apn", "parcel number"),
-    "property_class": ("property type", "class", "property class"),
+    "property_class": (
+        "type of property",
+        "prop type/type of building",
+        "property type",
+        "class",
+        "property class",
+    ),
     "status": ("status", "listing status"),
     "list_price": ("list price", "price", "current price"),
     "dom": ("dom", "days on market"),
@@ -44,6 +51,23 @@ _MOTIVATION_PHRASES = (
     "owner financing",
     "must sell",
 )
+
+
+@dataclass(frozen=True)
+class MatrixImportLedgerRow:
+    line_number: int
+    status: str
+    source_record_id: str | None
+    address: str | None
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class MatrixImportBatch:
+    headers: tuple[str, ...]
+    header_mapping: dict[str, str | None]
+    accepted: tuple[ListingSnapshot, ...]
+    ledger: tuple[MatrixImportLedgerRow, ...]
 
 
 def _columns(headers: list[str]) -> dict[str, str | None]:
@@ -80,7 +104,9 @@ class MatrixCsvImporter:
 
     def import_file(self, path: Path, *, fetched_at: str) -> tuple[ListingSnapshot, ...]:
         with path.open(encoding="utf-8-sig", newline="") as handle:
-            return self._read(csv.DictReader(handle), fetched_at, f"manual-import://{path.name}")
+            return self.import_reader(
+                handle, fetched_at=fetched_at, source_url=f"manual-import://{path.name}"
+            ).accepted
 
     def import_bytes(
         self, payload: bytes, *, filename: str, fetched_at: str
@@ -88,11 +114,32 @@ class MatrixCsvImporter:
         from io import StringIO
 
         handle = StringIO(payload.decode("utf-8-sig"))
-        return self._read(csv.DictReader(handle), fetched_at, f"email-attachment://{filename}")
+        return self.import_reader(
+            handle,
+            fetched_at=fetched_at,
+            source_url=f"email-attachment://{filename}",
+        ).accepted
+
+    def import_reader(
+        self, handle: TextIO, *, fetched_at: str, source_url: str
+    ) -> MatrixImportBatch:
+        reader = csv.DictReader(handle)
+        accepted, ledger, headers, columns = self._read(reader, fetched_at, source_url)
+        return MatrixImportBatch(
+            headers=tuple(headers),
+            header_mapping=columns,
+            accepted=accepted,
+            ledger=ledger,
+        )
 
     def _read(
         self, reader: csv.DictReader[str], fetched_at: str, source_url: str
-    ) -> tuple[ListingSnapshot, ...]:
+    ) -> tuple[
+        tuple[ListingSnapshot, ...],
+        tuple[MatrixImportLedgerRow, ...],
+        list[str],
+        dict[str, str | None],
+    ]:
         headers = reader.fieldnames or []
         columns = _columns(headers)
         missing = [
@@ -106,38 +153,71 @@ class MatrixCsvImporter:
                 f"Headers: {', '.join(headers)}"
             )
         records: list[ListingSnapshot] = []
+        ledger: list[MatrixImportLedgerRow] = []
         for line, row in enumerate(reader, start=2):
             mls_number = _text(row, columns["mls_number"])
             address = _text(row, columns["address"])
             if not mls_number or not address:
-                raise MatrixSchemaChangedError(
-                    f"Matrix CSV has blank MLS number or address on line {line}"
+                missing_fields = [
+                    label
+                    for value, label in ((mls_number, "MLS number"), (address, "address"))
+                    if not value
+                ]
+                ledger.append(
+                    MatrixImportLedgerRow(
+                        line_number=line,
+                        status="rejected",
+                        source_record_id=mls_number,
+                        address=address,
+                        reason=f"blank {', '.join(missing_fields)}",
+                    )
                 )
-            records.append(
-                ListingSnapshot(
+                continue
+            try:
+                records.append(
+                    ListingSnapshot(
+                        source_record_id=mls_number,
+                        source_name=self.source_name,
+                        fetched_at=fetched_at,
+                        address=address,
+                        municipality=_text(row, columns["municipality"]) or "",
+                        folio=normalize_folio(_text(row, columns["folio"])),
+                        property_class=_text(row, columns["property_class"]),
+                        status=_text(row, columns["status"]),
+                        list_price=_number(row, columns["list_price"]),
+                        dom=_integer(row, columns["dom"]),
+                        cdom=_integer(row, columns["cdom"]),
+                        units=_integer(row, columns["units"]),
+                        noi=_number(row, columns["noi"]),
+                        rents=_number(row, columns["rents"]),
+                        expenses=_number(row, columns["expenses"]),
+                        remarks=_text(row, columns["remarks"]),
+                        source_url=source_url,
+                        state=_text(row, columns["state"]),
+                        postal_code=_text(row, columns["postal_code"]),
+                        raw_payload=dict(row),
+                    )
+                )
+            except (TypeError, ValueError) as exc:
+                ledger.append(
+                    MatrixImportLedgerRow(
+                        line_number=line,
+                        status="rejected",
+                        source_record_id=mls_number,
+                        address=address,
+                        reason=f"invalid numeric value: {exc}",
+                    )
+                )
+                continue
+            ledger.append(
+                MatrixImportLedgerRow(
+                    line_number=line,
+                    status="accepted",
                     source_record_id=mls_number,
-                    source_name=self.source_name,
-                    fetched_at=fetched_at,
                     address=address,
-                    municipality=_text(row, columns["municipality"]) or "",
-                    folio=normalize_folio(_text(row, columns["folio"])),
-                    property_class=_text(row, columns["property_class"]),
-                    status=_text(row, columns["status"]),
-                    list_price=_number(row, columns["list_price"]),
-                    dom=_integer(row, columns["dom"]),
-                    cdom=_integer(row, columns["cdom"]),
-                    units=_integer(row, columns["units"]),
-                    noi=_number(row, columns["noi"]),
-                    rents=_number(row, columns["rents"]),
-                    expenses=_number(row, columns["expenses"]),
-                    remarks=_text(row, columns["remarks"]),
-                    source_url=source_url,
-                    state=_text(row, columns["state"]),
-                    postal_code=_text(row, columns["postal_code"]),
-                    raw_payload=dict(row),
                 )
             )
-        return tuple(records)
+        return tuple(records), tuple(ledger), headers, columns
 
 
 def _changed(

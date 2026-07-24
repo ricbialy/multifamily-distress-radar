@@ -25,9 +25,9 @@ class MatrixScoutTests(unittest.TestCase):
             "Prop Type,Style of Property,Prop Type/Type of Building,"
             "Type of Property,Property SqFt,Waterfront Property (Y/N),"
             "Sale Price,#Bays\n"
-            "1,A123,A,41,100 Test Ave,,$2,500,000,3901,1970,COM/Sale,,"
+            '1,A123,A,41,100 Test Ave,,"$2,500,000",3901,1970,COM/Sale,,'
             "Commercial/Residential Income,Income/MultiFamily,12000,,,,\n"
-            "2,,A,41,200 Test Ave,,$1,500,000,3901,1960,COM/Sale,,"
+            '2,,A,41,200 Test Ave,,"$1,500,000",3901,1960,COM/Sale,,'
             "Commercial/Residential Income,Income/MultiFamily,9000,,,,\n"
         )
         importer = MatrixCsvImporter()
