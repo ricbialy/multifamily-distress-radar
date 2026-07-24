@@ -4,6 +4,7 @@ import csv
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 from dataclasses import asdict, dataclass
@@ -50,19 +51,28 @@ def _count(connection: sqlite3.Connection, sql: str, parameters: tuple[Any, ...]
     return int(connection.execute(sql, parameters).fetchone()[0])
 
 
-def _controlled_copy(source: Path, destination: Path) -> str:
+def _controlled_copy(source: Path, destination: Path) -> tuple[str, str]:
     destination.parent.mkdir(parents=True, exist_ok=True)
     with source.open(encoding="utf-8-sig", newline="") as handle:
         rows = list(csv.reader(handle))
-    if not rows or "St" not in rows[0] or len(rows) < 2:
-        raise ValueError("Controlled change requires a real Matrix St column and data row")
+    if (
+        not rows
+        or "St" not in rows[0]
+        or "MLS # Link" not in rows[0]
+        or len(rows) < 2
+    ):
+        raise ValueError(
+            "Controlled change requires real Matrix St and MLS # Link columns"
+        )
     status_index = rows[0].index("St")
+    mls_index = rows[0].index("MLS # Link")
     before = rows[1][status_index]
     after = "W" if before != "W" else "A"
+    target_mls = rows[1][mls_index]
     rows[1][status_index] = after
     with destination.open("w", encoding="utf-8", newline="") as handle:
         csv.writer(handle).writerows(rows)
-    return f"line 2 St: {before} -> {after}"
+    return f"line 2 / {target_mls} St: {before} -> {after}", target_mls
 
 
 def _run_tests(repository: Path) -> tuple[bool, str]:
@@ -136,7 +146,9 @@ def verify_real_pilot(
         second_change_count = _count(connection, "SELECT COUNT(*) FROM listing_changes")
 
     controlled_path = output_dir / "controlled" / matrix_path.name
-    controlled_description = _controlled_copy(matrix_path, controlled_path)
+    controlled_description, controlled_mls = _controlled_copy(
+        matrix_path, controlled_path
+    )
     controlled_database = output_dir / "controlled.sqlite"
     controlled_baseline = run_pilot(
         matrix_path=matrix_path,
@@ -153,8 +165,9 @@ def verify_real_pilot(
         controlled_property = connection.execute(
             """
             SELECT property_id FROM listing_snapshots
-            ORDER BY fetched_at,snapshot_id LIMIT 1
-            """
+            WHERE mls_number=? ORDER BY fetched_at,snapshot_id LIMIT 1
+            """,
+            (controlled_mls,),
         ).fetchone()["property_id"]
         action_before = connection.execute(
             """
@@ -184,6 +197,7 @@ def verify_real_pilot(
         ).fetchone()["action"]
 
     failed_database = output_dir / "failed-source.sqlite"
+    shutil.copy2(database_path, failed_database)
     failed = run_pilot(
         matrix_path=matrix_path,
         database_path=failed_database,
