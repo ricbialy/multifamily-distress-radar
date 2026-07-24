@@ -25,12 +25,14 @@ class OfferRange:
     deductions: dict[str, float] = field(default_factory=dict)
     missing_data: tuple[str, ...] = ()
 
-    def to_dict(self) -> dict[str, float | str | None]:
+    def to_dict(self) -> dict[str, object]:
         return {
             "conservative": self.conservative,
             "base": self.base,
             "maximum": self.maximum,
             "status": self.status,
+            "deductions": dict(self.deductions),
+            "missing_data": list(self.missing_data),
         }
 
 
