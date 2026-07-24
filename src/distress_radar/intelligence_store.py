@@ -10,7 +10,7 @@ from uuid import uuid4
 from distress_radar.domain.evidence import EvidenceItem
 from distress_radar.domain.listing import ListingChange, ListingSnapshot
 from distress_radar.domain.property import CanonicalProperty
-from distress_radar.sources.base import SourceHealthState
+from distress_radar.sources.base import CoverageState, SourceHealthState
 from distress_radar.sources.mls.matrix_csv import detect_listing_changes
 
 
@@ -73,6 +73,17 @@ class IntelligenceStore:
                 last_attempt_at TEXT NOT NULL, last_success_at TEXT,
                 error_message TEXT, records_examined INTEGER NOT NULL DEFAULT 0,
                 records_changed INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS property_source_coverage (
+                property_id TEXT NOT NULL REFERENCES canonical_properties(property_id),
+                source_name TEXT NOT NULL, state TEXT NOT NULL,
+                query_scope TEXT NOT NULL, checked_at TEXT NOT NULL,
+                run_id TEXT REFERENCES source_runs(run_id), source_url TEXT,
+                raw_response_hash TEXT,
+                records_examined INTEGER NOT NULL DEFAULT 0,
+                records_matched INTEGER NOT NULL DEFAULT 0,
+                error_message TEXT,
+                PRIMARY KEY(property_id, source_name)
             );
             CREATE TABLE IF NOT EXISTS source_records (
                 source_name TEXT NOT NULL, source_record_id TEXT NOT NULL,
@@ -296,6 +307,65 @@ class IntelligenceStore:
             SELECT source_name,state,last_attempt_at,last_success_at,error_message
             FROM source_health WHERE state != 'healthy' ORDER BY source_name
             """
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def set_source_coverage(
+        self,
+        *,
+        property_id: str,
+        source_name: str,
+        state: CoverageState,
+        query_scope: str,
+        records_examined: int,
+        records_matched: int,
+        run_id: str | None = None,
+        source_url: str | None = None,
+        raw_response_hash: str | None = None,
+        error_message: str | None = None,
+        checked_at: str | None = None,
+    ) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO property_source_coverage (
+                property_id,source_name,state,query_scope,checked_at,run_id,
+                source_url,raw_response_hash,records_examined,records_matched,
+                error_message
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(property_id,source_name) DO UPDATE SET
+                state=excluded.state,query_scope=excluded.query_scope,
+                checked_at=excluded.checked_at,run_id=excluded.run_id,
+                source_url=excluded.source_url,
+                raw_response_hash=excluded.raw_response_hash,
+                records_examined=excluded.records_examined,
+                records_matched=excluded.records_matched,
+                error_message=excluded.error_message
+            """,
+            (
+                property_id,
+                source_name,
+                state.value,
+                query_scope,
+                checked_at or utc_now(),
+                run_id,
+                source_url,
+                raw_response_hash,
+                records_examined,
+                records_matched,
+                error_message,
+            ),
+        )
+        self.connection.commit()
+
+    def property_source_coverage(self, property_id: str) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            """
+            SELECT source_name,state,query_scope,checked_at,run_id,source_url,
+                   raw_response_hash,records_examined,records_matched,error_message
+            FROM property_source_coverage
+            WHERE property_id=? ORDER BY source_name
+            """,
+            (property_id,),
         ).fetchall()
         return [dict(row) for row in rows]
 

@@ -22,6 +22,15 @@ class SourceHealthState(StrEnum):
     DISABLED = "disabled"
 
 
+class CoverageState(StrEnum):
+    CONFIRMED_PRESENT = "confirmed_present"
+    CONFIRMED_ABSENT = "confirmed_absent"
+    UNKNOWN_FAILED = "unknown_failed"
+    UNKNOWN_NOT_RUN = "unknown_not_run"
+    UNKNOWN_STALE = "unknown_stale"
+    NOT_APPLICABLE = "not_applicable"
+
+
 class CollectionErrorKind(StrEnum):
     AUTHENTICATION = "authentication"
     BLOCKED = "blocked"
