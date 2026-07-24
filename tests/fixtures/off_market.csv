@@ -1,0 +1,4 @@
+source_record_id,folio,address,city,owner_name,unpaid_taxes,lis_pendens,active_liens,ownership_years,absentee,entity_status,code_escalation,units,current_noi,stabilized_noi,estimated_value,repairs,capex,source_url
+OM-001,04-3101-001-0010,101 Palm Avenue,Hialeah,Palm One Holdings LLC,12500,true,2,18,true,inactive,unsafe_structure,4,62000,70000,950000,50000,25000,manual-import://off_market.csv#OM-001
+OM-002,04-3101-099-0010,901 West 20 Street,Hialeah,West 20 Apartments LLC,0,false,0,22,true,active,open_cases,12,145000,175000,2800000,125000,80000,manual-import://off_market.csv#OM-002
+OM-003,04-3101-099-0020,905 West 20 Street,Hialeah,905 West LLC,,,,,,dissolved,,8,,,2100000,200000,100000,manual-import://off_market.csv#OM-003

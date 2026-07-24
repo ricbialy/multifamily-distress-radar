@@ -1,3 +1,4 @@
+import dataclasses
 import sqlite3
 import tempfile
 import unittest
@@ -5,6 +6,7 @@ from pathlib import Path
 
 from distress_radar.domain.evidence import EvidenceItem, FreshnessStatus, ValueType
 from distress_radar.domain.property import CanonicalProperty
+from distress_radar.sources.mls.matrix_csv import MatrixCsvImporter
 from distress_radar.intelligence_store import IntelligenceStore
 from distress_radar.sources.base import SourceHealthState
 
@@ -74,6 +76,54 @@ class IntelligenceStoreTests(unittest.TestCase):
                 warning = store.source_coverage_warnings()[0]
         self.assertEqual(warning["state"], "authentication_required")
         self.assertIn("credential missing", warning["error_message"])
+
+    def test_listing_snapshots_are_append_only_and_changes_persist(self) -> None:
+        fixture = Path(__file__).parent / "fixtures" / "matrix_20.csv"
+        importer = MatrixCsvImporter()
+        first = importer.import_file(
+            fixture, fetched_at="2026-07-23T12:00:00+00:00"
+        )[0]
+        second = importer.import_file(
+            fixture, fetched_at="2026-07-24T12:00:00+00:00"
+        )[0]
+        second = dataclasses.replace(second, list_price=800_000)
+        with tempfile.TemporaryDirectory() as temporary:
+            with IntelligenceStore(Path(temporary) / "radar.sqlite3") as store:
+                store.save_listing_snapshot(first)
+                changes = store.save_listing_snapshot(second)
+                count = store.connection.execute(
+                    "SELECT COUNT(*) FROM listing_snapshots"
+                ).fetchone()[0]
+                persisted = store.connection.execute(
+                    "SELECT change_type FROM listing_changes"
+                ).fetchall()
+        self.assertEqual(count, 2)
+        self.assertIn("price_change", {row[0] for row in persisted})
+        self.assertIn("price_change", {change.change_type for change in changes})
+
+    def test_human_decisions_and_outcomes_are_persisted_for_labels(self) -> None:
+        prop = CanonicalProperty(
+            property_id="property-1",
+            folio="0123456789010",
+            address="123 Main St",
+            municipality="Hialeah",
+            jurisdiction="Miami-Dade",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            with IntelligenceStore(Path(temporary) / "radar.sqlite3") as store:
+                store.upsert_property(prop)
+                store.record_human_decision(
+                    "property-1", "review_selected", "2026-07-24T12:00:00+00:00"
+                )
+                store.record_outcome(
+                    "property-1",
+                    "offer_made",
+                    "2026-07-25T12:00:00+00:00",
+                    amount=650_000,
+                )
+                labels = store.outcome_labels()
+        self.assertEqual([item["outcome_type"] for item in labels], ["offer_made"])
+        self.assertEqual(labels[0]["amount"], 650_000)
 
 
 if __name__ == "__main__":
