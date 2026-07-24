@@ -6,7 +6,7 @@ from pathlib import Path
 from distress_radar.domain.evidence import EvidenceItem
 from distress_radar.domain.property import CanonicalProperty
 from distress_radar.intelligence_store import IntelligenceStore
-from distress_radar.sources.base import SourceHealthState
+from distress_radar.sources.base import CoverageState, SourceHealthState
 from distress_radar.sources.mls.matrix_csv import MatrixCsvImporter
 
 
@@ -75,6 +75,42 @@ class IntelligenceStoreTests(unittest.TestCase):
                 warning = store.source_coverage_warnings()[0]
         self.assertEqual(warning["state"], "authentication_required")
         self.assertIn("credential missing", warning["error_message"])
+
+    def test_property_source_coverage_uses_exact_truth_states(self) -> None:
+        prop = CanonicalProperty(
+            property_id="property-coverage",
+            folio="0123456789010",
+            address="123 Main St",
+            municipality="Hialeah",
+            jurisdiction="Miami-Dade",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            with IntelligenceStore(Path(temporary) / "radar.sqlite3") as store:
+                store.upsert_property(prop)
+                store.set_source_coverage(
+                    property_id=prop.property_id,
+                    source_name="miami_dade_property_point_view",
+                    state=CoverageState.CONFIRMED_PRESENT,
+                    query_scope="folio:0123456789010",
+                    records_examined=1,
+                    records_matched=1,
+                )
+                store.set_source_coverage(
+                    property_id=prop.property_id,
+                    source_name="hialeah_tyler_energov",
+                    state=CoverageState.UNKNOWN_FAILED,
+                    query_scope="folio:0123456789010",
+                    records_examined=0,
+                    records_matched=0,
+                    error_message="timeout",
+                )
+                coverage = store.property_source_coverage(prop.property_id)
+        self.assertEqual(
+            {row["state"] for row in coverage},
+            {"confirmed_present", "unknown_failed"},
+        )
+        failed = next(row for row in coverage if row["state"] == "unknown_failed")
+        self.assertEqual(failed["error_message"], "timeout")
 
     def test_listing_snapshots_are_append_only_and_changes_persist(self) -> None:
         fixture = Path(__file__).parent / "fixtures" / "matrix_20.csv"
