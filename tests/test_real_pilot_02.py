@@ -194,6 +194,21 @@ class MunicipalSeverityTests(unittest.TestCase):
         self.assertEqual(classification.category, "minor_warning")
         self.assertEqual(classification.score, 10)
 
+    def test_case_age_is_stable_within_the_same_calendar_day(self) -> None:
+        municipal_case = case(opened_date="2026-05-07T22:34:50Z")
+
+        before_anniversary_time = classify_municipal_case(
+            municipal_case, as_of="2026-07-24T22:32:00Z"
+        )
+        after_anniversary_time = classify_municipal_case(
+            municipal_case, as_of="2026-07-24T22:38:00Z"
+        )
+
+        self.assertEqual(
+            before_anniversary_time.age_days,
+            after_anniversary_time.age_days,
+        )
+
 
 class EvidenceScoringTests(unittest.TestCase):
     def test_scores_are_calculated_from_visible_components(self) -> None:
