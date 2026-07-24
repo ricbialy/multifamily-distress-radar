@@ -124,6 +124,33 @@ class EndToEndIntelligenceTests(unittest.TestCase):
             brief,
         )
 
+    def test_missing_repair_inputs_do_not_become_zero_cost_offer(self) -> None:
+        headers = (FIXTURES / "off_market.csv").read_text().splitlines()[0]
+        row = (
+            "OM-MISSING,04-3101-001-0010,101 Palm Avenue,Hialeah,FL,33010,"
+            "Palm One Holdings LLC,12500,true,2,18,true,inactive,,4,62000,"
+            "70000,950000,,,manual-import://off_market.csv#OM-MISSING"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary_path = Path(temporary)
+            off_market = temporary_path / "off_market_missing_costs.csv"
+            off_market.write_text(f"{headers}\n{row}\n", encoding="utf-8")
+            result = run_fixture_demo(
+                matrix_path=FIXTURES / "matrix_20.csv",
+                off_market_path=off_market,
+                output_dir=temporary_path / "output",
+                generated_at="2026-07-24T12:00:00+00:00",
+            )
+            records = json.loads(result.json_path.read_text())
+
+        candidate = next(item for item in records if item["folio"] == "0431010010010")
+        self.assertEqual(
+            candidate["preliminary_offer_range"]["status"],
+            "insufficient_data",
+        )
+        self.assertIn("repairs", candidate["missing_data"])
+        self.assertIn("capex", candidate["missing_data"])
+
 
 if __name__ == "__main__":
     unittest.main()
