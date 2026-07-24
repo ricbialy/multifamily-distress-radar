@@ -42,6 +42,33 @@ class PropertyCollectorTests(unittest.TestCase):
         self.assertEqual(record.owner_name, "HUDSON PARK PARTNERS LLC")
         self.assertEqual(record.longitude, -80.3)
 
+    def test_exact_folio_lookup_uses_authoritative_query(self) -> None:
+        collector = ArcGisPropertyCollector(load_city_config("hialeah_fl", CONFIG_DIR))
+        requests: list[dict[str, object]] = []
+
+        def request(url: str, params: dict[str, object]) -> dict[str, object]:
+            requests.append(params)
+            return {"features": []}
+
+        collector._request = request  # type: ignore[method-assign]
+        result = collector.lookup_exact_folio("04-2025-001-0241")
+        self.assertEqual(result.records, ())
+        self.assertEqual(requests[0]["where"], "FOLIO = '0420250010241'")
+        self.assertEqual(result.raw_documents[0].kind, "property_exact_folio")
+
+    def test_address_lookup_normalizes_matrix_street_suffix(self) -> None:
+        collector = ArcGisPropertyCollector(load_city_config("hialeah_fl", CONFIG_DIR))
+        requests: list[dict[str, object]] = []
+
+        def request(url: str, params: dict[str, object]) -> dict[str, object]:
+            requests.append(params)
+            return {"features": []}
+
+        collector._request = request  # type: ignore[method-assign]
+        collector.lookup_address("1440 SW 4th St")
+        self.assertIn("1440 SW 4", str(requests[0]["where"]))
+        self.assertIn("LIKE", str(requests[0]["where"]))
+
 
 if __name__ == "__main__":
     unittest.main()
