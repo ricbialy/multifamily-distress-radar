@@ -34,6 +34,9 @@ class RecommendationFeatures:
     key_risks: tuple[str, ...] = ()
     missing_data: tuple[str, ...] = ()
     evidence: tuple[EvidenceItem, ...] = ()
+    is_synthetic: bool = False
+    identity_verified: bool = True
+    specific_opportunity: bool = True
 
     @classmethod
     def actionable(

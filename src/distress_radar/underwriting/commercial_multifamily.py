@@ -21,6 +21,8 @@ class CommercialMultifamilyInputs:
     market_cap_rate_base: float | None
     market_cap_rate_high: float | None
     building_area: float | None = None
+    public_unit_count_verified: bool = False
+    advertised_units: int | None = None
 
 
 @dataclass(frozen=True)
@@ -63,8 +65,48 @@ def underwrite_commercial(
     missing = [name for name, value in required.items() if value is None]
     if inputs.units is not None and inputs.units < 5:
         missing.append("five_plus_unit_segment")
+    if not inputs.public_unit_count_verified:
+        missing.append("verified_public_unit_count")
+    if (
+        inputs.units is not None
+        and inputs.advertised_units is not None
+        and inputs.units != inputs.advertised_units
+    ):
+        missing.append("unit_count_disagreement")
+    if inputs.current_noi is not None and inputs.current_noi <= 0:
+        missing.append("positive_current_noi")
+    cap_rates = (
+        inputs.market_cap_rate_low,
+        inputs.market_cap_rate_base,
+        inputs.market_cap_rate_high,
+    )
+    if any(rate is not None and rate <= 0 for rate in cap_rates):
+        missing.append("valid_cap_rate_support")
+    if (
+        inputs.gross_potential_rent is not None
+        and inputs.market_vacancy_rate is not None
+        and inputs.management_rate is not None
+    ):
+        effective_income = inputs.gross_potential_rent * (
+            1 - inputs.market_vacancy_rate
+        )
+        known_expenses = sum(
+            value or 0
+            for value in (
+                inputs.taxes_after_sale,
+                inputs.insurance,
+                effective_income * inputs.management_rate,
+                inputs.utilities,
+                inputs.maintenance,
+                inputs.other_operating_expenses,
+            )
+        )
+        if effective_income > 0 and known_expenses / effective_income < 0.15:
+            missing.append("plausible_operating_expenses")
     if missing:
-        return CommercialMultifamilyResult("insufficient_data", tuple(missing))
+        return CommercialMultifamilyResult(
+            "insufficient_data", tuple(dict.fromkeys(missing))
+        )
 
     assert inputs.units is not None
     assert inputs.gross_potential_rent is not None

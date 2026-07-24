@@ -11,7 +11,8 @@ from distress_radar.recommendations.features import (
 SUPPORTED_ACTIONS = {
     "contact_owner",
     "contact_broker",
-    "underwrite",
+    "excluded",
+    "verify_identity",
     "request_documents",
     "human_violation_review",
     "order_municipal_search",
@@ -33,26 +34,36 @@ class RecommendationResult:
 
 def _action(features: RecommendationFeatures) -> str:
     scores = features.scores
-    if scores.property_risk >= 85:
-        return "reject_high_risk"
+    if features.is_synthetic:
+        return "excluded"
+    if not features.identity_verified:
+        return "verify_identity"
+    if features.violation_review_required:
+        return "human_violation_review"
+    if features.critical_documents_missing:
+        return "request_documents"
     if (
         scores.data_completeness < 40
         or scores.data_confidence < 40
         or scores.data_freshness < 35
     ):
         return "insufficient_data"
-    if features.violation_review_required:
-        return "human_violation_review"
     if features.municipal_search_required:
         return "order_municipal_search"
     if not features.has_underwriting:
-        return "underwrite"
-    if features.critical_documents_missing:
-        return "request_documents"
+        return "insufficient_data"
+    if scores.property_risk >= 85:
+        return "reject_high_risk"
     if scores.economics < 30:
         return "reject"
     if scores.owner_motivation >= 65 and scores.economics >= 60:
-        return "contact_broker" if "mls" in features.discovery_channels else "contact_owner"
+        if not features.specific_opportunity:
+            return "watch"
+        return (
+            "contact_broker"
+            if "mls" in features.discovery_channels
+            else "contact_owner"
+        )
     return "watch"
 
 

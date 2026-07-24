@@ -279,14 +279,24 @@ def run_fixture_demo(
         recommendation = recommend(features)
         offer = calculate_offer_range(
             OfferInputs(
-                stabilized_value=(
+                stabilized_value_low=(
+                    off_market.estimated_value
+                    if off_market and has_offer_inputs
+                    else None
+                ),
+                stabilized_value_base=(
+                    off_market.estimated_value
+                    if off_market and has_offer_inputs
+                    else None
+                ),
+                stabilized_value_high=(
                     off_market.estimated_value
                     if off_market and has_offer_inputs
                     else None
                 ),
                 required_margin_rate=0.10,
-                repairs=off_market.repairs or 0 if off_market else 0,
-                capital_expenditures=off_market.capex or 0 if off_market else 0,
+                repairs=off_market.repairs if off_market else None,
+                capital_expenditures=off_market.capex if off_market else None,
                 violation_permit_contingency=25_000 if risk else 0,
                 closing_cost_rate=0.03,
                 financing_cost_rate=0.02,
