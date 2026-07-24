@@ -33,6 +33,26 @@ class TaxImportTests(unittest.TestCase):
             self.assertEqual(row["delinquent_tax_amount"], "12345.67")
             self.assertEqual(row["financial_distress_score"], "35")
 
+    def test_unpaid_status_is_not_interpreted_as_paid(self) -> None:
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "tax.csv"
+            path.write_text(
+                "folio,tax year,balance due,status\n"
+                "14-2235-001-0020,2024,1200.00,Unpaid\n",
+                encoding="utf-8",
+            )
+            records = import_tax_csv("surfside_fl", path)
+            with RadarStore(Path(temporary) / "radar.sqlite3") as store:
+                property_run = store.start_run("surfside_fl", "property", ())
+                store.upsert_properties(property_run, (sample_property(),))
+                run_id = store.start_run("surfside_fl", "tax_csv", ())
+                store.upsert_tax_delinquencies(run_id, records)
+                output = Path(temporary) / "opportunities.csv"
+                store.export_opportunities_csv("surfside_fl", output, 1)
+                with output.open(encoding="utf-8") as handle:
+                    row = next(csv.DictReader(handle))
+            self.assertEqual(row["financial_distress_score"], "35")
+
 
 if __name__ == "__main__":
     unittest.main()
