@@ -230,6 +230,18 @@ def run_fixture_demo(
         missing_data = tuple(
             item.field for item in evidence if item.value_type == ValueType.UNKNOWN
         )
+        has_offer_inputs = bool(
+            off_market
+            and all(
+                value is not None
+                for value in (
+                    off_market.estimated_value,
+                    off_market.stabilized_noi,
+                    off_market.repairs,
+                    off_market.capex,
+                )
+            )
+        )
         features = RecommendationFeatures(
             property_id="property-" + hashlib.sha256(key.encode()).hexdigest()[:16],
             discovery_channels=channels,
@@ -242,9 +254,7 @@ def run_fixture_demo(
                 data_completeness=completeness,
                 data_freshness=freshness,
             ),
-            has_underwriting=bool(
-                off_market and off_market.estimated_value and off_market.stabilized_noi
-            ),
+            has_underwriting=has_offer_inputs,
             critical_documents_missing=False,
             violation_review_required=any(
                 signal.signal_type == "unsafe_structure" for signal in signals
@@ -264,9 +274,7 @@ def run_fixture_demo(
             OfferInputs(
                 stabilized_value=(
                     off_market.estimated_value
-                    if off_market
-                    and off_market.estimated_value
-                    and off_market.stabilized_noi
+                    if off_market and has_offer_inputs
                     else None
                 ),
                 required_margin_rate=0.10,
