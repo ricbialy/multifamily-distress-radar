@@ -29,6 +29,12 @@ class EndToEndIntelligenceTests(unittest.TestCase):
         self.assertEqual(len(both), 1)
         self.assertEqual(both[0]["folio"], "0431010010010")
         self.assertEqual(both[0]["address"], "101 Palm Ave, Hialeah, FL 33010")
+        self.assertEqual(
+            both[0]["address_validation_status"], "corroborated"
+        )
+        self.assertEqual(
+            both[0]["address_validation_source"], "matrix + off_market_csv"
+        )
         self.assertTrue(both[0]["evidence"])
         self.assertEqual(
             both[0]["preliminary_offer_range"]["status"], "complete"
@@ -42,7 +48,10 @@ class EndToEndIntelligenceTests(unittest.TestCase):
             incomplete["preliminary_offer_range"]["status"], "insufficient_data"
         )
         self.assertIn("Top 10 actionable opportunities", brief)
-        self.assertIn("101 Palm Ave, Hialeah, FL 33010", brief)
+        self.assertIn(
+            "101 Palm Ave, Hialeah, FL 33010 [address: corroborated]", brief
+        )
+        self.assertIn("[address: unverified]", brief)
         self.assertIn("recommended_action", csv_text.splitlines()[0])
 
 
