@@ -19,6 +19,39 @@ published v0.14 baseline.
 
 ## Acquisition-intelligence fixture demo
 
+## REAL-PILOT-01 persisted workflow
+
+Run the genuine Matrix export through row validation, county identity
+verification, live Hialeah public-record enrichment, persisted hard gates, and
+database-derived reports:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m distress_radar pilot-run \
+  --matrix /absolute/path/to/Agent\ Single\ Line\ -\ COM.csv \
+  --db /absolute/path/to/pilot.sqlite \
+  --output-dir /absolute/path/to/pilot-output \
+  --municipality hialeah
+```
+
+The genuine export headers map as follows: `MLS # Link` → MLS number, `St` →
+listing status, `Address` → submitted street address, `Current Price` → list
+price, and `Type of Property` → property class. Missing optional city, folio,
+unit, rent, NOI, and expense columns remain unknown; they are not filled from
+assumptions. Per-row acceptance or rejection is written to `import_ledger.csv`.
+
+For a fresh database, the repeatable G0–G11 acceptance command is:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m distress_radar pilot-verify \
+  --matrix /absolute/path/to/Agent\ Single\ Line\ -\ COM.csv \
+  --db /absolute/path/to/fresh-verification.sqlite \
+  --output-dir /absolute/path/to/verification-output \
+  --municipality hialeah
+```
+
+Neither command modifies the supplied Matrix file. The verification command
+creates a separate controlled-change copy under its output directory.
+
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -e .

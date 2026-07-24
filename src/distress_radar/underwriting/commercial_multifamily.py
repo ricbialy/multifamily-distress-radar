@@ -125,6 +125,13 @@ def underwrite_commercial(
     )
     reconstructed_noi = inputs.gross_potential_rent - expenses
     stabilized_noi = effective_income - expenses
+    if stabilized_noi <= 0:
+        return CommercialMultifamilyResult(
+            "insufficient_data", ("positive_stabilized_noi",),
+            current_noi=inputs.current_noi,
+            reconstructed_noi=round(reconstructed_noi, 2),
+            stabilized_noi=round(stabilized_noi, 2),
+        )
     assert inputs.market_cap_rate_low
     assert inputs.market_cap_rate_base
     assert inputs.market_cap_rate_high

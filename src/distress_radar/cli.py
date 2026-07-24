@@ -158,6 +158,14 @@ def build_parser() -> argparse.ArgumentParser:
     pilot_run.add_argument("--output-dir", type=Path, required=True)
     pilot_run.add_argument("--municipality", default="hialeah")
     pilot_run.add_argument("--simulate-source-failure", action="store_true")
+    pilot_verify = subparsers.add_parser(
+        "pilot-verify",
+        help="Run the repeat, controlled-change, failure, and G0-G11 acceptance harness",
+    )
+    pilot_verify.add_argument("--matrix", type=Path, required=True)
+    pilot_verify.add_argument("--db", type=Path, required=True)
+    pilot_verify.add_argument("--output-dir", type=Path, required=True)
+    pilot_verify.add_argument("--municipality", default="hialeah")
     return parser
 
 
@@ -168,6 +176,38 @@ def main(argv: list[str] | None = None) -> None:
         format="%(levelname)s %(name)s: %(message)s",
     )
     try:
+        if args.command == "pilot-verify":
+            from distress_radar.pilot_verification import verify_real_pilot
+
+            result = verify_real_pilot(
+                matrix_path=args.matrix,
+                database_path=args.db,
+                output_dir=args.output_dir,
+                municipality=args.municipality,
+            )
+            print(
+                json.dumps(
+                    {
+                        "status": result.status,
+                        "gates": [
+                            {
+                                "gate": gate.gate,
+                                "status": gate.status,
+                                "evidence": gate.evidence,
+                            }
+                            for gate in result.gates
+                        ],
+                        "first_run_counts": result.first_run_counts,
+                        "second_run_counts": result.second_run_counts,
+                        "controlled_change": result.controlled_change,
+                        "source_statuses": result.source_statuses,
+                        "output_path": str(result.output_path),
+                    },
+                    indent=2,
+                )
+            )
+            return
+
         if args.command == "pilot-run":
             from distress_radar.pilot import run_pilot
 

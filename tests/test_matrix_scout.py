@@ -38,7 +38,7 @@ class MatrixScoutTests(unittest.TestCase):
         )
 
         self.assertEqual(batch.header_mapping["mls_number"], "MLS # Link")
-        self.assertEqual(batch.header_mapping["state"], "St")
+        self.assertEqual(batch.header_mapping["status"], "St")
         self.assertEqual(batch.header_mapping["list_price"], "Current Price")
         self.assertEqual(batch.header_mapping["property_class"], "Type of Property")
         self.assertEqual(len(batch.accepted), 1)

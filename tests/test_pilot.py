@@ -138,6 +138,96 @@ class PilotTests(unittest.TestCase):
         self.assertEqual(off_market["recommended_action"], "human_violation_review")
         self.assertTrue(listed["evidence_ids"])
 
+    def test_repeat_change_and_failure_are_auditable(self) -> None:
+        header = (
+            ",MLS # Link,St,Area,Address,,Current Price,ZN,Year Built,"
+            "Prop Type,Style of Property,Prop Type/Type of Building,"
+            "Type of Property,Property SqFt,Waterfront Property (Y/N),"
+            "Sale Price,#Bays\n"
+        )
+        active = (
+            '1,A123,A,41,100 Test Ave,,"$2,500,000",3901,1970,COM/Sale,,'
+            "Commercial/Residential Income,Income/MultiFamily,12000,,,,\n"
+        )
+        withdrawn = active.replace(",A,41,", ",W,41,", 1)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            matrix = root / "Agent Single Line - COM.csv"
+            matrix.write_text(header + active, encoding="utf-8")
+            db = root / "pilot.sqlite"
+            first = run_pilot(
+                matrix_path=matrix,
+                database_path=db,
+                output_dir=root / "first",
+                municipality="hialeah",
+                generated_at="2026-07-24T12:00:00+00:00",
+                property_collector=FakePropertyCollector(),
+                code_collector=FakeCodeCollector(),
+            )
+            second = run_pilot(
+                matrix_path=matrix,
+                database_path=db,
+                output_dir=root / "second",
+                municipality="hialeah",
+                generated_at="2026-07-24T13:00:00+00:00",
+                property_collector=FakePropertyCollector(),
+                code_collector=FakeCodeCollector(),
+            )
+            matrix.write_text(header + withdrawn, encoding="utf-8")
+            changed = run_pilot(
+                matrix_path=matrix,
+                database_path=db,
+                output_dir=root / "changed",
+                municipality="hialeah",
+                generated_at="2026-07-24T14:00:00+00:00",
+                property_collector=FakePropertyCollector(),
+                code_collector=FakeCodeCollector(),
+            )
+            failed = run_pilot(
+                matrix_path=matrix,
+                database_path=db,
+                output_dir=root / "failed",
+                municipality="hialeah",
+                generated_at="2026-07-24T15:00:00+00:00",
+                property_collector=FakePropertyCollector(),
+                code_collector=FakeCodeCollector(),
+                simulate_source_failure=True,
+            )
+            import sqlite3
+
+            connection = sqlite3.connect(db)
+            status_changes = connection.execute(
+                """
+                SELECT COUNT(*) FROM listing_changes
+                WHERE change_type='status_change'
+                """
+            ).fetchone()[0]
+            failed_coverage = connection.execute(
+                """
+                SELECT COUNT(*) FROM property_source_coverage
+                WHERE source_name='hialeah_tyler_energov'
+                  AND state='unknown_failed'
+                """
+            ).fetchone()[0]
+            connection.close()
+            failed_brief = (root / "failed" / "daily_brief.md").read_text()
+
+        self.assertEqual(
+            first.database_counts["canonical_properties"],
+            second.database_counts["canonical_properties"],
+        )
+        self.assertEqual(
+            first.database_counts["listing_snapshots"],
+            second.database_counts["listing_snapshots"],
+        )
+        self.assertEqual(status_changes, 1)
+        self.assertGreaterEqual(failed_coverage, 1)
+        self.assertIn("simulated source failure", failed_brief)
+        self.assertGreaterEqual(
+            failed.database_counts["recommendations"],
+            changed.database_counts["recommendations"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

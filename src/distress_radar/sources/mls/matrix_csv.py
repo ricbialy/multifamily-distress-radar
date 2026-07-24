@@ -20,7 +20,7 @@ _ALIASES = {
     "mls_number": ("mls number", "mls # link", "mls#", "mls", "listing id"),
     "address": ("property address", "address", "street address"),
     "municipality": ("city", "municipality"),
-    "state": ("state", "st", "state code"),
+    "state": ("state", "state code"),
     "postal_code": ("zip code", "zip", "postal code"),
     "folio": ("folio number", "folio", "apn", "parcel number"),
     "property_class": (
@@ -30,7 +30,7 @@ _ALIASES = {
         "class",
         "property class",
     ),
-    "status": ("status", "listing status"),
+    "status": ("status", "listing status", "st"),
     "list_price": ("list price", "price", "current price"),
     "dom": ("dom", "days on market"),
     "cdom": ("cdom", "cumulative days on market"),

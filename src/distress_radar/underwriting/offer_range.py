@@ -8,6 +8,7 @@ class OfferInputs:
     stabilized_value_low: float | None = None
     stabilized_value_base: float | None = None
     stabilized_value_high: float | None = None
+    asking_price: float | None = None
     required_margin_rate: float | None = None
     repairs: float | None = None
     capital_expenditures: float | None = None
@@ -43,6 +44,7 @@ def calculate_offer_range(inputs: OfferInputs) -> OfferRange:
         "stabilized_value_low",
         "stabilized_value_base",
         "stabilized_value_high",
+        "asking_price",
         "required_margin_rate",
         "repairs",
         "capital_expenditures",
@@ -62,6 +64,21 @@ def calculate_offer_range(inputs: OfferInputs) -> OfferRange:
         if any(value is not None and value <= 0 for value in values):
             missing += ("positive_stabilized_values",)
         return OfferRange(None, None, None, "insufficient_data", missing_data=missing)
+    assert inputs.asking_price is not None
+    if inputs.asking_price <= 0:
+        return OfferRange(
+            None, None, None, "insufficient_data",
+            missing_data=("positive_asking_price",),
+        )
+    if not (
+        inputs.stabilized_value_low
+        <= inputs.stabilized_value_base
+        <= inputs.stabilized_value_high
+    ):
+        return OfferRange(
+            None, None, None, "insufficient_data",
+            missing_data=("ordered_supported_value_scenarios",),
+        )
     assert all(value is not None for value in values)
     assert inputs.required_margin_rate is not None
     assert inputs.repairs is not None
@@ -71,6 +88,21 @@ def calculate_offer_range(inputs: OfferInputs) -> OfferRange:
     assert inputs.financing_cost_rate is not None
     assert inputs.insurance_flood_contingency is not None
     assert inputs.data_uncertainty_rate is not None
+    numeric_costs = (
+        inputs.required_margin_rate,
+        inputs.repairs,
+        inputs.capital_expenditures,
+        inputs.violation_permit_contingency,
+        inputs.closing_cost_rate,
+        inputs.financing_cost_rate,
+        inputs.insurance_flood_contingency,
+        inputs.data_uncertainty_rate,
+    )
+    if any(value < 0 for value in numeric_costs):
+        return OfferRange(
+            None, None, None, "insufficient_data",
+            missing_data=("nonnegative_costs_and_rates",),
+        )
     base_value = inputs.stabilized_value_base
     assert base_value is not None
     deductions = {
@@ -89,6 +121,15 @@ def calculate_offer_range(inputs: OfferInputs) -> OfferRange:
         + inputs.violation_permit_contingency
         + inputs.insurance_flood_contingency
     )
+    available_discount = base_value - inputs.asking_price
+    if fixed_costs > available_discount:
+        return OfferRange(
+            None,
+            None,
+            None,
+            "insufficient_data",
+            missing_data=("cure_costs_exceed_available_discount",),
+        )
     rate = (
         inputs.required_margin_rate
         + inputs.closing_cost_rate

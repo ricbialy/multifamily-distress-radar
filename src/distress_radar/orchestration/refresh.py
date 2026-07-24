@@ -294,6 +294,11 @@ def run_fixture_demo(
                     if off_market and has_offer_inputs
                     else None
                 ),
+                asking_price=(
+                    off_market.estimated_value * 0.60
+                    if off_market and has_offer_inputs and off_market.estimated_value
+                    else None
+                ),
                 required_margin_rate=0.10,
                 repairs=off_market.repairs if off_market else None,
                 capital_expenditures=off_market.capex if off_market else None,

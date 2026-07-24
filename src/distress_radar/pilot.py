@@ -11,6 +11,7 @@ from typing import Any
 from uuid import uuid4
 
 from distress_radar.collectors.arcgis_property import ArcGisPropertyCollector
+from distress_radar.collectors.miami_dade_clerk import MiamiDadeClerkCollector
 from distress_radar.collectors.tyler_energov import TylerEnerGovCollector
 from distress_radar.config import load_city_config
 from distress_radar.domain.evidence import EvidenceItem, FreshnessStatus, ValueType
@@ -20,8 +21,9 @@ from distress_radar.identity.address_normalizer import normalize_address
 from distress_radar.identity.address_validation import (
     AddressCandidate,
     CountyAddressValidator,
+    format_address,
 )
-from distress_radar.identity.folio_resolver import normalize_folio
+from distress_radar.identity.folio_resolver import FolioResolver, normalize_folio
 from distress_radar.identity.match_service import MatchService, MatchStatus
 from distress_radar.identity.owner_resolver import OwnerResolver, normalize_owner_name
 from distress_radar.intelligence_store import IntelligenceStore
@@ -133,9 +135,16 @@ def _canonical_owners(store: IntelligenceStore) -> tuple[CanonicalOwner, ...]:
 
 def _save_raw_document(
     store: IntelligenceStore, run_id: str, source_name: str, document: RawDocument
-) -> str:
+) -> tuple[str, bool]:
     payload = _json(document.payload)
     payload_hash = hashlib.sha256(payload.encode()).hexdigest()
+    previous = store.connection.execute(
+        """
+        SELECT 1 FROM source_records
+        WHERE source_name=? AND source_record_id=? AND payload_hash=? LIMIT 1
+        """,
+        (source_name, f"{document.kind}:{document.source_key}", payload_hash),
+    ).fetchone()
     store.connection.execute(
         """
         INSERT OR IGNORE INTO source_records (
@@ -155,7 +164,7 @@ def _save_raw_document(
         ),
     )
     store.connection.commit()
-    return payload_hash
+    return payload_hash, previous is None
 
 
 def _save_owner(store: IntelligenceStore, prop: CanonicalProperty, record: PropertyRecord) -> None:
@@ -233,22 +242,32 @@ def _record_for_matrix(
     county_run_id: str,
     collector: Any,
     generated_at: str,
-) -> tuple[str, bool]:
+) -> tuple[str, bool, bool, int]:
     query_scope = f"address:{listing.address}"
     county_record: PropertyRecord | None = None
     exact_documents: tuple[RawDocument, ...] = ()
     error: str | None = None
+    address_records_examined = 0
+    address_source_url: str | None = None
+    address_raw_hash: str | None = None
     try:
         address_result = collector.lookup_address(listing.address)
+        address_records_examined = len(address_result.records)
         for document in address_result.raw_documents:
-            _save_raw_document(store, county_run_id, COUNTY_SOURCE, document)
+            address_source_url = document.source_url
+            address_raw_hash, _ = _save_raw_document(
+                store, county_run_id, COUNTY_SOURCE, document
+            )
         candidates = tuple(
             record
             for record in address_result.records
             if normalize_address(record.address) == normalize_address(listing.address)
         )
         if candidates:
-            folio = normalize_folio(candidates[0].folio)
+            resolution = FolioResolver().resolve(
+                listing.folio, tuple(record.folio for record in candidates)
+            )
+            folio = resolution.folio
             exact_result = collector.lookup_exact_folio(folio or "")
             exact_documents = exact_result.raw_documents
             for document in exact_documents:
@@ -266,17 +285,40 @@ def _record_for_matrix(
 
     municipality = county_record.city if county_record and county_record.city else "Miami-Dade"
     folio = normalize_folio(county_record.folio) if county_record else None
-    address = county_record.address if county_record and county_record.address else listing.address
+    address = (
+        format_address(
+            county_record.address or listing.address,
+            municipality,
+            "FL",
+            county_record.zip_code,
+        )
+        if county_record
+        else listing.address
+    )
     existing = _canonical_properties(store)
-    match = MatchService().match(
-        folio=folio,
-        address=address,
-        municipality=municipality,
-        candidates=existing,
+    prior_listing = store.connection.execute(
+        """
+        SELECT property_id FROM listing_snapshots
+        WHERE mls_number=? AND source_name=? AND property_id IS NOT NULL
+        ORDER BY fetched_at DESC LIMIT 1
+        """,
+        (listing.source_record_id, listing.source_name),
+    ).fetchone()
+    match = (
+        None
+        if prior_listing
+        else MatchService().match(
+            folio=folio,
+            address=county_record.address if county_record and county_record.address else address,
+            municipality=municipality,
+            candidates=existing,
+        )
     )
     property_id = (
-        match.property_id
-        if match.status == MatchStatus.CONFIRMED and match.property_id
+        prior_listing["property_id"]
+        if prior_listing
+        else match.property_id
+        if match and match.status == MatchStatus.CONFIRMED and match.property_id
         else _property_id(folio, address, municipality)
     )
     prop = CanonicalProperty(
@@ -289,7 +331,7 @@ def _record_for_matrix(
         longitude=county_record.longitude if county_record else None,
     )
     store.upsert_property(prop)
-    store.save_listing_snapshot(listing, property_id)
+    listing_changes = store.save_listing_snapshot(listing, property_id)
 
     listing_evidence = EvidenceItem(
         field="matrix_listing",
@@ -342,6 +384,30 @@ def _record_for_matrix(
             },
         )
         store.add_evidence(property_id, county_evidence)
+        store.add_evidence(
+            property_id,
+            EvidenceItem(
+                field="public_property_record",
+                value={
+                    "folio": folio,
+                    "address": validation.address,
+                    "units": county_record.unit_count,
+                    "owner": county_record.owner_name,
+                    "property_class": county_record.dor_description,
+                    "pilot_segment_10_80": bool(
+                        county_record.unit_count
+                        and 10 <= county_record.unit_count <= 80
+                    ),
+                },
+                source=COUNTY_SOURCE,
+                source_record_id=county_record.folio,
+                source_url=county_record.source_url,
+                fetched_at=county_record.fetched_at,
+                freshness_status=FreshnessStatus.FRESH,
+                confidence=1.0,
+                value_type=ValueType.REPORTED,
+            ),
+        )
         store.set_source_coverage(
             property_id=property_id,
             source_name=COUNTY_SOURCE,
@@ -366,9 +432,11 @@ def _record_for_matrix(
             source_name=COUNTY_SOURCE,
             state=state,
             query_scope=query_scope,
-            records_examined=0,
+            records_examined=address_records_examined,
             records_matched=0,
             run_id=county_run_id,
+            source_url=address_source_url,
+            raw_response_hash=address_raw_hash,
             error_message=error,
             checked_at=generated_at,
         )
@@ -382,7 +450,7 @@ def _record_for_matrix(
                 reason=error or "no_exact_county_match",
             ),
         )
-    return property_id, verified
+    return property_id, verified, error is not None, len(listing_changes)
 
 
 def _persist_off_market(
@@ -402,10 +470,13 @@ def _persist_off_market(
             continue
         municipality = record.city or "HIALEAH"
         property_id = _property_id(folio, record.address, municipality)
+        complete_address = format_address(
+            record.address, municipality, "FL", record.zip_code
+        )
         prop = CanonicalProperty(
             property_id=property_id,
             folio=folio,
-            address=record.address,
+            address=complete_address,
             municipality=municipality,
             jurisdiction="Miami-Dade",
             latitude=record.latitude,
@@ -421,7 +492,7 @@ def _persist_off_market(
             prop = CanonicalProperty(
                 property_id=match.property_id,
                 folio=folio,
-                address=record.address,
+                address=complete_address,
                 municipality=municipality,
                 jurisdiction="Miami-Dade",
                 latitude=record.latitude,
@@ -545,6 +616,27 @@ def _persist_underwriting_and_recommendations(
                 CoverageState.UNKNOWN_STALE.value,
             }
         )
+        source_gap_evidence_ids: list[str] = []
+        for row in coverage:
+            if row["state"] not in {
+                CoverageState.UNKNOWN_FAILED.value,
+                CoverageState.UNKNOWN_NOT_RUN.value,
+                CoverageState.UNKNOWN_STALE.value,
+            }:
+                continue
+            source_gap_evidence_ids.append(
+                store.add_evidence(
+                    property_id,
+                    EvidenceItem.unknown(
+                        field=f"source_coverage:{row['source_name']}",
+                        source=row["source_name"],
+                        source_record_id=row["run_id"] or property_id,
+                        fetched_at=row["checked_at"],
+                        reason=row["error_message"] or row["state"],
+                        source_url=row["source_url"],
+                    ),
+                )
+            )
         units_row = store.connection.execute(
             """
             SELECT value_json FROM evidence_items
@@ -641,10 +733,52 @@ def _persist_underwriting_and_recommendations(
                 (property_id,),
             ).fetchall()
         )
+        listing_evidence_ids = tuple(
+            row["evidence_id"]
+            for row in store.connection.execute(
+                """
+                SELECT evidence_id FROM evidence_items
+                WHERE property_id=? AND field_name='matrix_listing'
+                ORDER BY fetched_at,evidence_id
+                """,
+                (property_id,),
+            ).fetchall()
+        )
+        identity_evidence_ids = tuple(
+            row["evidence_id"]
+            for row in store.connection.execute(
+                """
+                SELECT evidence_id FROM evidence_items
+                WHERE property_id=? AND field_name IN (
+                    'validated_address','public_property_record'
+                ) ORDER BY fetched_at,evidence_id
+                """,
+                (property_id,),
+            ).fetchall()
+        )
+        municipal_evidence_ids = tuple(
+            row["evidence_id"]
+            for row in store.connection.execute(
+                """
+                SELECT evidence_id FROM evidence_items
+                WHERE property_id=? AND field_name='municipal_code_case'
+                ORDER BY fetched_at,evidence_id
+                """,
+                (property_id,),
+            ).fetchall()
+        )
         explanation = {
             **result.explanation,
             "missing_data": missing,
             "evidence_ids": evidence_ids,
+            "statement_evidence_ids": {
+                "why_this_property_surfaced": (
+                    municipal_evidence_ids or listing_evidence_ids
+                ),
+                "identity": identity_evidence_ids,
+                "property_risk": municipal_evidence_ids,
+                "missing_source_data": tuple(source_gap_evidence_ids),
+            },
             "discovery_channels": channels,
             "identity_verified": identity_verified,
             "underwriting_status": underwriting.status,
@@ -725,6 +859,7 @@ def _report_records(store: IntelligenceStore) -> list[dict[str, Any]]:
                 "key_risks": explanation["What could destroy the deal"],
                 "missing_data": explanation["missing_data"],
                 "evidence_ids": explanation["evidence_ids"],
+                "statement_evidence_ids": explanation["statement_evidence_ids"],
                 "underwriting_status": explanation["underwriting_status"],
                 "underwriting_run_id": explanation["underwriting_run_id"],
                 "offer_gate": explanation["offer_gate"],
@@ -998,24 +1133,25 @@ def run_pilot(
                 ),
             )
         store.connection.commit()
-        store.finish_source_run(
-            run_id=matrix_run,
-            state=SourceHealthState.HEALTHY,
-            records_examined=len(batch.ledger),
-            records_changed=len(batch.accepted),
-        )
-
         county_run = store.start_source_run(COUNTY_SOURCE)
         county_failures = 0
+        matrix_changes = 0
         for listing in batch.accepted:
-            _, verified = _record_for_matrix(
+            _, _, lookup_failed, listing_change_count = _record_for_matrix(
                 store=store,
                 listing=listing,
                 county_run_id=county_run,
                 collector=property_collector,
                 generated_at=generated_at,
             )
-            county_failures += int(not verified)
+            county_failures += int(lookup_failed)
+            matrix_changes += listing_change_count
+        store.finish_source_run(
+            run_id=matrix_run,
+            state=SourceHealthState.HEALTHY,
+            records_examined=len(batch.ledger),
+            records_changed=matrix_changes,
+        )
 
         code_run = store.start_source_run(CODE_SOURCE)
         cases: tuple[CodeCase, ...] = ()
@@ -1061,61 +1197,140 @@ def run_pilot(
 
         store.finish_source_run(
             run_id=county_run,
-            state=SourceHealthState.DEGRADED if inventory_error else SourceHealthState.HEALTHY,
+            state=(
+                SourceHealthState.DEGRADED
+                if inventory_error or county_failures
+                else SourceHealthState.HEALTHY
+            ),
             records_examined=len(inventory) + len(batch.accepted),
-            records_changed=len(inventory),
-            error_message=inventory_error,
+            records_changed=0,
+            error_message=inventory_error
+            or (
+                f"{county_failures} Matrix county lookup(s) failed"
+                if county_failures
+                else None
+            ),
         )
         store.finish_source_run(
             run_id=code_run,
             state=SourceHealthState.DEGRADED if code_error else SourceHealthState.HEALTHY,
             records_examined=len(cases),
-            records_changed=len(cases),
+            records_changed=0,
             error_message=code_error,
         )
 
+        clerk_run = store.start_source_run(CLERK_SOURCE)
+        clerk_by_folio: dict[str, list[Any]] = {}
+        clerk_error: str | None = None
+        clerk_configured = bool(os.environ.get("MIAMI_DADE_CLERK_AUTH_KEY"))
+        if clerk_configured:
+            try:
+                folios = [
+                    prop.folio
+                    for prop in _canonical_properties(store)
+                    if prop.folio
+                ]
+                clerk_result = MiamiDadeClerkCollector(config).collect(folios)
+                for document in clerk_result.raw_documents:
+                    _save_raw_document(store, clerk_run, CLERK_SOURCE, document)
+                for record in clerk_result.records:
+                    clerk_by_folio.setdefault(
+                        normalize_folio(record.folio) or "", []
+                    ).append(record)
+                store.finish_source_run(
+                    run_id=clerk_run,
+                    state=SourceHealthState.HEALTHY,
+                    records_examined=len(folios),
+                    records_changed=0,
+                )
+            except Exception as exc:
+                clerk_error = str(exc)
+                store.finish_source_run(
+                    run_id=clerk_run,
+                    state=SourceHealthState.DEGRADED,
+                    records_examined=0,
+                    records_changed=0,
+                    error_message=clerk_error,
+                )
+        else:
+            store.finish_source_run(
+                run_id=clerk_run,
+                state=SourceHealthState.DISABLED,
+                records_examined=0,
+                records_changed=0,
+                error_message="MIAMI_DADE_CLERK_AUTH_KEY not configured",
+            )
+
         for prop in _canonical_properties(store):
             is_hialeah = prop.municipality.casefold() == "hialeah"
-            if not any(
-                row["source_name"] == CODE_SOURCE
-                for row in store.property_source_coverage(prop.property_id)
-            ):
-                matched = cases_by_folio.get(normalize_folio(prop.folio) or "", [])
-                state = (
-                    CoverageState.NOT_APPLICABLE
-                    if not is_hialeah
-                    else CoverageState.UNKNOWN_FAILED
-                    if code_error
-                    else CoverageState.CONFIRMED_PRESENT
-                    if matched
-                    else CoverageState.CONFIRMED_ABSENT
-                )
-                store.set_source_coverage(
-                    property_id=prop.property_id,
-                    source_name=CODE_SOURCE,
-                    state=state,
-                    query_scope=f"folio:{prop.folio or 'unverified'}",
-                    records_examined=len(cases),
-                    records_matched=len(matched),
-                    run_id=code_run,
-                    error_message=code_error if state == CoverageState.UNKNOWN_FAILED else None,
-                    checked_at=generated_at,
+            matched = cases_by_folio.get(normalize_folio(prop.folio) or "", [])
+            state = (
+                CoverageState.NOT_APPLICABLE
+                if not is_hialeah
+                else CoverageState.UNKNOWN_FAILED
+                if code_error
+                else CoverageState.CONFIRMED_PRESENT
+                if matched
+                else CoverageState.CONFIRMED_ABSENT
+            )
+            store.set_source_coverage(
+                property_id=prop.property_id,
+                source_name=CODE_SOURCE,
+                state=state,
+                query_scope=f"folio:{prop.folio or 'unverified'}",
+                records_examined=len(cases),
+                records_matched=len(matched),
+                run_id=code_run,
+                error_message=code_error if state == CoverageState.UNKNOWN_FAILED else None,
+                checked_at=generated_at,
+            )
+            official_records = clerk_by_folio.get(
+                normalize_folio(prop.folio) or "", []
+            )
+            clerk_state = (
+                CoverageState.UNKNOWN_NOT_RUN
+                if not clerk_configured
+                else CoverageState.UNKNOWN_FAILED
+                if clerk_error
+                else CoverageState.NOT_APPLICABLE
+                if not prop.folio
+                else CoverageState.CONFIRMED_PRESENT
+                if official_records
+                else CoverageState.CONFIRMED_ABSENT
+            )
+            for official_record in official_records:
+                store.add_evidence(
+                    prop.property_id,
+                    EvidenceItem(
+                        field="official_record",
+                        value={
+                            "instrument_id": official_record.instrument_id,
+                            "document_type": official_record.document_type,
+                            "signal_type": official_record.signal_type,
+                            "recorded_date": official_record.recorded_date,
+                        },
+                        source=CLERK_SOURCE,
+                        source_record_id=official_record.source_record_id,
+                        source_url=official_record.source_url,
+                        fetched_at=official_record.fetched_at,
+                        freshness_status=FreshnessStatus.FRESH,
+                        confidence=1.0,
+                        value_type=ValueType.REPORTED,
+                    ),
                 )
             store.set_source_coverage(
                 property_id=prop.property_id,
                 source_name=CLERK_SOURCE,
-                state=(
-                    CoverageState.UNKNOWN_NOT_RUN
-                    if not os.environ.get("MIAMI_DADE_CLERK_AUTH_KEY")
-                    else CoverageState.UNKNOWN_FAILED
-                ),
+                state=clerk_state,
                 query_scope=f"folio:{prop.folio or 'unverified'}",
-                records_examined=0,
-                records_matched=0,
-                error_message=(
-                    "credential configured but collector not completed"
-                    if os.environ.get("MIAMI_DADE_CLERK_AUTH_KEY")
-                    else "MIAMI_DADE_CLERK_AUTH_KEY not configured"
+                records_examined=1 if clerk_configured and prop.folio else 0,
+                records_matched=len(official_records),
+                run_id=clerk_run,
+                error_message=clerk_error
+                or (
+                    "MIAMI_DADE_CLERK_AUTH_KEY not configured"
+                    if not clerk_configured
+                    else None
                 ),
                 checked_at=generated_at,
             )

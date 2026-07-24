@@ -389,6 +389,15 @@ class IntelligenceStore:
                 raw_payload=json.loads(previous_row["raw_payload_json"]),
             )
         if previous is not None and previous.stable_dict() == snapshot.stable_dict():
+            if property_id is not None:
+                self.connection.execute(
+                    """
+                    UPDATE listing_snapshots SET property_id=?
+                    WHERE mls_number=? AND source_name=?
+                    """,
+                    (property_id, snapshot.source_record_id, snapshot.source_name),
+                )
+                self.connection.commit()
             return ()
         changes = detect_listing_changes(previous, snapshot)
         self.connection.execute(
