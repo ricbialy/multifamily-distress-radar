@@ -175,6 +175,7 @@ class MunicipalSeverityTests(unittest.TestCase):
         swale = case(
             case_type="Swale Alteration",
             status="Notice of Violation Extension",
+            opened_date="2026-05-27",
             description="Failure to comply with swale maintenance standards.",
             violations=(
                 {

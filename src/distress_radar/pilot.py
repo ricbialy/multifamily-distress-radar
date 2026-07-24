@@ -194,6 +194,15 @@ def _years_since(value: str | None, as_of: str) -> float | None:
     return round(max(0, (now - then).days) / 365.25, 1)
 
 
+def _display_date(value: str | None) -> str:
+    if not value:
+        return "Not available"
+    compact = value.strip()
+    if len(compact) == 8 and compact.isdigit():
+        return f"{compact[:4]}-{compact[4:6]}-{compact[6:]}"
+    return compact[:10]
+
+
 def _county_value(record: PropertyRecord, generated_at: str) -> dict[str, Any]:
     property_address = normalize_address(
         " ".join(value for value in (record.address, record.city) if value)
@@ -1067,9 +1076,16 @@ def _persist_underwriting_and_recommendations(
 
         municipal_rows = store.connection.execute(
             """
-            SELECT source_record_id,value_json FROM evidence_items
-            WHERE property_id=? AND field_name='municipal_code_case'
-            ORDER BY fetched_at DESC,evidence_id DESC
+            SELECT e.source_record_id,e.value_json FROM evidence_items e
+            WHERE e.property_id=? AND e.field_name='municipal_code_case'
+              AND e.evidence_id=(
+                  SELECT e2.evidence_id FROM evidence_items e2
+                  WHERE e2.property_id=e.property_id
+                    AND e2.field_name=e.field_name
+                    AND e2.source_record_id=e.source_record_id
+                  ORDER BY e2.fetched_at DESC,e2.evidence_id DESC LIMIT 1
+              )
+            ORDER BY e.source_record_id
             """,
             (property_id,),
         ).fetchall()
@@ -1082,26 +1098,50 @@ def _persist_underwriting_and_recommendations(
             municipal_values.append(json.loads(row["value_json"]))
         municipal = tuple(severity_from_mapping(value) for value in municipal_values)
         official_records = tuple(
-            json.loads(row["value_json"])
-            for row in store.connection.execute(
+            sorted(
+                (
+                    json.loads(row["value_json"])
+                    for row in store.connection.execute(
                 """
-                SELECT value_json FROM evidence_items
-                WHERE property_id=? AND field_name='official_record'
-                ORDER BY fetched_at DESC,evidence_id DESC
+                SELECT e.value_json FROM evidence_items e
+                WHERE e.property_id=? AND e.field_name='official_record'
+                  AND e.evidence_id=(
+                      SELECT e2.evidence_id FROM evidence_items e2
+                      WHERE e2.property_id=e.property_id
+                        AND e2.field_name=e.field_name
+                        AND e2.source_record_id=e.source_record_id
+                      ORDER BY e2.fetched_at DESC,e2.evidence_id DESC LIMIT 1
+                  )
+                ORDER BY e.source_record_id
                 """,
                 (property_id,),
-            ).fetchall()
+                    ).fetchall()
+                ),
+                key=_json,
+            )
         )
         tax_records = tuple(
-            json.loads(row["value_json"])
-            for row in store.connection.execute(
+            sorted(
+                (
+                    json.loads(row["value_json"])
+                    for row in store.connection.execute(
                 """
-                SELECT value_json FROM evidence_items
-                WHERE property_id=? AND field_name='tax_delinquency'
-                ORDER BY fetched_at DESC,evidence_id DESC
+                SELECT e.value_json FROM evidence_items e
+                WHERE e.property_id=? AND e.field_name='tax_delinquency'
+                  AND e.evidence_id=(
+                      SELECT e2.evidence_id FROM evidence_items e2
+                      WHERE e2.property_id=e.property_id
+                        AND e2.field_name=e.field_name
+                        AND e2.source_record_id=e.source_record_id
+                      ORDER BY e2.fetched_at DESC,e2.evidence_id DESC LIMIT 1
+                  )
+                ORDER BY e.source_record_id
                 """,
                 (property_id,),
-            ).fetchall()
+                    ).fetchall()
+                ),
+                key=_json,
+            )
         )
         source_gaps = tuple(
             f"{row['source_name']}:{row['state']}"
@@ -1255,6 +1295,22 @@ def _persist_underwriting_and_recommendations(
             + 0.05 * scores.data_completeness,
             2,
         )
+        ranking_tiebreakers = {
+            "maximum_municipal_severity": max(
+                (item.score for item in municipal), default=0
+            ),
+            "oldest_unresolved_case_days": max(
+                (
+                    item.age_days
+                    for item in municipal
+                    if item.age_days is not None
+                    and item.status_category != "closed_or_resolved"
+                ),
+                default=0,
+            ),
+            "serious_case_count": sum(item.score >= 50 for item in municipal),
+            "ownership_duration_years": county.get("ownership_duration_years") or 0,
+        }
         stable_payload = {
             "property_id": property_id,
             "listing": listing,
@@ -1346,6 +1402,7 @@ def _persist_underwriting_and_recommendations(
             "score_components": score_result.components,
             "preliminary_metrics": score_result.metrics,
             "qualification_score": qualification_score,
+            "ranking_tiebreakers": ranking_tiebreakers,
             "discovery_channels": channels,
             "identity_verified": identity_verified,
             "underwriting_status": underwriting.status,
@@ -1495,6 +1552,7 @@ def _report_records(store: IntelligenceStore) -> list[dict[str, Any]]:
                 "score_components": explanation.get("score_components") or {},
                 "preliminary_metrics": explanation.get("preliminary_metrics") or {},
                 "qualification_score": explanation.get("qualification_score", 0),
+                "ranking_tiebreakers": explanation.get("ranking_tiebreakers") or {},
                 "why_now": explanation["Why this property surfaced"],
                 "motivation_evidence": explanation["Why the owner may be motivated"],
                 "key_risks": explanation["What could destroy the deal"],
@@ -1534,6 +1592,10 @@ def _report_records(store: IntelligenceStore) -> list[dict[str, Any]]:
         records,
         key=lambda item: (
             -float(item["qualification_score"]),
+            -float(item["ranking_tiebreakers"].get("maximum_municipal_severity", 0)),
+            -float(item["ranking_tiebreakers"].get("oldest_unresolved_case_days", 0)),
+            -float(item["ranking_tiebreakers"].get("serious_case_count", 0)),
+            -float(item["ranking_tiebreakers"].get("ownership_duration_years", 0)),
             str(item["property_id"]),
         ),
     )
@@ -1639,6 +1701,10 @@ def _write_reports(store: IntelligenceStore, output_dir: Path, run_id: str) -> t
         unique_selected.values(),
         key=lambda item: (
             -float(item["qualification_score"]),
+            -float(item["ranking_tiebreakers"].get("maximum_municipal_severity", 0)),
+            -float(item["ranking_tiebreakers"].get("oldest_unresolved_case_days", 0)),
+            -float(item["ranking_tiebreakers"].get("serious_case_count", 0)),
+            -float(item["ranking_tiebreakers"].get("ownership_duration_years", 0)),
             str(item["property_id"]),
         ),
     )[:10]
@@ -1653,17 +1719,42 @@ def _write_reports(store: IntelligenceStore, output_dir: Path, run_id: str) -> t
                 - float(next_item["qualification_score"]),
                 2,
             )
-            strongest = max(
-                (
-                    (name, float(value))
-                    for name, value in item["scores"].items()
-                ),
-                key=lambda pair: pair[1],
-            )
-            reason = (
-                f"Qualification score is {difference:.2f} points higher; "
-                f"strongest dimension is {strongest[0]} at {strongest[1]:.2f}."
-            )
+            if difference > 0:
+                strongest = max(
+                    (
+                        (name, float(value))
+                        for name, value in item["scores"].items()
+                    ),
+                    key=lambda pair: pair[1],
+                )
+                reason = (
+                    f"Qualification score is {difference:.2f} points higher; "
+                    f"strongest dimension is {strongest[0]} at {strongest[1]:.2f}."
+                )
+            elif (
+                item["ranking_tiebreakers"]["oldest_unresolved_case_days"]
+                != next_item["ranking_tiebreakers"]["oldest_unresolved_case_days"]
+            ):
+                reason = (
+                    "Qualification scores tie; the oldest unresolved municipal "
+                    f"matter is {item['ranking_tiebreakers']['oldest_unresolved_case_days']} "
+                    "days versus "
+                    f"{next_item['ranking_tiebreakers']['oldest_unresolved_case_days']} days."
+                )
+            elif (
+                item["ranking_tiebreakers"]["serious_case_count"]
+                != next_item["ranking_tiebreakers"]["serious_case_count"]
+            ):
+                reason = (
+                    "Qualification scores and oldest-case age tie; this property has "
+                    f"{item['ranking_tiebreakers']['serious_case_count']} serious case(s) "
+                    f"versus {next_item['ranking_tiebreakers']['serious_case_count']}."
+                )
+            else:
+                reason = (
+                    "Evidence scores and material tie-breakers are equal; stable "
+                    "canonical property identity provides the final reproducible order."
+                )
         item["ranked_above_next_reason"] = reason
 
     queue_path = output_dir / "qualified_queue.json"
@@ -1676,6 +1767,7 @@ def _write_reports(store: IntelligenceStore, output_dir: Path, run_id: str) -> t
         f"Qualified analyst tasks: {len(queue)} (maximum 10)",
         "",
         "Municipal severity is property-risk evidence only. It does not independently create owner-motivation points.",
+        "Qualification-score ties are ordered by maximum municipal severity, oldest unresolved case age, serious-case count, ownership duration, and finally stable canonical identity.",
         "",
     ]
     if queue:
@@ -1734,10 +1826,10 @@ def _write_reports(store: IntelligenceStore, output_dir: Path, run_id: str) -> t
                 f"- Verified units: {item['verified_units'] if item['verified_units'] is not None else 'Not available'}",
                 f"- Asking price: {asking}",
                 f"- Asking price per verified unit: {price_per_unit}",
-                f"- Last sale: {item['last_sale_date'] or 'Not available'}"
+                f"- Last sale: {_display_date(item['last_sale_date'])}"
                 + (
                     f" for ${item['last_sale_price']:,.0f}"
-                    if item["last_sale_price"] is not None
+                    if item["last_sale_price"] not in (None, 0)
                     else ""
                 ),
                 f"- Ownership duration: {item['ownership_duration_years'] if item['ownership_duration_years'] is not None else 'Not available'} years",

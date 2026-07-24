@@ -31,11 +31,23 @@ def _date(value: str | None) -> datetime | None:
 
 
 def _text(case: CodeCase) -> str:
+    operative_violation_fields = (
+        "CodeNumber",
+        "CodeDescription",
+        "CorrectiveAction",
+        "CategoryName",
+        "CodeStatus",
+        "ViolationPriority",
+        "WFActionName",
+        "Description",
+        "Status",
+        "ViolationType",
+    )
     violation_text = " ".join(
-        str(value)
+        str(violation.get(field))
         for violation in case.violations
-        for value in violation.values()
-        if value is not None
+        for field in operative_violation_fields
+        if violation.get(field) is not None
     )
     return " ".join(
         value
@@ -79,7 +91,6 @@ def classify_municipal_case(
         "imminent danger",
         "fire hazard",
         "uninhabitable",
-        "emergency",
     )
     special_master_terms = ("special master", "special magistrate")
     lien_terms = ("intent to lien", "lien pending", "lien stage", "recorded lien")
@@ -107,7 +118,9 @@ def classify_municipal_case(
     elif any(term in text for term in special_master_terms):
         category, score = "special_master_escalation", 85.0
         reasons.append("Special-master or special-magistrate escalation is present.")
-    elif any(term in text for term in lien_terms):
+    elif any(term in text for term in lien_terms) or "lien" in (
+        case.status or ""
+    ).casefold():
         category, score = "intent_to_lien_or_lien", 70.0
         reasons.append("Intent-to-lien or lien-stage language is present.")
     elif any(term in text for term in minor_terms):
