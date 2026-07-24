@@ -32,7 +32,8 @@ class RecommendationTests(unittest.TestCase):
             {
                 "contact_owner",
                 "contact_broker",
-                "underwrite",
+                "excluded",
+                "verify_identity",
                 "request_documents",
                 "human_violation_review",
                 "order_municipal_search",
@@ -91,7 +92,10 @@ class RecommendationTests(unittest.TestCase):
 
     def test_workflow_gates_choose_specific_human_action(self) -> None:
         base = RecommendationFeatures.actionable(property_id="property-1")
-        self.assertEqual(recommend(base.with_flags(has_underwriting=False)).action, "underwrite")
+        self.assertEqual(
+            recommend(base.with_flags(has_underwriting=False)).action,
+            "insufficient_data",
+        )
         self.assertEqual(
             recommend(base.with_flags(critical_documents_missing=True)).action,
             "request_documents",
@@ -104,6 +108,32 @@ class RecommendationTests(unittest.TestCase):
             recommend(base.with_flags(municipal_search_required=True)).action,
             "order_municipal_search",
         )
+
+    def test_hard_gates_precede_scores_and_underwriting_status(self) -> None:
+        base = RecommendationFeatures.actionable(property_id="property-1").with_scores(
+            owner_motivation=100, economics=100
+        )
+        self.assertEqual(
+            recommend(base.with_flags(is_synthetic=True)).action, "excluded"
+        )
+        self.assertEqual(
+            recommend(base.with_flags(identity_verified=False)).action,
+            "verify_identity",
+        )
+        self.assertEqual(
+            recommend(
+                base.with_flags(
+                    violation_review_required=True,
+                    critical_documents_missing=True,
+                )
+            ).action,
+            "human_violation_review",
+        )
+
+    def test_contact_requires_specific_evidence_backed_opportunity(self) -> None:
+        base = RecommendationFeatures.actionable(property_id="property-1")
+        result = recommend(base.with_flags(specific_opportunity=False))
+        self.assertEqual(result.action, "watch")
 
 
 if __name__ == "__main__":

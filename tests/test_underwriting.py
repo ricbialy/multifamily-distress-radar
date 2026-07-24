@@ -71,6 +71,7 @@ class UnderwritingTests(unittest.TestCase):
             market_cap_rate_low=0.055,
             market_cap_rate_base=0.06,
             market_cap_rate_high=0.065,
+            public_unit_count_verified=True,
         )
         result = underwrite_commercial(inputs)
         self.assertEqual(result.status, "complete")
@@ -81,7 +82,9 @@ class UnderwritingTests(unittest.TestCase):
     def test_offer_range_deducts_every_required_reserve(self) -> None:
         result = calculate_offer_range(
             OfferInputs(
-                stabilized_value=1_000_000,
+                stabilized_value_low=900_000,
+                stabilized_value_base=1_000_000,
+                stabilized_value_high=1_100_000,
                 required_margin_rate=0.10,
                 repairs=50_000,
                 capital_expenditures=25_000,
@@ -93,20 +96,57 @@ class UnderwritingTests(unittest.TestCase):
             )
         )
         self.assertEqual(result.status, "complete")
-        self.assertEqual(result.maximum, 690_000)
-        self.assertEqual(result.base, 655_500)
-        self.assertEqual(result.conservative, 621_000)
+        self.assertEqual(result.conservative, 600_000)
+        self.assertEqual(result.base, 690_000)
+        self.assertEqual(result.maximum, 780_000)
         self.assertEqual(sum(result.deductions.values()), 310_000)
         exported = result.to_dict()
         self.assertEqual(exported["deductions"]["repairs"], 50_000)
         self.assertEqual(exported["missing_data"], [])
 
     def test_offer_range_never_fabricates_when_value_is_missing(self) -> None:
-        result = calculate_offer_range(OfferInputs(stabilized_value=None))
+        result = calculate_offer_range(OfferInputs())
         self.assertEqual(result.status, "insufficient_data")
         self.assertIsNone(result.maximum)
-        self.assertIn("stabilized_value", result.missing_data)
-        self.assertEqual(result.to_dict()["missing_data"], ["stabilized_value"])
+        self.assertIn("stabilized_value_low", result.missing_data)
+        self.assertIn("repairs", result.missing_data)
+
+    def test_commercial_model_rejects_unverified_units_and_bad_economics(self) -> None:
+        inputs = CommercialMultifamilyInputs(
+            units=12,
+            current_noi=-1,
+            gross_potential_rent=300_000,
+            market_vacancy_rate=0.05,
+            taxes_after_sale=1_000,
+            insurance=1_000,
+            management_rate=0.01,
+            utilities=1_000,
+            maintenance=1_000,
+            other_operating_expenses=1_000,
+            deferred_maintenance=100_000,
+            capital_expenditures=50_000,
+            market_cap_rate_low=0.055,
+            market_cap_rate_base=0.06,
+            market_cap_rate_high=0.065,
+            public_unit_count_verified=False,
+        )
+        result = underwrite_commercial(inputs)
+        self.assertEqual(result.status, "insufficient_data")
+        self.assertIn("verified_public_unit_count", result.missing_data)
+        self.assertIn("positive_current_noi", result.missing_data)
+        self.assertIn("plausible_operating_expenses", result.missing_data)
+
+    def test_offer_requires_all_material_costs(self) -> None:
+        result = calculate_offer_range(
+            OfferInputs(
+                stabilized_value_low=900_000,
+                stabilized_value_base=1_000_000,
+                stabilized_value_high=1_100_000,
+            )
+        )
+        self.assertEqual(result.status, "insufficient_data")
+        self.assertIn("repairs", result.missing_data)
+        self.assertIn("financing_cost_rate", result.missing_data)
 
 
 if __name__ == "__main__":
