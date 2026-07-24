@@ -125,6 +125,12 @@ class IntelligenceStore:
                     REFERENCES canonical_properties(property_id),
                 decision_type TEXT NOT NULL, decided_at TEXT NOT NULL, notes TEXT
             );
+            CREATE TABLE IF NOT EXISTS human_dispositions (
+                disposition_id TEXT PRIMARY KEY, property_id TEXT NOT NULL
+                    REFERENCES canonical_properties(property_id),
+                disposition TEXT NOT NULL, decided_at TEXT NOT NULL, notes TEXT,
+                baseline_content_hash TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1
+            );
             CREATE TABLE IF NOT EXISTS acquisition_outcomes (
                 outcome_id TEXT PRIMARY KEY, property_id TEXT NOT NULL
                     REFERENCES canonical_properties(property_id),
@@ -462,6 +468,73 @@ class IntelligenceStore:
         )
         self.connection.commit()
         return decision_id
+
+    def record_disposition(
+        self,
+        property_id: str,
+        disposition: str,
+        decided_at: str,
+        *,
+        baseline_content_hash: str,
+        notes: str | None = None,
+    ) -> str:
+        allowed = {
+            "investigate",
+            "request_documents",
+            "watch",
+            "dismiss",
+            "legal_municipal_review",
+            "approved_for_contact",
+        }
+        if disposition not in allowed:
+            raise ValueError(f"unsupported disposition: {disposition}")
+        disposition_id = str(uuid4())
+        self.connection.execute(
+            """
+            UPDATE human_dispositions SET active=0
+            WHERE property_id=? AND active=1
+            """,
+            (property_id,),
+        )
+        self.connection.execute(
+            """
+            INSERT INTO human_dispositions (
+                disposition_id,property_id,disposition,decided_at,notes,
+                baseline_content_hash,active
+            ) VALUES (?,?,?,?,?,?,1)
+            """,
+            (
+                disposition_id,
+                property_id,
+                disposition,
+                decided_at,
+                notes,
+                baseline_content_hash,
+            ),
+        )
+        self.connection.commit()
+        return disposition_id
+
+    def effective_disposition(
+        self, property_id: str, current_content_hash: str
+    ) -> str | None:
+        row = self.connection.execute(
+            """
+            SELECT disposition,baseline_content_hash
+            FROM human_dispositions
+            WHERE property_id=? AND active=1
+            ORDER BY decided_at DESC,disposition_id DESC LIMIT 1
+            """,
+            (property_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        if (
+            row["disposition"] == "dismiss"
+            and row["baseline_content_hash"] != current_content_hash
+        ):
+            return None
+        return str(row["disposition"])
 
     def record_outcome(
         self,

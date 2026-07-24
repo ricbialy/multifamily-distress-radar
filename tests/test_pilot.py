@@ -126,6 +126,8 @@ class PilotTests(unittest.TestCase):
             "daily_brief.md",
             "top_candidate_trace.json",
             "top_candidate_trace.md",
+            "acquisition_brief.md",
+            "qualified_queue.json",
         }
         self.assertEqual({path.name for path in result.output_files}, required)
         self.assertGreaterEqual(summary["canonical_properties"], 2)
@@ -134,8 +136,12 @@ class PilotTests(unittest.TestCase):
         off_market = next(
             item for item in recommendations if "off_market" in item["discovery_channels"]
         )
-        self.assertEqual(listed["recommended_action"], "request_documents")
-        self.assertEqual(off_market["recommended_action"], "human_violation_review")
+        self.assertEqual(
+            listed["recommended_action"], "contact_broker_for_documents"
+        )
+        self.assertEqual(
+            off_market["recommended_action"], "human_municipal_review"
+        )
         self.assertTrue(listed["evidence_ids"])
 
     def test_repeat_change_and_failure_are_auditable(self) -> None:

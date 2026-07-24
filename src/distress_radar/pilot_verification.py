@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import os
 import sqlite3
@@ -10,6 +11,21 @@ from pathlib import Path
 from typing import Any
 
 from distress_radar.pilot import PilotRunResult, run_pilot
+from distress_radar.sources.mls.matrix_csv import MatrixCsvImporter
+
+
+EXPECTED_MATRIX_FILENAME = "Agent Single Line - COM.csv"
+EXPECTED_MATRIX_SHA256 = (
+    "f85540c3510b294e7aaaeb77f7ee2ab6022c45cdd2bfd3799c1fe9dbbe59c649"
+)
+EXPECTED_MATRIX_ROWS = 20
+EXPECTED_HEADER_MAPPING = {
+    "mls_number": "MLS # Link",
+    "address": "Address",
+    "status": "St",
+    "list_price": "Current Price",
+    "property_class": "Type of Property",
+}
 
 
 @dataclass(frozen=True)
@@ -121,26 +137,56 @@ def verify_real_pilot(
 
     controlled_path = output_dir / "controlled" / matrix_path.name
     controlled_description = _controlled_copy(matrix_path, controlled_path)
-    with sqlite3.connect(database_path) as connection:
+    controlled_database = output_dir / "controlled.sqlite"
+    controlled_baseline = run_pilot(
+        matrix_path=matrix_path,
+        database_path=controlled_database,
+        output_dir=output_dir / "controlled-baseline",
+        municipality=municipality,
+    )
+    with sqlite3.connect(controlled_database) as connection:
+        connection.row_factory = sqlite3.Row
         status_changes_before = _count(
             connection,
             "SELECT COUNT(*) FROM listing_changes WHERE change_type='status_change'",
         )
+        controlled_property = connection.execute(
+            """
+            SELECT property_id FROM listing_snapshots
+            ORDER BY fetched_at,snapshot_id LIMIT 1
+            """
+        ).fetchone()["property_id"]
+        action_before = connection.execute(
+            """
+            SELECT action FROM recommendations
+            WHERE property_id=? ORDER BY generated_at DESC,recommendation_id DESC LIMIT 1
+            """,
+            (controlled_property,),
+        ).fetchone()["action"]
     controlled = run_pilot(
         matrix_path=controlled_path,
-        database_path=database_path,
+        database_path=controlled_database,
         output_dir=output_dir / "controlled",
         municipality=municipality,
     )
-    with sqlite3.connect(database_path) as connection:
+    with sqlite3.connect(controlled_database) as connection:
+        connection.row_factory = sqlite3.Row
         status_changes_after = _count(
             connection,
             "SELECT COUNT(*) FROM listing_changes WHERE change_type='status_change'",
         )
+        action_after = connection.execute(
+            """
+            SELECT action FROM recommendations
+            WHERE property_id=? ORDER BY generated_at DESC,recommendation_id DESC LIMIT 1
+            """,
+            (controlled_property,),
+        ).fetchone()["action"]
 
+    failed_database = output_dir / "failed-source.sqlite"
     failed = run_pilot(
         matrix_path=matrix_path,
-        database_path=database_path,
+        database_path=failed_database,
         output_dir=output_dir / "failed-source",
         municipality=municipality,
         simulate_source_failure=True,
@@ -156,9 +202,22 @@ def verify_real_pilot(
         "recommendations.json",
         "recommendations.csv",
         "daily_brief.md",
+        "acquisition_brief.md",
+        "qualified_queue.json",
         "top_candidate_trace.json",
         "top_candidate_trace.md",
     }
+    with matrix_path.open(encoding="utf-8-sig", newline="") as handle:
+        matrix_batch = MatrixCsvImporter().import_reader(
+            handle,
+            fetched_at="acceptance-check",
+            source_url=f"manual-import://{matrix_path.name}",
+        )
+    actual_sha = hashlib.sha256(matrix_path.read_bytes()).hexdigest()
+    mapping_matches = all(
+        matrix_batch.header_mapping.get(logical) == header
+        for logical, header in EXPECTED_HEADER_MAPPING.items()
+    )
     with sqlite3.connect(database_path) as connection:
         connection.row_factory = sqlite3.Row
         real_headers = _count(
@@ -195,6 +254,20 @@ def verify_real_pilot(
                 "SELECT source_name,state FROM source_health ORDER BY source_name"
             ).fetchall()
         }
+        source_attempts = {
+            row["source_name"]: {
+                "state": row["state"],
+                "records_examined": row["records_examined"],
+            }
+            for row in connection.execute(
+                """
+                SELECT source_name,state,records_examined
+                FROM source_runs WHERE pilot_run_id=?
+                ORDER BY source_name
+                """,
+                (first.run_id,),
+            ).fetchall()
+        }
         off_market_count = _count(
             connection,
             """
@@ -202,14 +275,39 @@ def verify_real_pilot(
             WHERE signal_type='off_market_live_code_case'
             """,
         )
-        failed_coverage = _count(
+        second_alerts = _count(
+            connection,
+            "SELECT COUNT(*) FROM opportunity_alerts WHERE pilot_run_id=?",
+            (second.run_id,),
+        )
+        second_unchanged = _count(
             connection,
             """
-            SELECT COUNT(*) FROM property_source_coverage
-            WHERE source_name='hialeah_tyler_energov'
-              AND state='unknown_failed'
+            SELECT COUNT(*) FROM recommendations
+            WHERE pilot_run_id=? AND change_type='unchanged'
             """,
+            (second.run_id,),
         )
+        first_hashes = {
+            row["property_id"]: row["content_hash"]
+            for row in connection.execute(
+                """
+                SELECT property_id,content_hash FROM recommendations
+                WHERE pilot_run_id=?
+                """,
+                (first.run_id,),
+            ).fetchall()
+        }
+        second_hashes = {
+            row["property_id"]: row["content_hash"]
+            for row in connection.execute(
+                """
+                SELECT property_id,content_hash FROM recommendations
+                WHERE pilot_run_id=?
+                """,
+                (second.run_id,),
+            ).fetchall()
+        }
         latest_recommendations = connection.execute(
             """
             SELECT r.property_id,r.action,r.explanation_json
@@ -222,6 +320,21 @@ def verify_real_pilot(
             """
         ).fetchall()
         evidence_linked = 0
+        semantic_evidence = 0
+        expected_action_fields = {
+            "verify_identity": {"validated_address", "public_property_record"},
+            "human_municipal_review": {"municipal_code_case"},
+            "contact_broker_for_documents": {
+                "matrix_listing",
+                "diligence:rent_roll",
+                "diligence:T12",
+            },
+            "investigate_owner": {
+                "public_property_record",
+                "official_record",
+                "tax_delinquency",
+            },
+        }
         for recommendation in latest_recommendations:
             explanation = json.loads(recommendation["explanation_json"])
             mappings = explanation.get("statement_evidence_ids") or {}
@@ -244,43 +357,139 @@ def verify_real_pilot(
                     (recommendation["property_id"],),
                 ).fetchall()
             }
+            action_ids = set(mappings.get("recommended_action") or ())
+            action_fields = {
+                row["field_name"]
+                for row in connection.execute(
+                    """
+                    SELECT field_name FROM evidence_items
+                    WHERE property_id=? AND evidence_id IN (
+                        SELECT value FROM json_each(?)
+                    )
+                    """,
+                    (
+                        recommendation["property_id"],
+                        json.dumps(sorted(action_ids)),
+                    ),
+                ).fetchall()
+            }
             if (
                 all(mappings.get(group) for group in required_groups)
                 and ids
                 and ids.issubset(existing_ids)
             ):
                 evidence_linked += 1
+                expected = expected_action_fields.get(recommendation["action"])
+                if expected is None or action_fields & expected:
+                    semantic_evidence += 1
+
+        queue = json.loads((output_dir / "first" / "qualified_queue.json").read_text())
+        queue_has_mls = any("mls" in item["discovery_channels"] for item in queue)
+        queue_has_off_market = any(
+            "off_market" in item["discovery_channels"] for item in queue
+        )
+
+    with sqlite3.connect(failed_database) as failed_connection:
+        failed_connection.row_factory = sqlite3.Row
+        failed_coverage = _count(
+            failed_connection,
+            """
+            SELECT COUNT(*) FROM property_source_coverage
+            WHERE source_name='hialeah_tyler_energov'
+              AND state='unknown_failed'
+            """,
+        )
+        failure_recommendations = [
+            json.loads(row["explanation_json"])
+            for row in failed_connection.execute(
+                """
+                SELECT explanation_json FROM recommendations
+                WHERE pilot_run_id=?
+                """,
+                (failed.run_id,),
+            ).fetchall()
+        ]
+        failure_visible_in_recommendations = any(
+            "hialeah_tyler_energov:unknown_failed"
+            in (explanation.get("missing_data") or ())
+            for explanation in failure_recommendations
+        )
 
     failure_brief = (output_dir / "failed-source" / "daily_brief.md").read_text()
     gates = (
-        GateResult("G0", "PASS" if first.matrix_sha256 else "FAIL", f"{matrix_path.name} / {first.matrix_sha256}"),
-        GateResult("G1", "PASS" if real_headers == first.accepted_rows and real_headers > 0 else "FAIL", f"{real_headers} accepted ledger rows"),
+        GateResult(
+            "G0",
+            "PASS"
+            if matrix_path.name == EXPECTED_MATRIX_FILENAME
+            and actual_sha == EXPECTED_MATRIX_SHA256
+            and len(matrix_batch.accepted) == EXPECTED_MATRIX_ROWS
+            else "FAIL",
+            (
+                f"{matrix_path.name} / {actual_sha} / "
+                f"{len(matrix_batch.accepted)} genuine rows"
+            ),
+        ),
+        GateResult(
+            "G1",
+            "PASS"
+            if mapping_matches
+            and real_headers == EXPECTED_MATRIX_ROWS
+            and first.accepted_rows == EXPECTED_MATRIX_ROWS
+            else "FAIL",
+            json.dumps(matrix_batch.header_mapping, sort_keys=True),
+        ),
         GateResult("G2", "PASS" if verified_matrix > 0 else "FAIL", f"{verified_matrix} Matrix properties with county presence"),
         GateResult("G3", "PASS" if persisted_core else "FAIL", json.dumps(first.database_counts, sort_keys=True)),
         GateResult(
             "G4",
             "PASS"
-            if {"miami_dade_property_point_view", "hialeah_tyler_energov"}.issubset(live_sources)
+            if all(
+                source_attempts.get(source, {}).get("state") == "healthy"
+                and source_attempts.get(source, {}).get("records_examined", 0) > 0
+                for source in (
+                    "miami_dade_property_point_view",
+                    "hialeah_tyler_energov",
+                )
+            )
             else "FAIL",
-            json.dumps(live_sources, sort_keys=True),
+            json.dumps(source_attempts, sort_keys=True),
         ),
-        GateResult("G5", "PASS" if off_market_count > 0 else "FAIL", f"{off_market_count} live off-market candidates"),
+        GateResult(
+            "G5",
+            "PASS"
+            if off_market_count > 0
+            and 0 < len(queue) <= 10
+            and queue_has_mls
+            and queue_has_off_market
+            else "FAIL",
+            (
+                f"{off_market_count} live off-market intersections; "
+                f"{len(queue)} ranked tasks; MLS={queue_has_mls}; "
+                f"off_market={queue_has_off_market}"
+            ),
+        ),
         GateResult(
             "G6",
             "PASS"
-            if failed_coverage > 0 and "simulated source failure" in failure_brief
+            if failed_coverage > 0
+            and failure_visible_in_recommendations
+            and "simulated source failure" in failure_brief
             else "FAIL",
-            f"{failed_coverage} unknown_failed coverage rows; failure visible in brief",
+            (
+                f"{failed_coverage} unknown_failed coverage rows; "
+                f"recommendations={failure_visible_in_recommendations}; report=true"
+            ),
         ),
         GateResult(
             "G7",
             "PASS"
             if evidence_linked == len(latest_recommendations)
+            and semantic_evidence == len(latest_recommendations)
             and evidence_linked > 0
             else "FAIL",
             (
-                f"{evidence_linked}/{len(latest_recommendations)} latest "
-                "recommendations have valid statement/action evidence"
+                f"{semantic_evidence}/{len(latest_recommendations)} latest "
+                "recommendations have semantically valid statement/action evidence"
             ),
         ),
         GateResult(
@@ -300,6 +509,9 @@ def verify_real_pilot(
             and first.database_counts["property_signals"]
             == second.database_counts["property_signals"]
             and first_change_count == second_change_count
+            and first_hashes == second_hashes
+            and second_alerts == 0
+            and second_unchanged == len(second_hashes)
             else "FAIL",
             (
                 f"properties {first.database_counts['canonical_properties']} -> "
@@ -308,13 +520,21 @@ def verify_real_pilot(
                 f"{second.database_counts['listing_snapshots']}; changes "
                 f"{first_change_count} -> {second_change_count}; signals "
                 f"{first.database_counts['property_signals']} -> "
-                f"{second.database_counts['property_signals']}"
+                f"{second.database_counts['property_signals']}; "
+                f"false alerts={second_alerts}; unchanged={second_unchanged}"
             ),
         ),
         GateResult(
             "G10",
-            "PASS" if status_changes_after - status_changes_before == 1 else "FAIL",
-            f"{controlled_description}; detected {status_changes_after - status_changes_before} status change",
+            "PASS"
+            if status_changes_after - status_changes_before == 1
+            and action_before != action_after
+            else "FAIL",
+            (
+                f"{controlled_description}; detected "
+                f"{status_changes_after - status_changes_before} status change; "
+                f"action {action_before} -> {action_after}"
+            ),
         ),
         GateResult(
             "G11",
@@ -323,9 +543,9 @@ def verify_real_pilot(
         ),
     )
     status = (
-        "REAL VERTICAL SLICE: PASS"
+        "REAL-PILOT-02: PASS"
         if all(gate.status == "PASS" for gate in gates)
-        else "REAL VERTICAL SLICE: FAIL"
+        else "REAL-PILOT-02: FAIL"
     )
     payload = {
         "status": status,
@@ -339,6 +559,7 @@ def verify_real_pilot(
             "counts": second.database_counts,
         },
         "controlled_run_id": controlled.run_id,
+        "controlled_baseline_run_id": controlled_baseline.run_id,
         "failed_source_run_id": failed.run_id,
         "controlled_change": {
             "description": controlled_description,

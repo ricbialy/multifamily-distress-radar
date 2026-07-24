@@ -9,6 +9,10 @@ from distress_radar.recommendations.features import (
 )
 
 SUPPORTED_ACTIONS = {
+    "contact_broker_for_documents",
+    "investigate_owner",
+    "human_municipal_review",
+    "dismiss",
     "contact_owner",
     "contact_broker",
     "excluded",
@@ -40,6 +44,21 @@ def _action(features: RecommendationFeatures) -> str:
         return "excluded"
     if not features.identity_verified:
         return "verify_identity"
+    if features.serious_municipal_matter:
+        return "human_municipal_review"
+    if (
+        features.listing_active
+        and "mls" in features.discovery_channels
+        and features.critical_documents_missing
+    ):
+        return "contact_broker_for_documents"
+    if (
+        "off_market" in features.discovery_channels
+        and features.independent_motivation
+    ):
+        return "investigate_owner"
+    if features.municipal_case_present and not features.independent_motivation:
+        return "watch"
     if features.violation_review_required:
         return "human_violation_review"
     if features.critical_documents_missing:
@@ -61,6 +80,8 @@ def _action(features: RecommendationFeatures) -> str:
     if scores.owner_motivation >= 65 and scores.economics >= 60:
         if not features.specific_opportunity:
             return "watch"
+        if not features.human_contact_approved:
+            return "investigate_owner"
         return (
             "contact_broker"
             if "mls" in features.discovery_channels
