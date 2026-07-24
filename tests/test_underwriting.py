@@ -97,12 +97,16 @@ class UnderwritingTests(unittest.TestCase):
         self.assertEqual(result.base, 655_500)
         self.assertEqual(result.conservative, 621_000)
         self.assertEqual(sum(result.deductions.values()), 310_000)
+        exported = result.to_dict()
+        self.assertEqual(exported["deductions"]["repairs"], 50_000)
+        self.assertEqual(exported["missing_data"], [])
 
     def test_offer_range_never_fabricates_when_value_is_missing(self) -> None:
         result = calculate_offer_range(OfferInputs(stabilized_value=None))
         self.assertEqual(result.status, "insufficient_data")
         self.assertIsNone(result.maximum)
         self.assertIn("stabilized_value", result.missing_data)
+        self.assertEqual(result.to_dict()["missing_data"], ["stabilized_value"])
 
 
 if __name__ == "__main__":
