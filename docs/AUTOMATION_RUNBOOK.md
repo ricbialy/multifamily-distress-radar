@@ -22,6 +22,12 @@ PYTHONPATH=src .venv/bin/python -m distress_radar fixture-demo \
 Review `recommendations.json`, `recommendations.csv`, and `daily_brief.md`.
 The fixture command performs no network requests.
 
+For authoritative address validation, first run `scrape-properties` and
+`export-properties`, then add
+`--county-properties exports/county-properties.csv` to the fixture command.
+If that input is omitted or a folio is absent from it, the address remains
+`corroborated` or `unverified`; do not manually promote it to `verified`.
+
 ## Local Matrix inbox
 
 Place authorized `.csv` exports or saved `.eml` messages containing CSV

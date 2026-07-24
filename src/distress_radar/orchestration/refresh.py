@@ -12,6 +12,12 @@ from distress_radar.domain.evidence import (
 )
 from distress_radar.domain.listing import ListingSnapshot
 from distress_radar.identity.address_normalizer import normalize_address
+from distress_radar.identity.address_validation import (
+    AddressCandidate,
+    AddressValidationStatus,
+    CountyAddressValidator,
+)
+from distress_radar.models import PropertyRecord
 from distress_radar.recommendations.features import (
     RecommendationFeatures,
     ScoreDimensions,
@@ -44,18 +50,6 @@ def _identity(folio: str | None, address: str, municipality: str) -> str:
         if folio
         else f"address:{normalize_address(address)}|{municipality.casefold()}"
     )
-
-
-def _complete_address(
-    street: str,
-    municipality: str,
-    state: str | None,
-    postal_code: str | None,
-) -> str:
-    locality = ", ".join(part for part in (municipality, state) if part)
-    if postal_code:
-        locality = f"{locality} {postal_code}".strip()
-    return ", ".join(part for part in (street, locality) if part)
 
 
 def _listing_evidence(
@@ -120,11 +114,13 @@ def run_fixture_demo(
     off_market_path: Path,
     output_dir: Path,
     generated_at: str,
+    property_records: tuple[PropertyRecord, ...] = (),
 ) -> FixtureDemoResult:
     listings = MatrixCsvImporter().import_file(matrix_path, fetched_at=generated_at)
     off_market_candidates = OffMarketCsvImporter().import_file(
         off_market_path, fetched_at=generated_at
     )
+    address_validator = CountyAddressValidator(property_records)
     properties: dict[str, dict[str, Any]] = {}
     for listing in listings:
         key = _identity(listing.folio, listing.address, listing.municipality)
@@ -239,22 +235,59 @@ def run_fixture_demo(
             if listing
             else None
         )
-        address = listing.address if listing else off_market.address
+        address_candidates = tuple(
+            candidate
+            for candidate in (
+                AddressCandidate(
+                    source=listing.source_name,
+                    street=listing.address,
+                    municipality=listing.municipality,
+                    state=listing.state,
+                    postal_code=listing.postal_code,
+                )
+                if listing
+                else None,
+                AddressCandidate(
+                    source=OffMarketCsvImporter.source_name,
+                    street=off_market.address,
+                    municipality=off_market.municipality,
+                    state=off_market.state,
+                    postal_code=off_market.postal_code,
+                )
+                if off_market
+                else None,
+            )
+            if candidate
+        )
+        address_validation = address_validator.validate(
+            folio=folio,
+            candidates=address_candidates,
+            checked_at=generated_at,
+        )
         municipality = (
             listing.municipality if listing else off_market.municipality
         )
-        state = listing.state if listing else off_market.state
-        postal_code = listing.postal_code if listing else off_market.postal_code
-        complete_address = _complete_address(
-            address, municipality, state, postal_code
-        )
+        if address_validation.status != AddressValidationStatus.VERIFIED:
+            missing_data = tuple(dict.fromkeys((*missing_data, "validated_address")))
         units = off_market.units if off_market and off_market.units else listing.units if listing else None
         records.append(
             normalize_record(
                 {
                     "property_id": features.property_id,
                     "folio": folio or "",
-                    "address": complete_address,
+                    "address": address_validation.address,
+                    "address_validation_status": address_validation.status.value,
+                    "address_validation_source": address_validation.source or "",
+                    "address_validation_source_record_id": (
+                        address_validation.source_record_id or ""
+                    ),
+                    "address_validation_source_url": (
+                        address_validation.source_url or ""
+                    ),
+                    "address_validation_checked_at": address_validation.checked_at,
+                    "address_validation_details": address_validation.details,
+                    "latitude": address_validation.latitude,
+                    "longitude": address_validation.longitude,
                     "jurisdiction": f"Miami-Dade / {municipality}",
                     "discovery_channels": list(channels),
                     "mls_numbers": [item.source_record_id for item in entry["listings"]],

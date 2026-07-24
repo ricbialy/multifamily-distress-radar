@@ -37,6 +37,28 @@ The demo creates:
 - `daily_brief.md` with actionable opportunities, diligence gaps, and source
   warnings.
 
+Addresses are not labeled `verified` from an MLS or spreadsheet alone. To
+validate them against Miami-Dade Property Point View by exact folio, collect
+and export the public county records, then pass that export into the combined
+flow:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m distress_radar scrape-properties \
+  --city hialeah_fl --database data/radar.sqlite3
+PYTHONPATH=src .venv/bin/python -m distress_radar export-properties \
+  --city hialeah_fl --database data/radar.sqlite3 \
+  --output exports/county-properties.csv
+PYTHONPATH=src .venv/bin/python -m distress_radar fixture-demo \
+  --matrix tests/fixtures/matrix_20.csv \
+  --off-market tests/fixtures/off_market.csv \
+  --county-properties exports/county-properties.csv \
+  --output-dir exports/fixture-demo
+```
+
+The brief distinguishes `verified`, `mismatch`, `corroborated`, and
+`unverified`. A mismatch displays the county site address and retains the
+submitted address in the validation details for review.
+
 No credential is used by the fixture demo. See
 [`docs/AUTOMATION_RUNBOOK.md`](docs/AUTOMATION_RUNBOOK.md) for live and
 fixture workflows.

@@ -135,6 +135,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     fixture_demo.add_argument("--matrix", type=Path, required=True)
     fixture_demo.add_argument("--off-market", type=Path, required=True)
+    fixture_demo.add_argument(
+        "--county-properties",
+        type=Path,
+        help=(
+            "Optional export-properties CSV from Miami-Dade Property Point View; "
+            "required for authoritative address verification"
+        ),
+    )
     fixture_demo.add_argument("--output-dir", type=Path, required=True)
     fixture_demo.add_argument(
         "--generated-at",
@@ -152,12 +160,22 @@ def main(argv: list[str] | None = None) -> None:
     )
     try:
         if args.command == "fixture-demo":
+            from distress_radar.sources.public.property_csv import (
+                PropertyRecordCsvImporter,
+            )
+
+            property_records = (
+                PropertyRecordCsvImporter().import_file(args.county_properties)
+                if args.county_properties
+                else ()
+            )
             result = run_fixture_demo(
                 matrix_path=args.matrix,
                 off_market_path=args.off_market,
                 output_dir=args.output_dir,
                 generated_at=args.generated_at
                 or datetime.now(timezone.utc).isoformat(),
+                property_records=property_records,
             )
             print(
                 json.dumps(

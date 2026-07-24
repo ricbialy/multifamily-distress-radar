@@ -15,8 +15,10 @@ def _line(record: dict[str, Any]) -> str:
         if offer.get("status") == "complete"
         else "offer range: insufficient data"
     )
+    validation = record.get("address_validation_status") or "unverified"
     return (
-        f"- {record.get('address') or record.get('property_id')}: "
+        f"- {record.get('address') or record.get('property_id')} "
+        f"[address: {validation}]: "
         f"{record.get('recommended_action')} ({offer_text})"
     )
 
