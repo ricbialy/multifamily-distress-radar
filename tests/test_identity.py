@@ -3,7 +3,7 @@ import unittest
 from distress_radar.domain.owner import CanonicalOwner
 from distress_radar.domain.property import CanonicalProperty
 from distress_radar.identity.address_normalizer import normalize_address
-from distress_radar.identity.folio_resolver import normalize_folio
+from distress_radar.identity.folio_resolver import FolioResolver, normalize_folio
 from distress_radar.identity.match_service import MatchService, MatchStatus
 from distress_radar.identity.owner_resolver import OwnerResolver
 
@@ -37,6 +37,15 @@ class IdentityTests(unittest.TestCase):
         self.assertEqual(result.status, MatchStatus.CONFIRMED)
         self.assertEqual(result.method, "folio")
         self.assertEqual(result.property_id, "property-1")
+
+    def test_folio_resolver_requires_one_exact_authoritative_match(self) -> None:
+        resolver = FolioResolver()
+        self.assertEqual(
+            resolver.resolve("04-2025-001-0241", ("0420250010241",)).folio,
+            "0420250010241",
+        )
+        self.assertIsNone(resolver.resolve(None, ()).folio)
+        self.assertTrue(resolver.resolve(None, ("1", "2")).conflicting)
 
     def test_exact_address_and_municipality_can_confirm_match(self) -> None:
         existing = CanonicalProperty(
