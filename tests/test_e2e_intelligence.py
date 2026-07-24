@@ -37,6 +37,14 @@ class EndToEndIntelligenceTests(unittest.TestCase):
             both[0]["address_validation_source"],
             "authorized_off_market_csv + matrix_csv",
         )
+        self.assertLess(both[0]["data_completeness_score"], 100)
+        validation_evidence = [
+            item
+            for item in both[0]["evidence"]
+            if item["field"] == "validated_address"
+        ]
+        self.assertEqual(len(validation_evidence), 1)
+        self.assertEqual(validation_evidence[0]["value_type"], "unknown")
         self.assertTrue(both[0]["evidence"])
         self.assertEqual(
             both[0]["preliminary_offer_range"]["status"], "complete"
@@ -103,6 +111,13 @@ class EndToEndIntelligenceTests(unittest.TestCase):
             validated["address_validation_source"],
             "miami_dade_property_point_view",
         )
+        validation_evidence = [
+            item
+            for item in validated["evidence"]
+            if item["field"] == "validated_address"
+        ]
+        self.assertEqual(len(validation_evidence), 1)
+        self.assertEqual(validation_evidence[0]["value_type"], "reported")
         self.assertNotIn("validated_address", validated["missing_data"])
         self.assertIn(
             "101 PALM AVE, HIALEAH, FL 33010 [address: verified]",
