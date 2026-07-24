@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import random
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -129,6 +130,66 @@ class ArcGisPropertyCollector:
             longitude=optional_float(geometry.get("x")),
             source_url=self.config.dataset_url,
             fetched_at=fetched_at,
+        )
+
+    def _lookup(self, *, where: str, kind: str, source_key: str) -> PropertyCollectionResult:
+        fetched_at = utc_now()
+        query_url = f"{self.config.layer_url.rstrip('/')}/query"
+        response = self._request(
+            query_url,
+            {
+                "where": where,
+                "outFields": self.OUT_FIELDS,
+                "returnGeometry": "true",
+                "outSR": 4326,
+                "orderByFields": "OBJECTID",
+                "resultRecordCount": self.config.page_size,
+                "f": "json",
+            },
+        )
+        records = tuple(
+            self._parse(feature, fetched_at)
+            for feature in response.get("features") or []
+        )
+        return PropertyCollectionResult(
+            records=records,
+            raw_documents=(
+                RawDocument(
+                    kind=kind,
+                    source_key=source_key,
+                    source_url=query_url,
+                    fetched_at=fetched_at,
+                    payload=response,
+                ),
+            ),
+        )
+
+    def lookup_exact_folio(self, folio: str) -> PropertyCollectionResult:
+        normalized = normalize_parcel(folio)
+        if not normalized:
+            raise ValueError("folio is required for exact lookup")
+        return self._lookup(
+            where=f"FOLIO = '{normalized}'",
+            kind="property_exact_folio",
+            source_key=normalized,
+        )
+
+    def lookup_address(self, address: str) -> PropertyCollectionResult:
+        # Matrix street addresses commonly use ordinal suffixes and unit markers
+        # that the county layer omits. Keep the house number and street stem,
+        # then validate any returned record locally before confirming identity.
+        stem = re.split(r"\b(?:UNIT|APT|#)\b", address.upper(), maxsplit=1)[0]
+        stem = re.sub(r"(\d)(?:ST|ND|RD|TH)\b", r"\1", stem)
+        stem = re.sub(r"\bSTREET\b", "ST", stem)
+        stem = re.sub(r"\bAVENUE\b", "AVE", stem)
+        stem = re.sub(r"\bDRIVE\b", "DR", stem)
+        stem = re.sub(r"\s+", " ", stem).strip().replace("'", "''")
+        if not stem:
+            raise ValueError("address is required for lookup")
+        return self._lookup(
+            where=f"UPPER(TRUE_SITE_ADDR) LIKE '{stem}%'",
+            kind="property_address_search",
+            source_key=stem,
         )
 
     def collect(self, *, max_pages: int | None = None) -> PropertyCollectionResult:
