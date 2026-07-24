@@ -1,7 +1,10 @@
 import unittest
 
 from distress_radar.domain.evidence import EvidenceItem, FreshnessStatus, ValueType
-from distress_radar.recommendations.features import RecommendationFeatures, ScoreDimensions
+from distress_radar.recommendations.features import (
+    RecommendationFeatures,
+    ScoreDimensions,
+)
 from distress_radar.recommendations.rule_engine import (
     SUPPORTED_ACTIONS,
     recommend,

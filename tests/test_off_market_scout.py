@@ -8,7 +8,6 @@ from distress_radar.recommendations.features import (
 )
 from distress_radar.sources.public.off_market_csv import OffMarketCsvImporter
 
-
 FIXTURE = Path(__file__).parent / "fixtures" / "off_market.csv"
 
 

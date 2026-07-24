@@ -5,7 +5,6 @@ from dataclasses import dataclass
 
 from distress_radar.domain.owner import CanonicalOwner
 
-
 _SUFFIXES = {"llc", "lc", "inc", "corp", "corporation", "ltd", "lp", "llp"}
 _DOTTED_SUFFIXES = (("l", "l", "c"), ("l", "l", "p"), ("i", "n", "c"))
 

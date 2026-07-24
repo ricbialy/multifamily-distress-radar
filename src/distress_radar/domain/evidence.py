@@ -48,7 +48,7 @@ class EvidenceItem:
         fetched_at: str,
         reason: str,
         source_url: str | None = None,
-    ) -> "EvidenceItem":
+    ) -> EvidenceItem:
         return cls(
             field=field,
             value=None,

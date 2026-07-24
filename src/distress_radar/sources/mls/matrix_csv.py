@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import csv
 from collections import OrderedDict
-from dataclasses import fields
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from distress_radar.domain.listing import ListingChange, ListingSnapshot
 from distress_radar.identity.address_normalizer import normalize_address

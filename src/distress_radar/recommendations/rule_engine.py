@@ -3,8 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from distress_radar.domain.evidence import EvidenceItem
-from distress_radar.recommendations.features import RecommendationFeatures, ScoreDimensions
-
+from distress_radar.recommendations.features import (
+    RecommendationFeatures,
+    ScoreDimensions,
+)
 
 SUPPORTED_ACTIONS = {
     "contact_owner",

@@ -1,6 +1,5 @@
 import unittest
 
-from distress_radar.underwriting.assumptions import UnderwritingAssumptions
 from distress_radar.underwriting.commercial_multifamily import (
     CommercialMultifamilyInputs,
     underwrite_commercial,

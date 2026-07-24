@@ -1,14 +1,13 @@
 import dataclasses
-import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 
-from distress_radar.domain.evidence import EvidenceItem, FreshnessStatus, ValueType
+from distress_radar.domain.evidence import EvidenceItem
 from distress_radar.domain.property import CanonicalProperty
-from distress_radar.sources.mls.matrix_csv import MatrixCsvImporter
 from distress_radar.intelligence_store import IntelligenceStore
 from distress_radar.sources.base import SourceHealthState
+from distress_radar.sources.mls.matrix_csv import MatrixCsvImporter
 
 
 class IntelligenceStoreTests(unittest.TestCase):

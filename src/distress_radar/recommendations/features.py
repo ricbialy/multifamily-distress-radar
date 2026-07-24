@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 
 from distress_radar.domain.evidence import EvidenceItem
 from distress_radar.domain.signals import PropertySignal
@@ -41,7 +41,7 @@ class RecommendationFeatures:
         *,
         property_id: str,
         discovery_channels: tuple[str, ...] = ("off_market",),
-    ) -> "RecommendationFeatures":
+    ) -> RecommendationFeatures:
         return cls(
             property_id=property_id,
             discovery_channels=discovery_channels,
@@ -52,10 +52,10 @@ class RecommendationFeatures:
             municipal_search_required=False,
         )
 
-    def with_scores(self, **changes: float) -> "RecommendationFeatures":
+    def with_scores(self, **changes: float) -> RecommendationFeatures:
         return replace(self, scores=replace(self.scores, **changes))
 
-    def with_flags(self, **changes: bool) -> "RecommendationFeatures":
+    def with_flags(self, **changes: bool) -> RecommendationFeatures:
         return replace(self, **changes)
 
 

@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 from uuid import uuid4
 
 from distress_radar.domain.evidence import EvidenceItem
@@ -15,7 +15,7 @@ from distress_radar.sources.mls.matrix_csv import detect_listing_changes
 
 
 def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 class IntelligenceStore:
@@ -28,7 +28,7 @@ class IntelligenceStore:
         self.connection.execute("PRAGMA foreign_keys = ON")
         self._migrate()
 
-    def __enter__(self) -> "IntelligenceStore":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:

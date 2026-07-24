@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from typing import Any, Iterable
+from collections.abc import Iterable
+from typing import Any
 
 
-def _money(value: float | int | None) -> str:
+def _money(value: float | None) -> str:
     return "unknown" if value is None else f"${value:,.0f}"
 
 

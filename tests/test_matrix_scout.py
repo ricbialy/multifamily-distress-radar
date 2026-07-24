@@ -6,7 +6,6 @@ from dataclasses import replace
 from email.message import EmailMessage
 from pathlib import Path
 
-from distress_radar.domain.listing import ListingSnapshot
 from distress_radar.sources.mls.matrix_csv import (
     MatrixCsvImporter,
     MatrixSchemaChangedError,
@@ -14,7 +13,6 @@ from distress_radar.sources.mls.matrix_csv import (
     detect_listing_changes,
 )
 from distress_radar.sources.mls.matrix_email import LocalMatrixInbox
-
 
 FIXTURE = Path(__file__).parent / "fixtures" / "matrix_20.csv"
 

@@ -5,7 +5,6 @@ from pathlib import Path
 
 from distress_radar.orchestration.refresh import run_fixture_demo
 
-
 FIXTURES = Path(__file__).parent / "fixtures"
 
 

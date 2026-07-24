@@ -68,7 +68,7 @@ class SourceSpec:
     preserves_raw_response: bool
 
     @classmethod
-    def fixture(cls, name: str, jurisdiction: str) -> "SourceSpec":
+    def fixture(cls, name: str, jurisdiction: str) -> SourceSpec:
         return cls(
             name=name,
             jurisdiction=jurisdiction,

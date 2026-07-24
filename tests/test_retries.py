@@ -1,7 +1,7 @@
 import unittest
 
-from distress_radar.orchestration.retries import RetryPolicy, run_with_retry
 from distress_radar.orchestration.jobs import collect_paginated
+from distress_radar.orchestration.retries import RetryPolicy, run_with_retry
 
 
 class RetryAndPaginationTests(unittest.TestCase):
