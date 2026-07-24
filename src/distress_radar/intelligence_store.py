@@ -8,8 +8,10 @@ from typing import Any
 from uuid import uuid4
 
 from distress_radar.domain.evidence import EvidenceItem
+from distress_radar.domain.listing import ListingChange, ListingSnapshot
 from distress_radar.domain.property import CanonicalProperty
 from distress_radar.sources.base import SourceHealthState
+from distress_radar.sources.mls.matrix_csv import detect_listing_changes
 
 
 def utc_now() -> str:
@@ -140,6 +142,11 @@ class IntelligenceStore:
                 dom INTEGER, cdom INTEGER, normalized_json TEXT NOT NULL,
                 raw_payload_json TEXT NOT NULL,
                 UNIQUE(mls_number, source_name, fetched_at)
+            );
+            CREATE TABLE IF NOT EXISTS listing_changes (
+                change_id TEXT PRIMARY KEY, mls_number TEXT NOT NULL,
+                source_name TEXT NOT NULL, detected_at TEXT NOT NULL,
+                change_type TEXT NOT NULL, before_json TEXT, after_json TEXT
             );
             """
         )
@@ -291,3 +298,131 @@ class IntelligenceStore:
             """
         ).fetchall()
         return [dict(row) for row in rows]
+
+    def save_listing_snapshot(
+        self, snapshot: ListingSnapshot, property_id: str | None = None
+    ) -> tuple[ListingChange, ...]:
+        previous_row = self.connection.execute(
+            """
+            SELECT fetched_at,normalized_json,raw_payload_json
+            FROM listing_snapshots
+            WHERE mls_number=? AND source_name=?
+            ORDER BY fetched_at DESC LIMIT 1
+            """,
+            (snapshot.source_record_id, snapshot.source_name),
+        ).fetchone()
+        previous = None
+        if previous_row:
+            previous = ListingSnapshot(
+                **json.loads(previous_row["normalized_json"]),
+                fetched_at=previous_row["fetched_at"],
+                raw_payload=json.loads(previous_row["raw_payload_json"]),
+            )
+        changes = detect_listing_changes(previous, snapshot)
+        self.connection.execute(
+            """
+            INSERT INTO listing_snapshots (
+                snapshot_id,property_id,mls_number,source_name,fetched_at,
+                status,list_price,dom,cdom,normalized_json,raw_payload_json
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                str(uuid4()),
+                property_id,
+                snapshot.source_record_id,
+                snapshot.source_name,
+                snapshot.fetched_at,
+                snapshot.status,
+                snapshot.list_price,
+                snapshot.dom,
+                snapshot.cdom,
+                json.dumps(snapshot.stable_dict(), sort_keys=True),
+                json.dumps(snapshot.raw_payload, sort_keys=True),
+            ),
+        )
+        self.connection.executemany(
+            """
+            INSERT INTO listing_changes (
+                change_id,mls_number,source_name,detected_at,change_type,
+                before_json,after_json
+            ) VALUES (?,?,?,?,?,?,?)
+            """,
+            [
+                (
+                    str(uuid4()),
+                    snapshot.source_record_id,
+                    snapshot.source_name,
+                    change.detected_at,
+                    change.change_type,
+                    json.dumps(change.before, sort_keys=True),
+                    json.dumps(change.after, sort_keys=True),
+                )
+                for change in changes
+            ],
+        )
+        self.connection.commit()
+        return changes
+
+    def record_human_decision(
+        self,
+        property_id: str,
+        decision_type: str,
+        decided_at: str,
+        notes: str | None = None,
+    ) -> str:
+        decision_id = str(uuid4())
+        self.connection.execute(
+            """
+            INSERT INTO human_decisions (
+                decision_id,property_id,decision_type,decided_at,notes
+            ) VALUES (?,?,?,?,?)
+            """,
+            (decision_id, property_id, decision_type, decided_at, notes),
+        )
+        self.connection.commit()
+        return decision_id
+
+    def record_outcome(
+        self,
+        property_id: str,
+        outcome_type: str,
+        occurred_at: str,
+        *,
+        amount: float | None = None,
+        reason: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        outcome_id = str(uuid4())
+        self.connection.execute(
+            """
+            INSERT INTO acquisition_outcomes (
+                outcome_id,property_id,outcome_type,occurred_at,amount,reason,metadata_json
+            ) VALUES (?,?,?,?,?,?,?)
+            """,
+            (
+                outcome_id,
+                property_id,
+                outcome_type,
+                occurred_at,
+                amount,
+                reason,
+                json.dumps(metadata or {}, sort_keys=True),
+            ),
+        )
+        self.connection.commit()
+        return outcome_id
+
+    def outcome_labels(self) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            """
+            SELECT property_id,outcome_type,occurred_at,amount,reason,metadata_json
+            FROM acquisition_outcomes ORDER BY occurred_at,outcome_id
+            """
+        ).fetchall()
+        return [
+            {
+                **dict(row),
+                "metadata": json.loads(row["metadata_json"]),
+            }
+            for row in rows
+        ]

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 
 from distress_radar.domain.evidence import EvidenceItem
+from distress_radar.domain.signals import PropertySignal
 
 
 @dataclass(frozen=True)
@@ -56,3 +57,39 @@ class RecommendationFeatures:
 
     def with_flags(self, **changes: bool) -> "RecommendationFeatures":
         return replace(self, **changes)
+
+
+def score_owner_motivation(signals: tuple[PropertySignal, ...]) -> float:
+    weights = {
+        "tax_delinquency": 30,
+        "lis_pendens": 35,
+        "recorded_liens": 15,
+        "long_ownership": 10,
+        "absentee_owner": 10,
+        "inactive_entity": 15,
+    }
+    return min(100, sum(weights.get(signal.signal_type, 0) for signal in signals))
+
+
+def score_property_risk(signals: tuple[PropertySignal, ...]) -> float:
+    weights = {
+        "recorded_liens": 15,
+        "code_enforcement_escalation": 30,
+        "unsafe_structure": 60,
+    }
+    return min(100, sum(weights.get(signal.signal_type, 0) for signal in signals))
+
+
+def score_data_quality(
+    evidence: tuple[EvidenceItem, ...],
+) -> tuple[float, float, float]:
+    if not evidence:
+        return 0, 0, 0
+    known = [item for item in evidence if item.value_type.value != "unknown"]
+    confidence = (
+        sum(item.confidence or 0 for item in known) / len(known) * 100 if known else 0
+    )
+    completeness = len(known) / len(evidence) * 100
+    fresh = sum(item.freshness_status.value == "fresh" for item in evidence)
+    freshness = fresh / len(evidence) * 100
+    return round(confidence, 2), round(completeness, 2), round(freshness, 2)
