@@ -1,4 +1,54 @@
-# Multifamily Distress Radar — collector starter
+# Multifamily Distress Radar — acquisition intelligence
+
+Version 0.15 adds a tested acquisition-intelligence foundation on top of the
+existing public-record collectors. It has two fixture-capable discovery paths:
+authorized Matrix CSV/email exports and authorized off-market CSV exports.
+Both paths feed canonical identity, evidence, underwriting, recommendation,
+outcome-capture, and reporting modules.
+
+This is not an autonomous acquisition system and it does not have an active ML
+model. Live Tyler EnerGov and Miami-Dade property collection remain available
+through the legacy refresh flow. Matrix is an authorized export workflow;
+off-market fixture data is a manual import; paid vendor adapters are disabled
+unless credentials exist and their live API implementations are still pending.
+
+The checkout used to build this branch started from GitHub `main` at version
+0.14. The previously described uncommitted version 0.15 was not present on
+GitHub and could not be recovered, so its functionality was rebuilt from the
+published v0.14 baseline.
+
+## Acquisition-intelligence fixture demo
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -e .
+
+PYTHONPATH=src .venv/bin/python -m distress_radar fixture-demo \
+  --matrix tests/fixtures/matrix_20.csv \
+  --off-market tests/fixtures/off_market.csv \
+  --output-dir exports/fixture-demo \
+  --generated-at 2026-07-24T12:00:00+00:00
+```
+
+The demo creates:
+
+- `recommendations.json` with evidence-backed fields and separate scores.
+- `recommendations.csv` for analysis.
+- `daily_brief.md` with actionable opportunities, diligence gaps, and source
+  warnings.
+
+No credential is used by the fixture demo. See
+[`docs/AUTOMATION_RUNBOOK.md`](docs/AUTOMATION_RUNBOOK.md) for live and
+fixture workflows.
+
+## Evidence boundary
+
+Every new intelligence field is modeled as reported, calculated, inferred, or
+unknown, with source, source record, timestamp, confidence, and freshness.
+Missing data and source failures remain explicit. They are never converted to
+claims such as “no lien,” “no violation,” or “clean property.”
+
+## Legacy collector history
 
 Version 0.14 adds authorized contact-research CSV import with source,
 verification status, and confidence. Version 0.13 added a persistent acquisition workflow with lead stages, assignee,
