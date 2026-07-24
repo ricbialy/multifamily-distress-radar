@@ -33,7 +33,11 @@ class EndToEndIntelligenceTests(unittest.TestCase):
         self.assertEqual(
             both[0]["preliminary_offer_range"]["status"], "complete"
         )
-        incomplete = next(item for item in records if item["address"] == "905 West 20 Street")
+        incomplete = next(
+            item
+            for item in records
+            if item["address"] == "905 West 20 Street, Hialeah, FL 33010"
+        )
         self.assertEqual(
             incomplete["preliminary_offer_range"]["status"], "insufficient_data"
         )

@@ -15,6 +15,8 @@ class OffMarketCandidate:
     folio: str | None
     address: str
     municipality: str
+    state: str | None
+    postal_code: str | None
     owner_name: str | None
     units: int | None
     current_noi: float | None
@@ -28,6 +30,8 @@ class OffMarketCandidate:
 
 _FIELDS = (
     "owner_name",
+    "state",
+    "postal_code",
     "unpaid_taxes",
     "lis_pendens",
     "active_liens",
@@ -80,6 +84,8 @@ class OffMarketCsvImporter:
         source_url = row.get("source_url") or f"manual-import://off-market#{record_id}"
         parsed = {
             "owner_name": row.get("owner_name") or None,
+            "state": row.get("state") or None,
+            "postal_code": row.get("zip_code") or row.get("postal_code") or None,
             "unpaid_taxes": _number(row.get("unpaid_taxes")),
             "lis_pendens": _boolean(row.get("lis_pendens")),
             "active_liens": _integer(row.get("active_liens")),
@@ -151,6 +157,8 @@ class OffMarketCsvImporter:
             folio=normalize_folio(row.get("folio")),
             address=row["address"].strip(),
             municipality=row["city"].strip(),
+            state=parsed["state"],
+            postal_code=parsed["postal_code"],
             owner_name=parsed["owner_name"],
             units=parsed["units"],
             current_noi=parsed["current_noi"],

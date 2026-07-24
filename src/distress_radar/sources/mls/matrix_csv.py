@@ -19,6 +19,8 @@ _ALIASES = {
     "mls_number": ("mls number", "mls#", "mls", "listing id"),
     "address": ("property address", "address", "street address"),
     "municipality": ("city", "municipality"),
+    "state": ("state", "state code"),
+    "postal_code": ("zip code", "zip", "postal code"),
     "folio": ("folio number", "folio", "apn", "parcel number"),
     "property_class": ("property type", "class", "property class"),
     "status": ("status", "listing status"),
@@ -130,6 +132,8 @@ class MatrixCsvImporter:
                     expenses=_number(row, columns["expenses"]),
                     remarks=_text(row, columns["remarks"]),
                     source_url=source_url,
+                    state=_text(row, columns["state"]),
+                    postal_code=_text(row, columns["postal_code"]),
                     raw_payload=dict(row),
                 )
             )

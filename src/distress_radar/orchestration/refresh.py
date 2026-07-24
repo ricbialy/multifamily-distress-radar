@@ -46,6 +46,18 @@ def _identity(folio: str | None, address: str, municipality: str) -> str:
     )
 
 
+def _complete_address(
+    street: str,
+    municipality: str,
+    state: str | None,
+    postal_code: str | None,
+) -> str:
+    locality = ", ".join(part for part in (municipality, state) if part)
+    if postal_code:
+        locality = f"{locality} {postal_code}".strip()
+    return ", ".join(part for part in (street, locality) if part)
+
+
 def _listing_evidence(
     listing: ListingSnapshot, generated_at: str
 ) -> tuple[EvidenceItem, ...]:
@@ -227,9 +239,14 @@ def run_fixture_demo(
             if listing
             else None
         )
-        address = off_market.address if off_market else listing.address
+        address = listing.address if listing else off_market.address
         municipality = (
-            off_market.municipality if off_market else listing.municipality
+            listing.municipality if listing else off_market.municipality
+        )
+        state = listing.state if listing else off_market.state
+        postal_code = listing.postal_code if listing else off_market.postal_code
+        complete_address = _complete_address(
+            address, municipality, state, postal_code
         )
         units = off_market.units if off_market and off_market.units else listing.units if listing else None
         records.append(
@@ -237,7 +254,7 @@ def run_fixture_demo(
                 {
                     "property_id": features.property_id,
                     "folio": folio or "",
-                    "address": address,
+                    "address": complete_address,
                     "jurisdiction": f"Miami-Dade / {municipality}",
                     "discovery_channels": list(channels),
                     "mls_numbers": [item.source_record_id for item in entry["listings"]],
