@@ -19,7 +19,7 @@ published v0.14 baseline.
 
 ## Acquisition-intelligence fixture demo
 
-## REAL-PILOT-01 persisted workflow
+## REAL-PILOT-02 qualified acquisition workflow
 
 Run the genuine Matrix export through row validation, county identity
 verification, live Hialeah public-record enrichment, persisted hard gates, and

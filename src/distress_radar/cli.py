@@ -151,7 +151,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pilot_run = subparsers.add_parser(
         "pilot-run",
-        help="Run the persisted REAL-PILOT-01 Matrix and live public-record workflow",
+        help="Run the persisted REAL-PILOT-02 qualified acquisition workflow",
     )
     pilot_run.add_argument("--matrix", type=Path, required=True)
     pilot_run.add_argument("--db", type=Path, required=True)
