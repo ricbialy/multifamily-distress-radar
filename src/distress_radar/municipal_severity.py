@@ -77,7 +77,7 @@ def classify_municipal_case(
     as_of_date = _date(as_of) if isinstance(as_of, str) else as_of
     opened = _date(case.opened_date)
     age_days = (
-        max(0, (as_of_date - opened).days)
+        max(0, (as_of_date.date() - opened.date()).days)
         if as_of_date is not None and opened is not None
         else None
     )
