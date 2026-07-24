@@ -100,6 +100,29 @@ class IntelligenceStoreTests(unittest.TestCase):
         self.assertIn("price_change", {row[0] for row in persisted})
         self.assertIn("price_change", {change.change_type for change in changes})
 
+    def test_unchanged_listing_is_not_duplicated_on_repeat_run(self) -> None:
+        fixture = Path(__file__).parent / "fixtures" / "matrix_20.csv"
+        importer = MatrixCsvImporter()
+        first = importer.import_file(
+            fixture, fetched_at="2026-07-23T12:00:00+00:00"
+        )[0]
+        repeated = dataclasses.replace(
+            first, fetched_at="2026-07-24T12:00:00+00:00"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            with IntelligenceStore(Path(temporary) / "radar.sqlite3") as store:
+                store.save_listing_snapshot(first)
+                changes = store.save_listing_snapshot(repeated)
+                snapshot_count = store.connection.execute(
+                    "SELECT COUNT(*) FROM listing_snapshots"
+                ).fetchone()[0]
+                change_count = store.connection.execute(
+                    "SELECT COUNT(*) FROM listing_changes"
+                ).fetchone()[0]
+        self.assertEqual(changes, ())
+        self.assertEqual(snapshot_count, 1)
+        self.assertEqual(change_count, 1)
+
     def test_human_decisions_and_outcomes_are_persisted_for_labels(self) -> None:
         prop = CanonicalProperty(
             property_id="property-1",

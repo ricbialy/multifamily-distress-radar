@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from email.message import EmailMessage
+from io import StringIO
 from pathlib import Path
 
 from distress_radar.sources.mls.matrix_csv import (
@@ -18,6 +19,34 @@ FIXTURE = Path(__file__).parent / "fixtures" / "matrix_20.csv"
 
 
 class MatrixScoutTests(unittest.TestCase):
+    def test_real_export_headers_map_and_bad_row_is_ledgered(self) -> None:
+        payload = (
+            ",MLS # Link,St,Area,Address,,Current Price,ZN,Year Built,"
+            "Prop Type,Style of Property,Prop Type/Type of Building,"
+            "Type of Property,Property SqFt,Waterfront Property (Y/N),"
+            "Sale Price,#Bays\n"
+            "1,A123,A,41,100 Test Ave,,$2,500,000,3901,1970,COM/Sale,,"
+            "Commercial/Residential Income,Income/MultiFamily,12000,,,,\n"
+            "2,,A,41,200 Test Ave,,$1,500,000,3901,1960,COM/Sale,,"
+            "Commercial/Residential Income,Income/MultiFamily,9000,,,,\n"
+        )
+        importer = MatrixCsvImporter()
+        batch = importer.import_reader(
+            StringIO(payload),
+            fetched_at="2026-07-24T12:00:00+00:00",
+            source_url="manual-import://synthetic-header-test.csv",
+        )
+
+        self.assertEqual(batch.header_mapping["mls_number"], "MLS # Link")
+        self.assertEqual(batch.header_mapping["state"], "St")
+        self.assertEqual(batch.header_mapping["list_price"], "Current Price")
+        self.assertEqual(batch.header_mapping["property_class"], "Type of Property")
+        self.assertEqual(len(batch.accepted), 1)
+        self.assertEqual(batch.accepted[0].source_record_id, "A123")
+        self.assertEqual(batch.accepted[0].list_price, 2_500_000)
+        self.assertEqual([row.status for row in batch.ledger], ["accepted", "rejected"])
+        self.assertIn("MLS", batch.ledger[1].reason or "")
+
     def test_imports_existing_twenty_property_fixture(self) -> None:
         listings = MatrixCsvImporter().import_file(
             FIXTURE, fetched_at="2026-07-24T12:00:00+00:00"
