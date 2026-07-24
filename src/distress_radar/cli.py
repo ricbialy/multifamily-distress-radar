@@ -149,6 +149,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="ISO-8601 timestamp for deterministic fixture output",
     )
+    pilot_run = subparsers.add_parser(
+        "pilot-run",
+        help="Run the persisted REAL-PILOT-01 Matrix and live public-record workflow",
+    )
+    pilot_run.add_argument("--matrix", type=Path, required=True)
+    pilot_run.add_argument("--db", type=Path, required=True)
+    pilot_run.add_argument("--output-dir", type=Path, required=True)
+    pilot_run.add_argument("--municipality", default="hialeah")
+    pilot_run.add_argument("--simulate-source-failure", action="store_true")
     return parser
 
 
@@ -159,6 +168,31 @@ def main(argv: list[str] | None = None) -> None:
         format="%(levelname)s %(name)s: %(message)s",
     )
     try:
+        if args.command == "pilot-run":
+            from distress_radar.pilot import run_pilot
+
+            result = run_pilot(
+                matrix_path=args.matrix,
+                database_path=args.db,
+                output_dir=args.output_dir,
+                municipality=args.municipality,
+                simulate_source_failure=args.simulate_source_failure,
+            )
+            print(
+                json.dumps(
+                    {
+                        "run_id": result.run_id,
+                        "matrix_sha256": result.matrix_sha256,
+                        "accepted_rows": result.accepted_rows,
+                        "rejected_rows": result.rejected_rows,
+                        "database_counts": result.database_counts,
+                        "output_files": [str(path) for path in result.output_files],
+                    },
+                    indent=2,
+                )
+            )
+            return
+
         if args.command == "fixture-demo":
             from distress_radar.sources.public.property_csv import (
                 PropertyRecordCsvImporter,

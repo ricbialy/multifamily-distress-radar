@@ -195,7 +195,11 @@ class MatrixCsvImporter:
                         source_url=source_url,
                         state=_text(row, columns["state"]),
                         postal_code=_text(row, columns["postal_code"]),
-                        raw_payload=dict(row),
+                        raw_payload={
+                            str(key): value
+                            for key, value in row.items()
+                            if key is not None
+                        },
                     )
                 )
             except (TypeError, ValueError) as exc:

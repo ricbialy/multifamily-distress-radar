@@ -24,4 +24,8 @@ _REPLACEMENTS = {
 
 def normalize_address(value: str | None) -> str:
     tokens = re.findall(r"[a-z0-9]+", (value or "").casefold().replace("#", " "))
-    return " ".join(_REPLACEMENTS.get(token, token) for token in tokens)
+    normalized = [
+        re.sub(r"^(\d+)(?:st|nd|rd|th)$", r"\1", _REPLACEMENTS.get(token, token))
+        for token in tokens
+    ]
+    return " ".join(normalized)
