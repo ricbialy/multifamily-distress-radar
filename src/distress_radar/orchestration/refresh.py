@@ -14,6 +14,7 @@ from distress_radar.domain.listing import ListingSnapshot
 from distress_radar.identity.address_normalizer import normalize_address
 from distress_radar.identity.address_validation import (
     AddressCandidate,
+    AddressValidationResult,
     AddressValidationStatus,
     CountyAddressValidator,
 )
@@ -86,6 +87,30 @@ def _listing_evidence(
     return tuple(items)
 
 
+def _address_evidence(result: AddressValidationResult) -> EvidenceItem:
+    if result.status == AddressValidationStatus.VERIFIED:
+        return EvidenceItem(
+            field="validated_address",
+            value=result.address,
+            source=result.source or "county_address_validation",
+            source_record_id=result.source_record_id or "address-validation",
+            source_url=result.source_url,
+            fetched_at=result.checked_at,
+            freshness_status=FreshnessStatus.FRESH,
+            confidence=0.99,
+            value_type=ValueType.REPORTED,
+            metadata={"validation_status": result.status.value},
+        )
+    return EvidenceItem.unknown(
+        field="validated_address",
+        source=result.source or "county_address_validation",
+        source_record_id=result.source_record_id or "address-validation",
+        source_url=result.source_url,
+        fetched_at=result.checked_at,
+        reason=f"address_validation_{result.status.value}",
+    )
+
+
 def _economics_score(
     listing: ListingSnapshot | None, off_market: OffMarketCandidate | None
 ) -> float:
@@ -139,9 +164,46 @@ def run_fixture_demo(
     for key, entry in properties.items():
         listing = entry["listings"][0] if entry["listings"] else None
         off_market = entry["off_market"]
+        folio = (
+            off_market.folio
+            if off_market
+            else listing.folio
+            if listing
+            else None
+        )
+        address_candidates = tuple(
+            candidate
+            for candidate in (
+                AddressCandidate(
+                    source=listing.source_name,
+                    street=listing.address,
+                    municipality=listing.municipality,
+                    state=listing.state,
+                    postal_code=listing.postal_code,
+                )
+                if listing
+                else None,
+                AddressCandidate(
+                    source=OffMarketCsvImporter.source_name,
+                    street=off_market.address,
+                    municipality=off_market.municipality,
+                    state=off_market.state,
+                    postal_code=off_market.postal_code,
+                )
+                if off_market
+                else None,
+            )
+            if candidate
+        )
+        address_validation = address_validator.validate(
+            folio=folio,
+            candidates=address_candidates,
+            checked_at=generated_at,
+        )
         evidence = (
             (_listing_evidence(listing, generated_at) if listing else ())
             + (off_market.evidence if off_market else ())
+            + (_address_evidence(address_validation),)
         )
         signals = off_market.signals if off_market else ()
         confidence, completeness, freshness = score_data_quality(evidence)
@@ -228,47 +290,9 @@ def run_fixture_demo(
             ),
             2,
         )
-        folio = (
-            off_market.folio
-            if off_market
-            else listing.folio
-            if listing
-            else None
-        )
-        address_candidates = tuple(
-            candidate
-            for candidate in (
-                AddressCandidate(
-                    source=listing.source_name,
-                    street=listing.address,
-                    municipality=listing.municipality,
-                    state=listing.state,
-                    postal_code=listing.postal_code,
-                )
-                if listing
-                else None,
-                AddressCandidate(
-                    source=OffMarketCsvImporter.source_name,
-                    street=off_market.address,
-                    municipality=off_market.municipality,
-                    state=off_market.state,
-                    postal_code=off_market.postal_code,
-                )
-                if off_market
-                else None,
-            )
-            if candidate
-        )
-        address_validation = address_validator.validate(
-            folio=folio,
-            candidates=address_candidates,
-            checked_at=generated_at,
-        )
         municipality = (
             listing.municipality if listing else off_market.municipality
         )
-        if address_validation.status != AddressValidationStatus.VERIFIED:
-            missing_data = tuple(dict.fromkeys((*missing_data, "validated_address")))
         units = off_market.units if off_market and off_market.units else listing.units if listing else None
         records.append(
             normalize_record(
