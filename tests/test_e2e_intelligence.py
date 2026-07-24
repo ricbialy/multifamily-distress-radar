@@ -37,6 +37,7 @@ class EndToEndIntelligenceTests(unittest.TestCase):
             both[0]["address_validation_source"],
             "authorized_off_market_csv + matrix_csv",
         )
+        self.assertIsNone(both[0]["public_record_units"])
         self.assertLess(both[0]["data_completeness_score"], 100)
         validation_evidence = [
             item
@@ -81,7 +82,7 @@ class EndToEndIntelligenceTests(unittest.TestCase):
             mailing_zip=None,
             dor_code=None,
             dor_description=None,
-            unit_count=4,
+            unit_count=5,
             year_built=None,
             floor_count=None,
             building_area=None,
@@ -111,6 +112,7 @@ class EndToEndIntelligenceTests(unittest.TestCase):
             validated["address_validation_source"],
             "miami_dade_property_point_view",
         )
+        self.assertEqual(validated["public_record_units"], 5)
         validation_evidence = [
             item
             for item in validated["evidence"]
