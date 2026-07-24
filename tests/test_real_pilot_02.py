@@ -171,6 +171,28 @@ class MunicipalSeverityTests(unittest.TestCase):
         self.assertEqual(scores.components["owner_motivation"], ())
         self.assertGreater(scores.dimensions.property_risk, 0)
 
+    def test_boilerplate_ordinance_text_does_not_inflate_swale_case(self) -> None:
+        swale = case(
+            case_type="Swale Alteration",
+            status="Notice of Violation Extension",
+            description="Failure to comply with swale maintenance standards.",
+            violations=(
+                {
+                    "CodeDescription": "MAINTENANCE OF SWALE AREA",
+                    "ViolationPriority": "Medium",
+                    "RevisionCodeText": (
+                        "If an unrelated emergency creates an unsafe condition, "
+                        "the city may act immediately."
+                    ),
+                },
+            ),
+        )
+
+        classification = classify_municipal_case(swale, as_of=GENERATED_AT)
+
+        self.assertEqual(classification.category, "minor_warning")
+        self.assertEqual(classification.score, 10)
+
 
 class EvidenceScoringTests(unittest.TestCase):
     def test_scores_are_calculated_from_visible_components(self) -> None:
