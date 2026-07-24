@@ -36,6 +36,8 @@ def _action(features: RecommendationFeatures) -> str:
     scores = features.scores
     if features.is_synthetic:
         return "excluded"
+    if not features.in_scope:
+        return "excluded"
     if not features.identity_verified:
         return "verify_identity"
     if features.violation_review_required:

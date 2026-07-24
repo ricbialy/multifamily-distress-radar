@@ -210,14 +210,46 @@ def verify_real_pilot(
               AND state='unknown_failed'
             """,
         )
-        evidence_linked = _count(
-            connection,
+        latest_recommendations = connection.execute(
             """
-            SELECT COUNT(*) FROM recommendations
-            WHERE explanation_json LIKE '%statement_evidence_ids%'
-              AND explanation_json LIKE '%evidence_ids%'
-            """,
-        )
+            SELECT r.property_id,r.action,r.explanation_json
+            FROM recommendations r
+            WHERE r.recommendation_id=(
+                SELECT r2.recommendation_id FROM recommendations r2
+                WHERE r2.property_id=r.property_id
+                ORDER BY r2.generated_at DESC,r2.recommendation_id DESC LIMIT 1
+            )
+            """
+        ).fetchall()
+        evidence_linked = 0
+        for recommendation in latest_recommendations:
+            explanation = json.loads(recommendation["explanation_json"])
+            mappings = explanation.get("statement_evidence_ids") or {}
+            required_groups = (
+                "why_this_property_surfaced",
+                "recommended_action",
+            )
+            ids = {
+                evidence_id
+                for group in mappings.values()
+                for evidence_id in group
+            }
+            existing_ids = {
+                row[0]
+                for row in connection.execute(
+                    """
+                    SELECT evidence_id FROM evidence_items
+                    WHERE property_id=?
+                    """,
+                    (recommendation["property_id"],),
+                ).fetchall()
+            }
+            if (
+                all(mappings.get(group) for group in required_groups)
+                and ids
+                and ids.issubset(existing_ids)
+            ):
+                evidence_linked += 1
 
     failure_brief = (output_dir / "failed-source" / "daily_brief.md").read_text()
     gates = (
@@ -240,7 +272,17 @@ def verify_real_pilot(
             else "FAIL",
             f"{failed_coverage} unknown_failed coverage rows; failure visible in brief",
         ),
-        GateResult("G7", "PASS" if evidence_linked > 0 else "FAIL", f"{evidence_linked} evidence-linked recommendations"),
+        GateResult(
+            "G7",
+            "PASS"
+            if evidence_linked == len(latest_recommendations)
+            and evidence_linked > 0
+            else "FAIL",
+            (
+                f"{evidence_linked}/{len(latest_recommendations)} latest "
+                "recommendations have valid statement/action evidence"
+            ),
+        ),
         GateResult(
             "G8",
             "PASS"
@@ -255,6 +297,8 @@ def verify_real_pilot(
             == second.database_counts["canonical_properties"]
             and first.database_counts["listing_snapshots"]
             == second.database_counts["listing_snapshots"]
+            and first.database_counts["property_signals"]
+            == second.database_counts["property_signals"]
             and first_change_count == second_change_count
             else "FAIL",
             (
@@ -262,7 +306,9 @@ def verify_real_pilot(
                 f"{second.database_counts['canonical_properties']}; listings "
                 f"{first.database_counts['listing_snapshots']} -> "
                 f"{second.database_counts['listing_snapshots']}; changes "
-                f"{first_change_count} -> {second_change_count}"
+                f"{first_change_count} -> {second_change_count}; signals "
+                f"{first.database_counts['property_signals']} -> "
+                f"{second.database_counts['property_signals']}"
             ),
         ),
         GateResult(

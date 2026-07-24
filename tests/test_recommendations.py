@@ -135,6 +135,13 @@ class RecommendationTests(unittest.TestCase):
         result = recommend(base.with_flags(specific_opportunity=False))
         self.assertEqual(result.action, "watch")
 
+    def test_verified_property_outside_pilot_segment_is_excluded(self) -> None:
+        base = RecommendationFeatures.actionable(property_id="property-1")
+        self.assertEqual(
+            recommend(base.with_flags(in_scope=False)).action,
+            "excluded",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

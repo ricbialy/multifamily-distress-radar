@@ -32,6 +32,8 @@ class FolioResolver:
         )
         if submitted_folio and submitted_folio in candidates:
             return FolioResolution(submitted_folio, False, "exact_authoritative")
+        if submitted_folio and candidates:
+            return FolioResolution(None, True, None)
         if len(candidates) == 1:
             return FolioResolution(candidates[0], False, "unique_authoritative")
         return FolioResolution(None, len(candidates) > 1, None)

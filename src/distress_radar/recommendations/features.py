@@ -37,6 +37,7 @@ class RecommendationFeatures:
     is_synthetic: bool = False
     identity_verified: bool = True
     specific_opportunity: bool = True
+    in_scope: bool = True
 
     @classmethod
     def actionable(

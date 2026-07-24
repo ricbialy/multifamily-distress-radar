@@ -46,6 +46,9 @@ class IdentityTests(unittest.TestCase):
         )
         self.assertIsNone(resolver.resolve(None, ()).folio)
         self.assertTrue(resolver.resolve(None, ("1", "2")).conflicting)
+        self.assertTrue(
+            resolver.resolve("0400000000001", ("0400000000002",)).conflicting
+        )
 
     def test_exact_address_and_municipality_can_confirm_match(self) -> None:
         existing = CanonicalProperty(

@@ -35,6 +35,7 @@ from distress_radar.recommendations.features import (
 from distress_radar.recommendations.rule_engine import recommend
 from distress_radar.sources.base import CoverageState, SourceHealthState
 from distress_radar.sources.mls.matrix_csv import MatrixCsvImporter
+from distress_radar.tax_import import import_tax_csv
 from distress_radar.underwriting.commercial_multifamily import (
     CommercialMultifamilyInputs,
     underwrite_commercial,
@@ -213,7 +214,7 @@ def _save_signal(
     value: Any,
     evidence_ids: tuple[str, ...],
 ) -> None:
-    identity = _json((property_id, signal_type, value, evidence_ids))
+    identity = _json((property_id, signal_type, value))
     signal_id = "signal-" + hashlib.sha256(identity.encode()).hexdigest()[:24]
     store.connection.execute(
         """
@@ -637,6 +638,19 @@ def _persist_underwriting_and_recommendations(
                     ),
                 )
             )
+        diligence_evidence_ids = tuple(
+            store.add_evidence(
+                property_id,
+                EvidenceItem.unknown(
+                    field=f"diligence:{field}",
+                    source="acquisition_diligence",
+                    source_record_id=property_id,
+                    fetched_at=generated_at,
+                    reason="not_provided_or_not_supported",
+                ),
+            )
+            for field in MISSING_DILIGENCE
+        )
         units_row = store.connection.execute(
             """
             SELECT value_json FROM evidence_items
@@ -648,6 +662,7 @@ def _persist_underwriting_and_recommendations(
         units = None
         if units_row:
             units = json.loads(units_row["value_json"]).get("units")
+        in_scope = units is None or 10 <= units <= 80
         inputs = CommercialMultifamilyInputs(
             units=units,
             current_noi=None,
@@ -721,6 +736,7 @@ def _persist_underwriting_and_recommendations(
             is_synthetic=False,
             identity_verified=identity_verified,
             specific_opportunity=bool(case_evidence),
+            in_scope=in_scope,
         )
         result = recommend(features)
         evidence_ids = tuple(
@@ -778,6 +794,16 @@ def _persist_underwriting_and_recommendations(
                 "identity": identity_evidence_ids,
                 "property_risk": municipal_evidence_ids,
                 "missing_source_data": tuple(source_gap_evidence_ids),
+                "missing_diligence": diligence_evidence_ids,
+                "recommended_action": (
+                    municipal_evidence_ids
+                    if result.action == "human_violation_review"
+                    else identity_evidence_ids
+                    if result.action == "verify_identity"
+                    else diligence_evidence_ids
+                    if result.action in {"request_documents", "insufficient_data"}
+                    else evidence_ids
+                ),
             },
             "discovery_channels": channels,
             "identity_verified": identity_verified,
@@ -1261,6 +1287,41 @@ def run_pilot(
                 error_message="MIAMI_DADE_CLERK_AUTH_KEY not configured",
             )
 
+        tax_run = store.start_source_run(TAX_SOURCE)
+        tax_path_value = os.environ.get("RADAR_TAX_CSV")
+        tax_by_folio: dict[str, list[Any]] = {}
+        tax_error: str | None = None
+        if tax_path_value:
+            try:
+                tax_records = import_tax_csv(config.slug, Path(tax_path_value))
+                for record in tax_records:
+                    tax_by_folio.setdefault(
+                        normalize_folio(record.folio) or "", []
+                    ).append(record)
+                store.finish_source_run(
+                    run_id=tax_run,
+                    state=SourceHealthState.HEALTHY,
+                    records_examined=len(tax_records),
+                    records_changed=0,
+                )
+            except Exception as exc:
+                tax_error = str(exc)
+                store.finish_source_run(
+                    run_id=tax_run,
+                    state=SourceHealthState.DEGRADED,
+                    records_examined=0,
+                    records_changed=0,
+                    error_message=tax_error,
+                )
+        else:
+            store.finish_source_run(
+                run_id=tax_run,
+                state=SourceHealthState.DISABLED,
+                records_examined=0,
+                records_changed=0,
+                error_message="RADAR_TAX_CSV not configured",
+            )
+
         for prop in _canonical_properties(store):
             is_hialeah = prop.municipality.casefold() == "hialeah"
             matched = cases_by_folio.get(normalize_folio(prop.folio) or "", [])
@@ -1334,14 +1395,53 @@ def run_pilot(
                 ),
                 checked_at=generated_at,
             )
+            tax_records_for_property = tax_by_folio.get(
+                normalize_folio(prop.folio) or "", []
+            )
+            tax_state = (
+                CoverageState.UNKNOWN_NOT_RUN
+                if not tax_path_value
+                else CoverageState.UNKNOWN_FAILED
+                if tax_error
+                else CoverageState.NOT_APPLICABLE
+                if not prop.folio
+                else CoverageState.CONFIRMED_PRESENT
+                if tax_records_for_property
+                else CoverageState.CONFIRMED_ABSENT
+            )
+            for tax_record in tax_records_for_property:
+                store.add_evidence(
+                    prop.property_id,
+                    EvidenceItem(
+                        field="tax_delinquency",
+                        value={
+                            "tax_year": tax_record.tax_year,
+                            "amount_due": tax_record.amount_due,
+                            "status": tax_record.status,
+                        },
+                        source=TAX_SOURCE,
+                        source_record_id=tax_record.source_record_id,
+                        source_url=tax_record.source_url,
+                        fetched_at=tax_record.fetched_at,
+                        freshness_status=FreshnessStatus.FRESH,
+                        confidence=1.0,
+                        value_type=ValueType.REPORTED,
+                    ),
+                )
             store.set_source_coverage(
                 property_id=prop.property_id,
                 source_name=TAX_SOURCE,
-                state=CoverageState.UNKNOWN_NOT_RUN,
+                state=tax_state,
                 query_scope=f"folio:{prop.folio or 'unverified'}",
-                records_examined=0,
-                records_matched=0,
-                error_message="authorized tax CSV not configured",
+                records_examined=len(tax_by_folio),
+                records_matched=len(tax_records_for_property),
+                run_id=tax_run,
+                error_message=tax_error
+                or (
+                    "RADAR_TAX_CSV not configured"
+                    if not tax_path_value
+                    else None
+                ),
                 checked_at=generated_at,
             )
         _persist_underwriting_and_recommendations(store, generated_at=generated_at)

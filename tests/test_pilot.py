@@ -220,6 +220,10 @@ class PilotTests(unittest.TestCase):
             first.database_counts["listing_snapshots"],
             second.database_counts["listing_snapshots"],
         )
+        self.assertEqual(
+            first.database_counts["property_signals"],
+            second.database_counts["property_signals"],
+        )
         self.assertEqual(status_changes, 1)
         self.assertGreaterEqual(failed_coverage, 1)
         self.assertIn("simulated source failure", failed_brief)
