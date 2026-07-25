@@ -61,6 +61,12 @@ class FakePropertyCollector:
         return PropertyCollectionResult((self.matrix, self.off_market), ())
 
 
+class MismatchPropertyCollector(FakePropertyCollector):
+    def __init__(self) -> None:
+        super().__init__()
+        self.matrix = property_record("0400000000001", "999 OTHER AVE", 12)
+
+
 class FakeCodeCollector:
     def collect(self, statuses: tuple[str, ...], **kwargs: object) -> CollectionResult:
         case = CodeCase(
@@ -85,20 +91,100 @@ class FakeCodeCollector:
         return CollectionResult((case,), (), statuses)
 
 
-class PilotTests(unittest.TestCase):
-    def test_one_run_persists_workflow_and_generates_database_reports(self) -> None:
-        csv_text = (
-            ",MLS # Link,St,Area,Address,,Current Price,ZN,Year Built,"
-            "Prop Type,Style of Property,Prop Type/Type of Building,"
-            "Type of Property,Property SqFt,Waterfront Property (Y/N),"
-            "Sale Price,#Bays\n"
-            '1,A123,A,41,100 Test Ave,,"$2,500,000",3901,1970,COM/Sale,,'
-            "Commercial/Residential Income,Income/MultiFamily,12000,,,,\n"
+class IntentToLienCodeCollector:
+    def collect(self, statuses: tuple[str, ...], **kwargs: object) -> CollectionResult:
+        case = CodeCase(
+            city_slug="hialeah_fl",
+            source_name="hialeah_tyler_energov",
+            source_record_id="case-itl",
+            case_number="CE-ITL",
+            case_type="Code Enforcement",
+            status="Intent to Lien",
+            opened_date="2026-07-24",
+            closed_date=None,
+            address="200 TEST AVE",
+            parcel_number="0400000000002",
+            description="Administrative enforcement case",
+            project_name=None,
+            assigned_to=None,
+            violation_count=0,
+            violations=(),
+            source_url="https://example.test/case-itl",
+            fetched_at="2026-07-24T12:00:00+00:00",
         )
+        return CollectionResult((case,), (), statuses)
+
+
+class PilotTests(unittest.TestCase):
+    csv_text = (
+        ",MLS # Link,St,Area,Address,,Current Price,ZN,Year Built,"
+        "Prop Type,Style of Property,Prop Type/Type of Building,"
+        "Type of Property,Property SqFt,Waterfront Property (Y/N),"
+        "Sale Price,#Bays\n"
+        '1,A123,A,41,100 Test Ave,,"$2,500,000",3901,1970,COM/Sale,,'
+        "Commercial/Residential Income,Income/MultiFamily,12000,,,,\n"
+    )
+
+    def test_county_address_mismatch_requires_identity_verification(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             matrix = root / "Agent Single Line - COM.csv"
-            matrix.write_text(csv_text, encoding="utf-8")
+            matrix.write_text(self.csv_text, encoding="utf-8")
+            run_pilot(
+                matrix_path=matrix,
+                database_path=root / "pilot.sqlite",
+                output_dir=root / "output",
+                municipality="hialeah",
+                generated_at="2026-07-24T12:00:00+00:00",
+                property_collector=MismatchPropertyCollector(),
+                code_collector=FakeCodeCollector(),
+            )
+            recommendations = json.loads(
+                (root / "output/recommendations.json").read_text()
+            )
+
+        listed = next(
+            item for item in recommendations if "mls" in item["discovery_channels"]
+        )
+        self.assertFalse(listed["identity_verified"])
+        self.assertEqual(listed["recommended_action"], "verify_identity")
+
+    def test_fresh_intent_to_lien_requires_municipal_review(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            matrix = root / "Agent Single Line - COM.csv"
+            matrix.write_text(self.csv_text, encoding="utf-8")
+            run_pilot(
+                matrix_path=matrix,
+                database_path=root / "pilot.sqlite",
+                output_dir=root / "output",
+                municipality="hialeah",
+                generated_at="2026-07-24T12:00:00+00:00",
+                property_collector=FakePropertyCollector(),
+                code_collector=IntentToLienCodeCollector(),
+            )
+            recommendations = json.loads(
+                (root / "output/recommendations.json").read_text()
+            )
+
+        off_market = next(
+            item
+            for item in recommendations
+            if "off_market" in item["discovery_channels"]
+        )
+        self.assertLess(
+            off_market["municipal_cases"][0]["severity_score"],
+            50,
+        )
+        self.assertEqual(
+            off_market["recommended_action"], "human_municipal_review"
+        )
+
+    def test_one_run_persists_workflow_and_generates_database_reports(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            matrix = root / "Agent Single Line - COM.csv"
+            matrix.write_text(self.csv_text, encoding="utf-8")
             output = root / "output"
             db = root / "pilot.sqlite"
             result = run_pilot(

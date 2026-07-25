@@ -29,6 +29,7 @@ from distress_radar.identity.owner_resolver import OwnerResolver, normalize_owne
 from distress_radar.intelligence_store import IntelligenceStore
 from distress_radar.models import CodeCase, PropertyRecord, RawDocument
 from distress_radar.municipal_severity import (
+    MunicipalSeverity,
     classify_municipal_case,
     severity_from_mapping,
 )
@@ -386,6 +387,44 @@ def _material_value(value: Any) -> Any:
 
 def _material_content_hash(payload: dict[str, Any]) -> str:
     return hashlib.sha256(_json(_material_value(payload)).encode()).hexdigest()
+
+
+def _has_verified_address_evidence(
+    store: IntelligenceStore, property_id: str
+) -> bool:
+    row = store.connection.execute(
+        """
+        SELECT value_json,value_type,metadata_json
+        FROM evidence_items
+        WHERE property_id=? AND field_name='validated_address'
+        ORDER BY fetched_at DESC,rowid DESC LIMIT 1
+        """,
+        (property_id,),
+    ).fetchone()
+    if not row or row["value_type"] != ValueType.REPORTED.value:
+        return False
+    metadata = json.loads(row["metadata_json"])
+    return bool(
+        json.loads(row["value_json"])
+        and metadata.get("validation_status") == "verified"
+    )
+
+
+def _is_serious_municipal_matter(item: MunicipalSeverity) -> bool:
+    return bool(
+        item.currently_active
+        and (
+            item.score >= 50
+            or item.enforcement_stage in {"itl", "lien", "special_master"}
+            or item.category
+            in {
+                "intent_to_lien_or_lien",
+                "special_master_escalation",
+                "unsafe_or_life_safety",
+            }
+            or item.substantive_hazard == "unsafe_life_safety"
+        )
+    )
 
 
 def _active_clerk_records(records: tuple[Any, ...]) -> tuple[Any, ...]:
@@ -1006,7 +1045,10 @@ def _persist_underwriting_and_recommendations_legacy(
             (row for row in coverage if row["source_name"] == COUNTY_SOURCE), None
         )
         identity_verified = bool(
-            prop.folio and county and county["state"] == CoverageState.CONFIRMED_PRESENT.value
+            prop.folio
+            and county
+            and county["state"] == CoverageState.CONFIRMED_PRESENT.value
+            and (not listing or _has_verified_address_evidence(store, property_id))
         )
         source_gaps = tuple(
             f"{row['source_name']}:{row['state']}"
@@ -1284,6 +1326,10 @@ def _persist_underwriting_and_recommendations(
             prop.folio
             and county_coverage
             and county_coverage["state"] == CoverageState.CONFIRMED_PRESENT.value
+            and (
+                listing_row is None
+                or _has_verified_address_evidence(store, property_id)
+            )
         )
         county_row = store.connection.execute(
             """
@@ -1483,7 +1529,9 @@ def _persist_underwriting_and_recommendations(
             "active",
             "act",
         }
-        serious_municipal = any(item.score >= 50 for item in municipal)
+        serious_municipal = any(
+            _is_serious_municipal_matter(item) for item in municipal
+        )
         independent_motivation = scores.owner_motivation > 0
         in_scope = units is None or 10 <= units <= 80
         features = RecommendationFeatures(
