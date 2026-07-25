@@ -4,18 +4,33 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
+from distress_radar.domain.property import CanonicalProperty
 from distress_radar.intelligence_store import IntelligenceStore
 from distress_radar.models import (
     CodeCase,
     CollectionResult,
+    OfficialRecord,
     PropertyCollectionResult,
     PropertyRecord,
 )
-from distress_radar.municipal_severity import classify_municipal_case
-from distress_radar.pilot import run_pilot
-from distress_radar.recommendations.features import calculate_evidence_scores
+from distress_radar.municipal_severity import (
+    active_violations,
+    classify_municipal_case,
+)
+from distress_radar.pilot import (
+    _active_clerk_records,
+    _apply_disposition_action,
+    _material_content_hash,
+    run_pilot,
+)
+from distress_radar.recommendations.features import (
+    acquisition_attractiveness,
+    calculate_evidence_scores,
+    municipal_review_urgency,
+)
 
 
 GENERATED_AT = "2026-07-24T12:00:00+00:00"
@@ -62,6 +77,7 @@ def case(
     description: str = "Unsafe structure and life safety inspection",
     parcel: str = "0400000000002",
     violations: tuple[dict[str, object], ...] = (),
+    closed_date: str | None = None,
 ) -> CodeCase:
     return CodeCase(
         city_slug="hialeah_fl",
@@ -71,7 +87,7 @@ def case(
         case_type=case_type,
         status=status,
         opened_date=opened_date,
-        closed_date=None,
+        closed_date=closed_date,
         address="200 TEST AVE",
         parcel_number=parcel,
         description=description,
@@ -209,6 +225,69 @@ class MunicipalSeverityTests(unittest.TestCase):
             after_anniversary_time.age_days,
         )
 
+    def test_enforcement_stage_is_separate_from_substantive_hazard(self) -> None:
+        graffiti = classify_municipal_case(
+            case(
+                case_type="Graffiti",
+                status="Special Master Order Sent",
+                description="Graffiti on exterior wall",
+            ),
+            as_of=GENERATED_AT,
+        )
+        minimum_housing = classify_municipal_case(
+            case(
+                case_type="Minimum Housing",
+                status="Notice Of Violation Sent",
+                description="Mold and uninhabitable sleeping room",
+            ),
+            as_of=GENERATED_AT,
+        )
+
+        self.assertEqual(graffiti.enforcement_stage, "special_master")
+        self.assertEqual(graffiti.substantive_hazard, "cosmetic")
+        self.assertEqual(minimum_housing.enforcement_stage, "nov")
+        self.assertEqual(minimum_housing.substantive_hazard, "minimum_housing")
+        self.assertGreater(
+            municipal_review_urgency((minimum_housing,)),
+            municipal_review_urgency((graffiti,)),
+        )
+
+    def test_configured_hialeah_hearing_and_itl_statuses_are_recognized(self) -> None:
+        expectations = {
+            "Notice of Hearing Sent": "hearing",
+            "ITL NOH Sent": "itl",
+            "ITL Appealed": "itl",
+            "Intent to Lien Sent": "itl",
+            "Lien": "lien",
+        }
+        for status, expected in expectations.items():
+            with self.subTest(status=status):
+                result = classify_municipal_case(
+                    case(case_type="Signs", status=status, description="Sign"),
+                    as_of=GENERATED_AT,
+                )
+                self.assertEqual(result.enforcement_stage, expected)
+
+    def test_resolved_violation_rows_are_filtered(self) -> None:
+        rows = (
+            {"CodeStatus": "In Violation", "ResolveDate": None},
+            {"CodeStatus": "Complied", "ResolveDate": "2026-07-01"},
+            {"Status": "Closed"},
+        )
+        self.assertEqual(active_violations(rows), (rows[0],))
+
+    def test_closed_case_has_no_current_review_urgency(self) -> None:
+        closed = classify_municipal_case(
+            case(
+                status="Closed",
+                closed_date="2026-07-01",
+                violations=({"CodeStatus": "Complied"},),
+            ),
+            as_of=GENERATED_AT,
+        )
+        self.assertFalse(closed.currently_active)
+        self.assertEqual(municipal_review_urgency((closed,)), 0)
+
 
 class EvidenceScoringTests(unittest.TestCase):
     def test_scores_are_calculated_from_visible_components(self) -> None:
@@ -244,6 +323,94 @@ class EvidenceScoringTests(unittest.TestCase):
         self.assertTrue(scores.components["economics"])
         self.assertTrue(scores.components["data_completeness"])
 
+    def test_absentee_and_long_ownership_are_context_not_confirmed_motivation(self) -> None:
+        scores = calculate_evidence_scores(
+            county={
+                "absentee_owner": True,
+                "ownership_duration_years": 30,
+                "verified_units": 20,
+            },
+            listing={},
+            municipal=(),
+            official_records=(),
+            tax_records=(),
+            missing_fields=(),
+        )
+        self.assertEqual(scores.dimensions.owner_motivation, 0)
+        self.assertTrue(
+            all("+0" in item for item in scores.components["owner_motivation"])
+        )
+
+    def test_bad_economics_and_assessed_value_do_not_create_positive_points(self) -> None:
+        scores = calculate_evidence_scores(
+            county={"verified_units": 10, "assessed_value": 10_000_000},
+            listing={
+                "list_price": 5_000_000,
+                "noi": 100_000,
+                "expenses": None,
+            },
+            municipal=(),
+            official_records=(),
+            tax_records=(),
+            missing_fields=("expenses",),
+        )
+        self.assertEqual(scores.dimensions.economics, 0)
+        self.assertNotIn("asking_to_assessed_ratio", scores.metrics)
+        self.assertNotIn("reported_noi_cap_rate", scores.metrics)
+
+    def test_only_price_reductions_create_market_pressure(self) -> None:
+        increases = calculate_evidence_scores(
+            county={},
+            listing={"price_reduction_count": 0, "price_change_count": 4},
+            municipal=(),
+            official_records=(),
+            tax_records=(),
+            missing_fields=(),
+        )
+        reductions = calculate_evidence_scores(
+            county={},
+            listing={"price_reduction_count": 2, "price_change_count": 4},
+            municipal=(),
+            official_records=(),
+            tax_records=(),
+            missing_fields=(),
+        )
+        self.assertEqual(increases.dimensions.market_pressure, 0)
+        self.assertGreater(reductions.dimensions.market_pressure, 0)
+
+    def test_resolved_taxes_and_clerk_releases_score_zero(self) -> None:
+        records = tuple(
+            {"amount_due": 10_000, "status": status}
+            for status in ("redeemed", "released", "cancelled", "paid", "satisfied")
+        )
+        scores = calculate_evidence_scores(
+            county={},
+            listing={},
+            municipal=(),
+            official_records=({"signal_type": "release"},),
+            tax_records=records,
+            missing_fields=(),
+        )
+        self.assertEqual(scores.dimensions.owner_motivation, 0)
+
+    def test_acquisition_attractiveness_does_not_reward_property_risk(self) -> None:
+        safe = calculate_evidence_scores(
+            county={"verified_units": 20},
+            listing={"list_price": 2_000_000},
+            municipal=(),
+            official_records=(),
+            tax_records=(),
+            missing_fields=(),
+        )
+        risky = replace(
+            safe,
+            dimensions=replace(safe.dimensions, property_risk=100),
+        )
+        self.assertEqual(
+            acquisition_attractiveness(safe.dimensions),
+            acquisition_attractiveness(risky.dimensions),
+        )
+
 
 class DispositionTests(unittest.TestCase):
     def test_dismissal_is_durable_until_material_evidence_changes(self) -> None:
@@ -275,6 +442,125 @@ class DispositionTests(unittest.TestCase):
                 self.assertIsNone(
                     store.effective_disposition("property-1", "new-content")
                 )
+
+    def test_approval_is_hash_bound_and_cannot_bypass_hard_gates(self) -> None:
+        self.assertEqual(
+            _apply_disposition_action(
+                disposition="approved_for_contact",
+                baseline_content_hash="old",
+                current_content_hash="new",
+                default_action="watch",
+                listing_present=False,
+                identity_verified=True,
+                in_scope=True,
+                serious_municipal=False,
+                underwriting_complete=True,
+            ),
+            "watch",
+        )
+        for gate_action, flags in (
+            ("verify_identity", {"identity_verified": False}),
+            ("excluded", {"in_scope": False}),
+            ("human_municipal_review", {"serious_municipal": True}),
+            ("request_documents", {"underwriting_complete": False}),
+        ):
+            with self.subTest(gate=gate_action):
+                arguments = {
+                    "identity_verified": True,
+                    "in_scope": True,
+                    "serious_municipal": False,
+                    "underwriting_complete": True,
+                    **flags,
+                }
+                self.assertEqual(
+                    _apply_disposition_action(
+                        disposition="approved_for_contact",
+                        baseline_content_hash="same",
+                        current_content_hash="same",
+                        default_action=gate_action,
+                        listing_present=False,
+                        **arguments,
+                    ),
+                    gate_action,
+                )
+
+    def test_material_hash_excludes_clock_only_fields(self) -> None:
+        first = {
+            "county": {
+                "owner": "OWNER LLC",
+                "last_sale_date": "2000-01-01",
+                "ownership_duration_years": 26.5,
+                "fetched_at": "2026-07-24T12:00:00Z",
+            },
+            "municipal": [
+                {
+                    "case_number": "C-1",
+                    "status": "Open",
+                    "age_days": 100,
+                    "severity_score": 50,
+                    "severity_reasons": ["100 days old"],
+                }
+            ],
+            "generated_at": "2026-07-24T12:00:00Z",
+            "data_freshness": 90,
+        }
+        second = {
+            "county": {
+                **first["county"],
+                "ownership_duration_years": 26.6,
+                "fetched_at": "2026-07-25T12:00:00Z",
+            },
+            "municipal": [
+                {
+                    **first["municipal"][0],
+                    "age_days": 101,
+                    "severity_reasons": ["101 days old"],
+                }
+            ],
+            "generated_at": "2026-07-25T12:00:00Z",
+            "data_freshness": 89,
+        }
+        self.assertEqual(
+            _material_content_hash(first),
+            _material_content_hash(second),
+        )
+
+
+class ClerkLifecycleTests(unittest.TestCase):
+    def test_clerk_party_rows_deduplicate_and_release_original_instrument(self) -> None:
+        base = OfficialRecord(
+            "hialeah_fl",
+            "miami_dade_clerk",
+            "party-1",
+            "2026-100",
+            None,
+            None,
+            "0400000000001",
+            "LIEN",
+            "lien",
+            "2026-01-01",
+            None,
+            "CITY",
+            "OWNER",
+            None,
+            None,
+            None,
+            None,
+            None,
+            "https://example.test/clerk",
+            GENERATED_AT,
+        )
+        duplicate = replace(base, source_record_id="party-2", first_party="OTHER")
+        release = replace(
+            base,
+            source_record_id="release-party",
+            instrument_id="2026-200",
+            original_instrument_id="2026-100",
+            document_type="SATISFACTION",
+            signal_type="release",
+        )
+        self.assertEqual(_active_clerk_records((base, duplicate)), (base,))
+        self.assertEqual(_active_clerk_records((base, duplicate, release)), ())
 
 
 class QualifiedQueueIntegrationTests(unittest.TestCase):
@@ -362,6 +648,213 @@ class QualifiedQueueIntegrationTests(unittest.TestCase):
 
         self.assertGreater(first_alerts, 0)
         self.assertEqual(second_alerts, 0)
+
+    def test_next_day_unchanged_run_has_no_false_transitions_or_alerts(self) -> None:
+        csv_text = (
+            "MLS Number,Address,Status,List Price,DOM,CDOM,Units,Remarks\n"
+            "A123,100 Test Ave,A,2400000,90,120,12,Price reduced\n"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            matrix = root / "Agent Single Line - COM.csv"
+            matrix.write_text(csv_text, encoding="utf-8")
+            database = root / "pilot.sqlite"
+            first = run_pilot(
+                matrix_path=matrix,
+                database_path=database,
+                output_dir=root / "first",
+                municipality="hialeah",
+                generated_at=GENERATED_AT,
+                property_collector=TargetedPropertyCollector(),
+                code_collector=TargetedCodeCollector(),
+            )
+            second = run_pilot(
+                matrix_path=matrix,
+                database_path=database,
+                output_dir=root / "second",
+                municipality="hialeah",
+                generated_at="2026-07-25T12:00:00+00:00",
+                property_collector=TargetedPropertyCollector(),
+                code_collector=TargetedCodeCollector(),
+            )
+            with sqlite3.connect(database) as connection:
+                changed = connection.execute(
+                    """
+                    SELECT COUNT(*) FROM recommendations
+                    WHERE pilot_run_id=? AND change_type='materially_changed'
+                    """,
+                    (second.run_id,),
+                ).fetchone()[0]
+                alerts = connection.execute(
+                    "SELECT COUNT(*) FROM opportunity_alerts WHERE pilot_run_id=?",
+                    (second.run_id,),
+                ).fetchone()[0]
+                transitions = connection.execute(
+                    """
+                    SELECT COUNT(*) FROM signal_observations
+                    WHERE pilot_run_id=? AND status IN ('resolved','active')
+                    """,
+                    (second.run_id,),
+                ).fetchone()[0]
+            self.assertEqual(changed, 0)
+            self.assertEqual(alerts, 0)
+            self.assertEqual(transitions, 0)
+
+    def test_source_failure_preserves_last_known_without_current_scoring(self) -> None:
+        class FailedCodeCollector(TargetedCodeCollector):
+            def collect(self, statuses: tuple[str, ...], **kwargs: object) -> CollectionResult:
+                raise RuntimeError("source unavailable")
+
+        csv_text = (
+            "MLS Number,Address,Status,List Price,DOM,CDOM,Units,Remarks\n"
+            "A123,100 Test Ave,A,2400000,90,120,12,Price reduced\n"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            matrix = root / "Agent Single Line - COM.csv"
+            matrix.write_text(csv_text, encoding="utf-8")
+            database = root / "pilot.sqlite"
+            run_pilot(
+                matrix_path=matrix,
+                database_path=database,
+                output_dir=root / "first",
+                municipality="hialeah",
+                generated_at=GENERATED_AT,
+                property_collector=TargetedPropertyCollector(),
+                code_collector=TargetedCodeCollector(),
+            )
+            failed = run_pilot(
+                matrix_path=matrix,
+                database_path=database,
+                output_dir=root / "failed",
+                municipality="hialeah",
+                generated_at="2026-07-25T12:00:00+00:00",
+                property_collector=TargetedPropertyCollector(),
+                code_collector=FailedCodeCollector(),
+            )
+            with sqlite3.connect(database) as connection:
+                connection.row_factory = sqlite3.Row
+                signal = connection.execute(
+                    """
+                    SELECT status,confirmation_status FROM property_signals
+                    WHERE signal_type='off_market_live_code_case'
+                    """
+                ).fetchone()
+                current = connection.execute(
+                    """
+                    SELECT explanation_json FROM recommendations
+                    WHERE pilot_run_id=? AND property_id=(
+                        SELECT property_id FROM canonical_properties
+                        WHERE folio='0400000000002'
+                    )
+                    """,
+                    (failed.run_id,),
+                ).fetchone()
+                alerts = connection.execute(
+                    "SELECT COUNT(*) FROM opportunity_alerts WHERE pilot_run_id=?",
+                    (failed.run_id,),
+                ).fetchone()[0]
+            self.assertEqual(dict(signal), {"status": "active", "confirmation_status": "last_known"})
+            self.assertEqual(json.loads(current["explanation_json"])["municipal_cases"], [])
+            self.assertEqual(alerts, 0)
+
+    def test_healthy_disappearance_resolves_once_and_removes_current_case(self) -> None:
+        class EmptyCodeCollector(TargetedCodeCollector):
+            def collect(self, statuses: tuple[str, ...], **kwargs: object) -> CollectionResult:
+                return CollectionResult((), (), statuses)
+
+        csv_text = (
+            "MLS Number,Address,Status,List Price,DOM,CDOM,Units,Remarks\n"
+            "A123,100 Test Ave,A,2400000,90,120,12,Price reduced\n"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            matrix = root / "Agent Single Line - COM.csv"
+            matrix.write_text(csv_text, encoding="utf-8")
+            database = root / "pilot.sqlite"
+            run_pilot(
+                matrix_path=matrix,
+                database_path=database,
+                output_dir=root / "first",
+                municipality="hialeah",
+                generated_at=GENERATED_AT,
+                property_collector=TargetedPropertyCollector(),
+                code_collector=TargetedCodeCollector(),
+            )
+            disappeared = run_pilot(
+                matrix_path=matrix,
+                database_path=database,
+                output_dir=root / "second",
+                municipality="hialeah",
+                generated_at="2026-07-25T12:00:00+00:00",
+                property_collector=TargetedPropertyCollector(),
+                code_collector=EmptyCodeCollector(),
+            )
+            run_pilot(
+                matrix_path=matrix,
+                database_path=database,
+                output_dir=root / "third",
+                municipality="hialeah",
+                generated_at="2026-07-26T12:00:00+00:00",
+                property_collector=TargetedPropertyCollector(),
+                code_collector=EmptyCodeCollector(),
+            )
+            with sqlite3.connect(database) as connection:
+                resolutions = connection.execute(
+                    """
+                    SELECT COUNT(*) FROM signal_observations WHERE status='resolved'
+                    """
+                ).fetchone()[0]
+                explanation = json.loads(
+                    connection.execute(
+                        """
+                        SELECT explanation_json FROM recommendations
+                        WHERE pilot_run_id=? AND property_id=(
+                            SELECT property_id FROM canonical_properties
+                            WHERE folio='0400000000002'
+                        )
+                        """,
+                        (disappeared.run_id,),
+                    ).fetchone()[0]
+                )
+            self.assertEqual(resolutions, 1)
+            self.assertEqual(explanation["municipal_cases"], [])
+
+    def test_closed_case_does_not_enter_current_queue(self) -> None:
+        class ClosedCodeCollector(TargetedCodeCollector):
+            def enrich_records(
+                self, records: tuple[CodeCase, ...], *, include_violations: bool
+            ) -> CollectionResult:
+                closed = tuple(
+                    case(
+                        record_id=item.source_record_id,
+                        status="Closed",
+                        closed_date="2026-07-01",
+                        violations=({"CodeStatus": "Complied"},),
+                    )
+                    for item in records
+                )
+                return CollectionResult(closed, (), ("Closed",))
+
+        csv_text = (
+            "MLS Number,Address,Status,List Price,DOM,CDOM,Units,Remarks\n"
+            "A123,100 Test Ave,A,2400000,90,120,12,Price reduced\n"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            matrix = root / "Agent Single Line - COM.csv"
+            matrix.write_text(csv_text, encoding="utf-8")
+            run_pilot(
+                matrix_path=matrix,
+                database_path=root / "pilot.sqlite",
+                output_dir=root / "output",
+                municipality="hialeah",
+                generated_at=GENERATED_AT,
+                property_collector=TargetedPropertyCollector(),
+                code_collector=ClosedCodeCollector(),
+            )
+            queue = json.loads((root / "output" / "municipal_review_queue.json").read_text())
+        self.assertEqual(queue, [])
 
 
 if __name__ == "__main__":
