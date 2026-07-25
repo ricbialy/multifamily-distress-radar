@@ -113,6 +113,24 @@ class PilotVerificationTests(unittest.TestCase):
                 {"case_number": "C-1", "currently_active": False},
             )
         )
+        self.assertTrue(
+            _evidence_value_supports_action(
+                "verify_identity",
+                "validated_address",
+                None,
+                value_type="unknown",
+                metadata={"reason": "no_exact_county_match"},
+            )
+        )
+        self.assertFalse(
+            _evidence_value_supports_action(
+                "verify_identity",
+                "validated_address",
+                None,
+                value_type="unknown",
+                metadata={},
+            )
+        )
 
     def test_g10_requires_exact_target_and_zero_unrelated_changes(self) -> None:
         changes = [

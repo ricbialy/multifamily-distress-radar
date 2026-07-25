@@ -70,7 +70,12 @@ def _active_intersection_count(
 
 
 def _evidence_value_supports_action(
-    action: str, field_name: str, value: Any
+    action: str,
+    field_name: str,
+    value: Any,
+    *,
+    value_type: str | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> bool:
     if action == "human_municipal_review":
         return (
@@ -98,8 +103,15 @@ def _evidence_value_supports_action(
                 and is_unpaid_status(value.get("status"))
             )
     if action == "verify_identity":
-        return field_name in {"validated_address", "public_property_record"} and bool(
-            value
+        return field_name in {
+            "validated_address",
+            "public_property_record",
+        } and (
+            bool(value)
+            or (
+                value_type == "unknown"
+                and bool((metadata or {}).get("reason"))
+            )
         )
     if action in {"contact_broker_for_documents", "request_documents"}:
         return field_name == "matrix_listing" or field_name.startswith("diligence:")
@@ -526,7 +538,8 @@ def verify_real_pilot(
                 row
                 for row in connection.execute(
                     """
-                    SELECT field_name,value_json FROM evidence_items
+                    SELECT field_name,value_json,value_type,metadata_json
+                    FROM evidence_items
                     WHERE property_id=? AND evidence_id IN (
                         SELECT value FROM json_each(?)
                     )
@@ -548,10 +561,15 @@ def verify_real_pilot(
                     _evidence_value_supports_action(
                         recommendation["action"],
                         row["field_name"],
-                        json.loads(row["value_json"]),
+                        (
+                            json.loads(row["value_json"])
+                            if row["value_json"] is not None
+                            else None
+                        ),
+                        value_type=row["value_type"],
+                        metadata=json.loads(row["metadata_json"] or "{}"),
                     )
                     for row in action_evidence
-                    if row["value_json"] is not None
                 )
                 if expected is None or (
                     {row["field_name"] for row in action_evidence} & expected
