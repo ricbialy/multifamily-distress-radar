@@ -6,6 +6,8 @@ import unittest
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from distress_radar.cli import build_parser, main
 from distress_radar.domain.property import CanonicalProperty
@@ -14,6 +16,63 @@ from distress_radar.pilot import _migrate_pilot
 
 
 class PilotDispositionCliTests(unittest.TestCase):
+    def test_pilot_run_command_reports_complete_result(self) -> None:
+        result = SimpleNamespace(
+            run_id="run-1",
+            matrix_sha256="sha",
+            accepted_rows=20,
+            rejected_rows=0,
+            database_counts={"recommendations": 20},
+            output_files=(Path("acquisition_brief.md"),),
+        )
+        output = StringIO()
+        with patch("distress_radar.pilot.run_pilot", return_value=result):
+            with redirect_stdout(output):
+                main(
+                    [
+                        "pilot-run",
+                        "--matrix",
+                        "matrix.csv",
+                        "--db",
+                        "pilot.sqlite",
+                        "--output-dir",
+                        "outputs",
+                    ]
+                )
+        self.assertEqual(json.loads(output.getvalue())["accepted_rows"], 20)
+
+    def test_pilot_verify_command_reports_same_and_next_day_counts(self) -> None:
+        result = SimpleNamespace(
+            status="REAL-PILOT-02: PASS",
+            gates=(SimpleNamespace(gate="G0", status="PASS", evidence="real input"),),
+            first_run_counts={"recommendations": 20},
+            second_run_counts={"recommendations": 40},
+            next_day_run_counts={"recommendations": 60},
+            controlled_change={"status_changes_detected": 1},
+            source_statuses={"hialeah_tyler_energov": "healthy"},
+            output_path=Path("acceptance_gates.json"),
+        )
+        output = StringIO()
+        with patch(
+            "distress_radar.pilot_verification.verify_real_pilot",
+            return_value=result,
+        ):
+            with redirect_stdout(output):
+                main(
+                    [
+                        "pilot-verify",
+                        "--matrix",
+                        "matrix.csv",
+                        "--db",
+                        "pilot.sqlite",
+                        "--output-dir",
+                        "outputs",
+                    ]
+                )
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["status"], "REAL-PILOT-02: PASS")
+        self.assertEqual(payload["next_day_run_counts"]["recommendations"], 60)
+
     def test_parser_exposes_pilot_disposition_command(self) -> None:
         args = build_parser().parse_args(
             [

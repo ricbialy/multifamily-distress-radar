@@ -128,6 +128,11 @@ class PilotTests(unittest.TestCase):
             "top_candidate_trace.md",
             "acquisition_brief.md",
             "qualified_queue.json",
+            "acquisition_queue.json",
+            "municipal_review_queue.json",
+            "mls_example.json",
+            "source_health_warnings.json",
+            "change_summary.json",
         }
         self.assertEqual({path.name for path in result.output_files}, required)
         self.assertGreaterEqual(summary["canonical_properties"], 2)

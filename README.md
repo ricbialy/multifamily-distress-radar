@@ -19,7 +19,7 @@ published v0.14 baseline.
 
 ## Acquisition-intelligence fixture demo
 
-## REAL-PILOT-02 qualified acquisition workflow
+## REAL-PILOT-02 corrective acquisition-review workflow
 
 Run the genuine Matrix export through row validation, county identity
 verification, live Hialeah public-record enrichment, persisted hard gates, and
@@ -51,6 +51,27 @@ PYTHONPATH=src .venv/bin/python -m distress_radar pilot-verify \
 
 Neither command modifies the supplied Matrix file. The verification command
 creates a separate controlled-change copy under its output directory.
+
+The reports keep acquisition attractiveness and municipal-review urgency as
+separate rankings. `qualified_queue.json` remains as a compatibility alias for
+`acquisition_queue.json`; MLS examples are written separately and are never
+forced into either numerical top ten. Source-health warnings and opportunity
+changes are also emitted separately.
+
+Record an analyst disposition against the latest reviewed material-content
+hash with:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m distress_radar pilot-disposition \
+  --db /absolute/path/to/pilot.sqlite \
+  --property-id property-identifier \
+  --disposition dismiss \
+  --notes "Reviewed by analyst"
+```
+
+Dismissals reopen when material source evidence changes. Contact approval is
+also hash-bound and cannot bypass identity, scope, municipal-risk, or
+underwriting hard gates.
 
 ```bash
 python3 -m venv .venv

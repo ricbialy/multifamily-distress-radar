@@ -8,14 +8,18 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from distress_radar.collectors import ArcGisPropertyCollector, MiamiDadeClerkCollector, TylerEnerGovCollector
-from distress_radar.config import CityConfig, load_city_config
-from distress_radar.storage import RadarStore
-from distress_radar.pipeline import run_refresh
-from distress_radar.tax_import import import_tax_csv
 from distress_radar.alerts import deliver_webhook
+from distress_radar.collectors import (
+    ArcGisPropertyCollector,
+    MiamiDadeClerkCollector,
+    TylerEnerGovCollector,
+)
+from distress_radar.config import CityConfig, load_city_config
 from distress_radar.contact_import import import_contacts_csv
 from distress_radar.orchestration.refresh import run_fixture_demo
+from distress_radar.pipeline import run_refresh
+from distress_radar.storage import RadarStore
+from distress_radar.tax_import import import_tax_csv
 
 
 def _collector(config: CityConfig) -> TylerEnerGovCollector:
@@ -166,6 +170,25 @@ def build_parser() -> argparse.ArgumentParser:
     pilot_verify.add_argument("--db", type=Path, required=True)
     pilot_verify.add_argument("--output-dir", type=Path, required=True)
     pilot_verify.add_argument("--municipality", default="hialeah")
+    pilot_disposition = subparsers.add_parser(
+        "pilot-disposition",
+        help="Record an analyst disposition against the latest reviewed content hash",
+    )
+    pilot_disposition.add_argument("--db", type=Path, required=True)
+    pilot_disposition.add_argument("--property-id", required=True)
+    pilot_disposition.add_argument(
+        "--disposition",
+        required=True,
+        choices=(
+            "investigate",
+            "request_documents",
+            "watch",
+            "dismiss",
+            "legal_municipal_review",
+            "approved_for_contact",
+        ),
+    )
+    pilot_disposition.add_argument("--notes")
     return parser
 
 
@@ -176,6 +199,45 @@ def main(argv: list[str] | None = None) -> None:
         format="%(levelname)s %(name)s: %(message)s",
     )
     try:
+        if args.command == "pilot-disposition":
+            from distress_radar.intelligence_store import IntelligenceStore
+            from distress_radar.pilot import _migrate_pilot
+
+            with IntelligenceStore(args.db) as store:
+                _migrate_pilot(store)
+                row = store.connection.execute(
+                    """
+                    SELECT content_hash FROM recommendations
+                    WHERE property_id=? AND content_hash IS NOT NULL
+                    ORDER BY generated_at DESC,recommendation_id DESC LIMIT 1
+                    """,
+                    (args.property_id,),
+                ).fetchone()
+                if row is None:
+                    raise ValueError(
+                        f"No recommendation exists for property {args.property_id}"
+                    )
+                baseline_content_hash = str(row["content_hash"])
+                disposition_id = store.record_disposition(
+                    args.property_id,
+                    args.disposition,
+                    datetime.now(timezone.utc).isoformat(),
+                    notes=args.notes,
+                    baseline_content_hash=baseline_content_hash,
+                )
+            print(
+                json.dumps(
+                    {
+                        "disposition_id": disposition_id,
+                        "property_id": args.property_id,
+                        "disposition": args.disposition,
+                        "baseline_content_hash": baseline_content_hash,
+                    },
+                    indent=2,
+                )
+            )
+            return
+
         if args.command == "pilot-verify":
             from distress_radar.pilot_verification import verify_real_pilot
 
@@ -199,6 +261,7 @@ def main(argv: list[str] | None = None) -> None:
                         ],
                         "first_run_counts": result.first_run_counts,
                         "second_run_counts": result.second_run_counts,
+                        "next_day_run_counts": result.next_day_run_counts,
                         "controlled_change": result.controlled_change,
                         "source_statuses": result.source_statuses,
                         "output_path": str(result.output_path),

@@ -6,6 +6,7 @@ from typing import Any
 from distress_radar.domain.evidence import EvidenceItem
 from distress_radar.domain.signals import PropertySignal
 from distress_radar.municipal_severity import MunicipalSeverity
+from distress_radar.tax_import import is_unpaid_status
 
 
 @dataclass(frozen=True)
@@ -118,6 +119,30 @@ def _number(value: Any) -> float | None:
     return float(value) if isinstance(value, (int, float)) else None
 
 
+def acquisition_attractiveness(scores: ScoreDimensions) -> float:
+    """Evidence-backed acquisition potential; municipal risk is never a benefit."""
+    return round(
+        0.35 * scores.economics
+        + 0.25 * scores.market_pressure
+        + 0.25 * scores.owner_motivation
+        + 0.10 * scores.data_confidence
+        + 0.05 * scores.data_completeness,
+        2,
+    )
+
+
+def municipal_review_urgency(
+    municipal: tuple[MunicipalSeverity, ...],
+) -> float:
+    return round(
+        max(
+            (item.score for item in municipal if item.currently_active),
+            default=0.0,
+        ),
+        2,
+    )
+
+
 def calculate_evidence_scores(
     *,
     county: dict[str, Any],
@@ -139,17 +164,17 @@ def calculate_evidence_scores(
 
     motivation = 0.0
     if county.get("absentee_owner") is True:
-        motivation += 10
-        components["owner_motivation"].append("Absentee owner: +10")
+        components["owner_motivation"].append(
+            "Absentee ownership is screening context, not confirmed motivation: +0"
+        )
     ownership_years = _number(county.get("ownership_duration_years"))
     if ownership_years is not None and ownership_years >= 15:
-        motivation += 10
         components["owner_motivation"].append(
-            f"Ownership duration {ownership_years:.1f} years: +10"
+            f"Ownership duration {ownership_years:.1f} years is screening context, not confirmed motivation: +0"
         )
     lien_count = sum(
         str(item.get("signal_type") or "").casefold()
-        in {"recorded_liens", "lis_pendens", "foreclosure"}
+        in {"lien", "recorded_liens", "lis_pendens", "foreclosure"}
         for item in official_records
     )
     if lien_count:
@@ -162,7 +187,7 @@ def calculate_evidence_scores(
         item
         for item in tax_records
         if _number(item.get("amount_due")) not in (None, 0)
-        and str(item.get("status") or "").casefold() not in {"paid", "satisfied"}
+        and is_unpaid_status(item.get("status"))
     ]
     if unpaid_taxes:
         motivation += 30
@@ -174,32 +199,52 @@ def calculate_evidence_scores(
     economics = 0.0
     price = _number(listing.get("list_price"))
     units = _number(county.get("verified_units"))
-    assessed = _number(county.get("assessed_value"))
+    price_per_unit: float | None = None
     if price is not None and units not in (None, 0):
         price_per_unit = round(price / units, 2)
         metrics["price_per_unit"] = price_per_unit
-        points = 20 if price_per_unit <= 100_000 else 10 if price_per_unit <= 150_000 else 5
+        points = (
+            20
+            if price_per_unit <= 100_000
+            else 10
+            if price_per_unit <= 150_000
+            else 5
+            if price_per_unit <= 200_000
+            else 0
+        )
         economics += points
         components["economics"].append(
             f"Asking price per verified unit ${price_per_unit:,.0f}: +{points}"
         )
-    if price is not None and assessed not in (None, 0):
-        ratio = round(price / assessed, 3)
-        metrics["asking_to_assessed_ratio"] = ratio
-        points = 20 if ratio <= 1.25 else 10 if ratio <= 1.75 else 5
-        economics += points
-        components["economics"].append(
-            f"Asking/assessed-value ratio {ratio:.2f}: +{points}"
-        )
     noi = _number(listing.get("noi"))
-    if price not in (None, 0) and noi is not None and noi > 0:
+    expenses = _number(listing.get("expenses"))
+    cap_rate_supported = False
+    if (
+        price not in (None, 0)
+        and noi is not None
+        and noi > 0
+        and expenses is not None
+        and expenses >= 0
+    ):
+        cap_rate_supported = True
         cap_rate = round(noi / price, 4)
         metrics["reported_noi_cap_rate"] = cap_rate
-        points = 30 if cap_rate >= 0.06 else 20 if cap_rate >= 0.045 else 10
+        points = 30 if cap_rate >= 0.06 else 20 if cap_rate >= 0.045 else 0
         economics += points
         components["economics"].append(
             f"Reported NOI/asking-price rate {cap_rate:.2%}: +{points}"
         )
+    if price_per_unit is None:
+        metrics["economics_status"] = "unknown"
+        components["economics"].append(
+            "Economics unknown: asking price and verified unit count are not both supported."
+        )
+    elif economics == 0:
+        metrics["economics_status"] = "demonstrably_bad"
+    else:
+        metrics["economics_status"] = "supported"
+    if not cap_rate_supported:
+        metrics["cap_rate_status"] = "unknown"
 
     pressure = 0.0
     dom = _number(listing.get("dom"))
@@ -210,12 +255,12 @@ def calculate_evidence_scores(
     if cdom is not None and cdom >= 120:
         pressure += 10
         components["market_pressure"].append(f"CDOM {cdom:.0f}: +10")
-    price_changes = int(listing.get("price_change_count") or 0)
-    if price_changes:
-        points = min(20, price_changes * 10)
+    price_reductions = int(listing.get("price_reduction_count") or 0)
+    if price_reductions:
+        points = min(20, price_reductions * 10)
         pressure += points
         components["market_pressure"].append(
-            f"{price_changes} price change(s): +{points}"
+            f"{price_reductions} supported price reduction(s): +{points}"
         )
     remarks = str(listing.get("remarks") or "").casefold()
     if any(
@@ -233,10 +278,13 @@ def calculate_evidence_scores(
             f"Non-active listing status {listing.get('status')}: +10"
         )
 
-    risk = max((item.score for item in municipal), default=0.0)
+    risk = municipal_review_urgency(municipal)
     for item in sorted(municipal, key=lambda value: value.score, reverse=True):
+        if not item.currently_active:
+            continue
         components["property_risk"].append(
-            f"{item.case_type}: {item.category} ({item.score:.0f}/100)"
+            f"{item.case_type}: {item.substantive_hazard}; "
+            f"stage={item.enforcement_stage}; urgency={item.score:.0f}/100"
         )
 
     known_county = sum(
@@ -288,7 +336,7 @@ def calculate_evidence_scores(
     return EvidenceScoreResult(
         dimensions=ScoreDimensions(
             owner_motivation=min(100, motivation),
-            economics=min(100, economics),
+            economics=max(0, min(100, economics)),
             market_pressure=min(100, pressure),
             property_risk=min(100, risk),
             data_confidence=confidence,

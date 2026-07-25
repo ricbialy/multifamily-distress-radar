@@ -7,7 +7,6 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
-from distress_radar.domain.property import CanonicalProperty
 from distress_radar.intelligence_store import IntelligenceStore
 from distress_radar.models import (
     CodeCase,
@@ -22,8 +21,10 @@ from distress_radar.municipal_severity import (
 )
 from distress_radar.pilot import (
     _active_clerk_records,
+    _acquisition_rank_reason,
     _apply_disposition_action,
     _material_content_hash,
+    _municipal_rank_reason,
     run_pilot,
 )
 from distress_radar.recommendations.features import (
@@ -31,7 +32,6 @@ from distress_radar.recommendations.features import (
     calculate_evidence_scores,
     municipal_review_urgency,
 )
-
 
 GENERATED_AT = "2026-07-24T12:00:00+00:00"
 
@@ -411,6 +411,70 @@ class EvidenceScoringTests(unittest.TestCase):
             acquisition_attractiveness(risky.dimensions),
         )
 
+    def test_rank_explanations_name_the_component_that_caused_ordering(self) -> None:
+        acquisition = {
+            "scores": {
+                "economics": 20,
+                "market_pressure": 0,
+                "owner_motivation": 0,
+                "data_confidence": 0,
+                "data_completeness": 0,
+            }
+        }
+        next_acquisition = {
+            "scores": {
+                "economics": 10,
+                "market_pressure": 0,
+                "owner_motivation": 0,
+                "data_confidence": 0,
+                "data_completeness": 0,
+            }
+        }
+        self.assertIn(
+            "economics",
+            _acquisition_rank_reason(acquisition, next_acquisition),
+        )
+        self.assertIn(
+            "stable canonical",
+            _acquisition_rank_reason(acquisition, acquisition),
+        )
+        self.assertIn("Final item", _acquisition_rank_reason(acquisition, None))
+
+        def municipal(
+            urgency: float, hazard: str, age_days: int
+        ) -> dict[str, object]:
+            return {
+                "municipal_review_urgency_score": urgency,
+                "municipal_cases": [
+                    {"substantive_hazard": hazard, "age_days": age_days}
+                ],
+            }
+
+        high = municipal(90, "minimum_housing", 20)
+        low = municipal(80, "unsafe_life_safety", 100)
+        self.assertIn("urgency", _municipal_rank_reason(high, low))
+        self.assertIn(
+            "substantive-hazard",
+            _municipal_rank_reason(
+                municipal(90, "unsafe_life_safety", 20),
+                municipal(90, "cosmetic", 100),
+            ),
+        )
+        self.assertIn(
+            "active-case age",
+            _municipal_rank_reason(
+                municipal(90, "permit", 100),
+                municipal(90, "permit", 20),
+            ),
+        )
+        self.assertIn(
+            "stable canonical",
+            _municipal_rank_reason(
+                municipal(90, "permit", 20),
+                municipal(90, "permit", 20),
+            ),
+        )
+
 
 class DispositionTests(unittest.TestCase):
     def test_dismissal_is_durable_until_material_evidence_changes(self) -> None:
@@ -659,7 +723,7 @@ class QualifiedQueueIntegrationTests(unittest.TestCase):
             matrix = root / "Agent Single Line - COM.csv"
             matrix.write_text(csv_text, encoding="utf-8")
             database = root / "pilot.sqlite"
-            first = run_pilot(
+            run_pilot(
                 matrix_path=matrix,
                 database_path=database,
                 output_dir=root / "first",
@@ -757,6 +821,131 @@ class QualifiedQueueIntegrationTests(unittest.TestCase):
             self.assertEqual(dict(signal), {"status": "active", "confirmation_status": "last_known"})
             self.assertEqual(json.loads(current["explanation_json"])["municipal_cases"], [])
             self.assertEqual(alerts, 0)
+
+    def test_inventory_failure_cannot_resolve_code_intersection(self) -> None:
+        class FailedInventoryCollector(TargetedPropertyCollector):
+            def collect(self) -> PropertyCollectionResult:
+                raise RuntimeError("inventory unavailable")
+
+        csv_text = (
+            "MLS Number,Address,Status,List Price,DOM,CDOM,Units,Remarks\n"
+            "A123,100 Test Ave,A,2400000,90,120,12,Price reduced\n"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            matrix = root / "Agent Single Line - COM.csv"
+            matrix.write_text(csv_text, encoding="utf-8")
+            database = root / "pilot.sqlite"
+            run_pilot(
+                matrix_path=matrix,
+                database_path=database,
+                output_dir=root / "first",
+                municipality="hialeah",
+                generated_at=GENERATED_AT,
+                property_collector=TargetedPropertyCollector(),
+                code_collector=TargetedCodeCollector(),
+            )
+            second = run_pilot(
+                matrix_path=matrix,
+                database_path=database,
+                output_dir=root / "failed",
+                municipality="hialeah",
+                generated_at="2026-07-25T12:00:00+00:00",
+                property_collector=FailedInventoryCollector(),
+                code_collector=TargetedCodeCollector(),
+            )
+            with sqlite3.connect(database) as connection:
+                signal = connection.execute(
+                    """
+                    SELECT status,confirmation_status FROM property_signals
+                    WHERE signal_type='off_market_live_code_case'
+                    """
+                ).fetchone()
+                resolutions = connection.execute(
+                    """
+                    SELECT COUNT(*) FROM signal_observations
+                    WHERE pilot_run_id=? AND status='resolved'
+                    """,
+                    (second.run_id,),
+                ).fetchone()[0]
+        self.assertEqual(signal, ("active", "last_known"))
+        self.assertEqual(resolutions, 0)
+
+    def test_failure_after_resolution_does_not_resurrect_old_material_content(self) -> None:
+        class EmptyCodeCollector(TargetedCodeCollector):
+            def collect(
+                self, statuses: tuple[str, ...], **kwargs: object
+            ) -> CollectionResult:
+                return CollectionResult((), (), statuses)
+
+        class FailedCodeCollector(TargetedCodeCollector):
+            def collect(
+                self, statuses: tuple[str, ...], **kwargs: object
+            ) -> CollectionResult:
+                raise RuntimeError("source unavailable")
+
+        csv_text = (
+            "MLS Number,Address,Status,List Price,DOM,CDOM,Units,Remarks\n"
+            "A123,100 Test Ave,A,2400000,90,120,12,Price reduced\n"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            matrix = root / "Agent Single Line - COM.csv"
+            matrix.write_text(csv_text, encoding="utf-8")
+            database = root / "pilot.sqlite"
+            run_pilot(
+                matrix_path=matrix,
+                database_path=database,
+                output_dir=root / "first",
+                municipality="hialeah",
+                generated_at=GENERATED_AT,
+                property_collector=TargetedPropertyCollector(),
+                code_collector=TargetedCodeCollector(),
+            )
+            resolved = run_pilot(
+                matrix_path=matrix,
+                database_path=database,
+                output_dir=root / "resolved",
+                municipality="hialeah",
+                generated_at="2026-07-25T12:00:00+00:00",
+                property_collector=TargetedPropertyCollector(),
+                code_collector=EmptyCodeCollector(),
+            )
+            failed = run_pilot(
+                matrix_path=matrix,
+                database_path=database,
+                output_dir=root / "failed",
+                municipality="hialeah",
+                generated_at="2026-07-26T12:00:00+00:00",
+                property_collector=TargetedPropertyCollector(),
+                code_collector=FailedCodeCollector(),
+            )
+            with sqlite3.connect(database) as connection:
+                property_id = connection.execute(
+                    """
+                    SELECT property_id FROM canonical_properties
+                    WHERE folio='0400000000002'
+                    """
+                ).fetchone()[0]
+                hashes = [
+                    row[0]
+                    for row in connection.execute(
+                        """
+                        SELECT content_hash FROM recommendations
+                        WHERE property_id=? AND pilot_run_id IN (?,?)
+                        ORDER BY generated_at
+                        """,
+                        (property_id, resolved.run_id, failed.run_id),
+                    ).fetchall()
+                ]
+                failed_alerts = connection.execute(
+                    """
+                    SELECT COUNT(*) FROM opportunity_alerts WHERE pilot_run_id=?
+                    """,
+                    (failed.run_id,),
+                ).fetchone()[0]
+        self.assertEqual(len(set(hashes)), 1)
+        self.assertEqual(failed_alerts, 0)
 
     def test_healthy_disappearance_resolves_once_and_removes_current_case(self) -> None:
         class EmptyCodeCollector(TargetedCodeCollector):

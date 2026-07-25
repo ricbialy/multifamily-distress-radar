@@ -1,19 +1,57 @@
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import unittest
-import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from distress_radar.pilot_verification import (
     _active_intersection_count,
     _controlled_change_is_isolated,
     _controlled_copy,
     _evidence_value_supports_action,
+    _run_tests,
+    verify_real_pilot,
 )
 
 
 class PilotVerificationTests(unittest.TestCase):
+    def test_verification_harness_runs_tests_and_compile_check(self) -> None:
+        test_process = SimpleNamespace(
+            returncode=0,
+            stdout="Ran 124 tests in 1.0s\n\nOK",
+            stderr="",
+        )
+        compile_process = SimpleNamespace(
+            returncode=0,
+            stdout="",
+            stderr="",
+        )
+        with patch(
+            "distress_radar.pilot_verification.subprocess.run",
+            side_effect=(test_process, compile_process),
+        ) as run:
+            passed, count, output = _run_tests(Path("/repository"))
+        self.assertTrue(passed)
+        self.assertEqual(count, 124)
+        self.assertIn("OK", output)
+        self.assertEqual(run.call_count, 2)
+
+    def test_verification_harness_refuses_to_overwrite_acceptance_database(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            database = root / "existing.sqlite"
+            database.touch()
+            with self.assertRaisesRegex(ValueError, "must not already exist"):
+                verify_real_pilot(
+                    matrix_path=root / "matrix.csv",
+                    database_path=database,
+                    output_dir=root / "outputs",
+                    municipality="hialeah",
+                )
+
     def test_controlled_copy_returns_the_exact_mutated_mls_identity(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

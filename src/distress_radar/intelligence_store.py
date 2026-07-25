@@ -518,6 +518,12 @@ class IntelligenceStore:
     def effective_disposition(
         self, property_id: str, current_content_hash: str
     ) -> str | None:
+        row = self.active_disposition(property_id)
+        if row is None or row["baseline_content_hash"] != current_content_hash:
+            return None
+        return str(row["disposition"])
+
+    def active_disposition(self, property_id: str) -> sqlite3.Row | None:
         row = self.connection.execute(
             """
             SELECT disposition,baseline_content_hash
@@ -527,14 +533,7 @@ class IntelligenceStore:
             """,
             (property_id,),
         ).fetchone()
-        if row is None:
-            return None
-        if (
-            row["disposition"] == "dismiss"
-            and row["baseline_content_hash"] != current_content_hash
-        ):
-            return None
-        return str(row["disposition"])
+        return row
 
     def record_outcome(
         self,

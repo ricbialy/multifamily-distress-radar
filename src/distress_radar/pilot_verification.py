@@ -4,16 +4,17 @@ import csv
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
 from dataclasses import asdict, dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from distress_radar.pilot import PilotRunResult, run_pilot
+from distress_radar.pilot import run_pilot
 from distress_radar.sources.mls.matrix_csv import MatrixCsvImporter
-
 
 EXPECTED_MATRIX_FILENAME = "Agent Single Line - COM.csv"
 EXPECTED_MATRIX_SHA256 = (
@@ -42,6 +43,7 @@ class VerificationResult:
     gates: tuple[GateResult, ...]
     first_run_counts: dict[str, int]
     second_run_counts: dict[str, int]
+    next_day_run_counts: dict[str, int]
     controlled_change: dict[str, Any]
     source_statuses: dict[str, str]
     output_path: Path
@@ -49,6 +51,74 @@ class VerificationResult:
 
 def _count(connection: sqlite3.Connection, sql: str, parameters: tuple[Any, ...] = ()) -> int:
     return int(connection.execute(sql, parameters).fetchone()[0])
+
+
+def _active_intersection_count(
+    connection: sqlite3.Connection, pilot_run_id: str
+) -> int:
+    return _count(
+        connection,
+        """
+        SELECT COUNT(DISTINCT property_id) FROM property_signals
+        WHERE signal_type='off_market_live_code_case'
+          AND status='active'
+          AND confirmation_status='confirmed'
+          AND pilot_run_id=?
+        """,
+        (pilot_run_id,),
+    )
+
+
+def _evidence_value_supports_action(
+    action: str, field_name: str, value: Any
+) -> bool:
+    if action == "human_municipal_review":
+        return (
+            isinstance(value, dict)
+            and field_name == "municipal_code_case"
+            and bool(value.get("currently_active"))
+            and bool(value.get("case_number"))
+            and bool(value.get("enforcement_stage"))
+            and bool(value.get("substantive_hazard"))
+        )
+    if action == "investigate_owner":
+        if not isinstance(value, dict):
+            return False
+        if field_name == "official_record":
+            return str(value.get("signal_type") or "") in {
+                "lien",
+                "recorded_liens",
+                "lis_pendens",
+            }
+        if field_name == "tax_delinquency":
+            from distress_radar.tax_import import is_unpaid_status
+
+            return (
+                float(value.get("amount_due") or 0) > 0
+                and is_unpaid_status(value.get("status"))
+            )
+    if action == "verify_identity":
+        return field_name in {"validated_address", "public_property_record"} and bool(
+            value
+        )
+    if action in {"contact_broker_for_documents", "request_documents"}:
+        return field_name == "matrix_listing" or field_name.startswith("diligence:")
+    return bool(value)
+
+
+def _controlled_change_is_isolated(
+    changes: list[dict[str, Any]],
+    *,
+    target_mls: str,
+    materially_changed_property_ids: set[str],
+    target_property_id: str,
+) -> bool:
+    return (
+        len(changes) == 1
+        and changes[0].get("mls_number") == target_mls
+        and changes[0].get("change_type") == "status_change"
+        and materially_changed_property_ids == {target_property_id}
+    )
 
 
 def _controlled_copy(source: Path, destination: Path) -> tuple[str, str]:
@@ -75,7 +145,7 @@ def _controlled_copy(source: Path, destination: Path) -> tuple[str, str]:
     return f"line 2 / {target_mls} St: {before} -> {after}", target_mls
 
 
-def _run_tests(repository: Path) -> tuple[bool, str]:
+def _run_tests(repository: Path) -> tuple[bool, int, str]:
     tests = subprocess.run(
         [
             str(repository / ".venv/bin/python"),
@@ -115,7 +185,12 @@ def _run_tests(repository: Path) -> tuple[bool, str]:
             compile_check.stderr,
         )
     ).strip()
-    return tests.returncode == 0 and compile_check.returncode == 0, output
+    match = re.search(r"Ran (\d+) tests?", output)
+    return (
+        tests.returncode == 0 and compile_check.returncode == 0,
+        int(match.group(1)) if match else 0,
+        output,
+    )
 
 
 def verify_real_pilot(
@@ -128,11 +203,13 @@ def verify_real_pilot(
     if database_path.exists():
         raise ValueError("Acceptance database must not already exist")
     output_dir.mkdir(parents=True, exist_ok=True)
+    first_generated_at = datetime.now(UTC).replace(microsecond=0)
     first = run_pilot(
         matrix_path=matrix_path,
         database_path=database_path,
         output_dir=output_dir / "first",
         municipality=municipality,
+        generated_at=first_generated_at.isoformat(),
     )
     with sqlite3.connect(database_path) as connection:
         first_change_count = _count(connection, "SELECT COUNT(*) FROM listing_changes")
@@ -141,9 +218,17 @@ def verify_real_pilot(
         database_path=database_path,
         output_dir=output_dir / "second",
         municipality=municipality,
+        generated_at=(first_generated_at + timedelta(hours=1)).isoformat(),
     )
     with sqlite3.connect(database_path) as connection:
         second_change_count = _count(connection, "SELECT COUNT(*) FROM listing_changes")
+    next_day = run_pilot(
+        matrix_path=matrix_path,
+        database_path=database_path,
+        output_dir=output_dir / "next-day",
+        municipality=municipality,
+        generated_at=(first_generated_at + timedelta(days=1)).isoformat(),
+    )
 
     controlled_path = output_dir / "controlled" / matrix_path.name
     controlled_description, controlled_mls = _controlled_copy(
@@ -162,6 +247,9 @@ def verify_real_pilot(
             connection,
             "SELECT COUNT(*) FROM listing_changes WHERE change_type='status_change'",
         )
+        last_change_rowid = connection.execute(
+            "SELECT COALESCE(MAX(rowid),0) FROM listing_changes"
+        ).fetchone()[0]
         controlled_property = connection.execute(
             """
             SELECT property_id FROM listing_snapshots
@@ -195,6 +283,37 @@ def verify_real_pilot(
             """,
             (controlled_property,),
         ).fetchone()["action"]
+        controlled_changes = [
+            {
+                "mls_number": row["mls_number"],
+                "change_type": row["change_type"],
+                "before": json.loads(row["before_json"]),
+                "after": json.loads(row["after_json"]),
+            }
+            for row in connection.execute(
+                """
+                SELECT mls_number,change_type,before_json,after_json
+                FROM listing_changes WHERE rowid>? ORDER BY rowid
+                """,
+                (last_change_rowid,),
+            ).fetchall()
+        ]
+        controlled_material_changes = {
+            row["property_id"]
+            for row in connection.execute(
+                """
+                SELECT property_id FROM recommendations
+                WHERE pilot_run_id=? AND change_type='materially_changed'
+                """,
+                (controlled.run_id,),
+            ).fetchall()
+        }
+        controlled_isolated = _controlled_change_is_isolated(
+            controlled_changes,
+            target_mls=controlled_mls,
+            materially_changed_property_ids=controlled_material_changes,
+            target_property_id=controlled_property,
+        )
 
     failed_database = output_dir / "failed-source.sqlite"
     shutil.copy2(database_path, failed_database)
@@ -206,7 +325,7 @@ def verify_real_pilot(
         simulate_source_failure=True,
     )
     repository = Path(__file__).resolve().parents[2]
-    tests_passed, test_output = _run_tests(repository)
+    tests_passed, test_count, test_output = _run_tests(repository)
 
     required_outputs = {
         "run_manifest.json",
@@ -218,6 +337,11 @@ def verify_real_pilot(
         "daily_brief.md",
         "acquisition_brief.md",
         "qualified_queue.json",
+        "acquisition_queue.json",
+        "municipal_review_queue.json",
+        "mls_example.json",
+        "source_health_warnings.json",
+        "change_summary.json",
         "top_candidate_trace.json",
         "top_candidate_trace.md",
     }
@@ -282,13 +406,7 @@ def verify_real_pilot(
                 (first.run_id,),
             ).fetchall()
         }
-        off_market_count = _count(
-            connection,
-            """
-            SELECT COUNT(*) FROM property_signals
-            WHERE signal_type='off_market_live_code_case'
-            """,
-        )
+        off_market_count = _active_intersection_count(connection, next_day.run_id)
         second_alerts = _count(
             connection,
             "SELECT COUNT(*) FROM opportunity_alerts WHERE pilot_run_id=?",
@@ -301,6 +419,28 @@ def verify_real_pilot(
             WHERE pilot_run_id=? AND change_type='unchanged'
             """,
             (second.run_id,),
+        )
+        next_day_alerts = _count(
+            connection,
+            "SELECT COUNT(*) FROM opportunity_alerts WHERE pilot_run_id=?",
+            (next_day.run_id,),
+        )
+        next_day_unchanged = _count(
+            connection,
+            """
+            SELECT COUNT(*) FROM recommendations
+            WHERE pilot_run_id=? AND change_type='unchanged'
+            """,
+            (next_day.run_id,),
+        )
+        repeat_transitions = _count(
+            connection,
+            """
+            SELECT COUNT(*) FROM signal_observations
+            WHERE pilot_run_id IN (?,?)
+              AND status IN ('active','resolved')
+            """,
+            (second.run_id, next_day.run_id),
         )
         first_hashes = {
             row["property_id"]: row["content_hash"]
@@ -320,6 +460,16 @@ def verify_real_pilot(
                 WHERE pilot_run_id=?
                 """,
                 (second.run_id,),
+            ).fetchall()
+        }
+        next_day_hashes = {
+            row["property_id"]: row["content_hash"]
+            for row in connection.execute(
+                """
+                SELECT property_id,content_hash FROM recommendations
+                WHERE pilot_run_id=?
+                """,
+                (next_day.run_id,),
             ).fetchall()
         }
         latest_recommendations = connection.execute(
@@ -372,11 +522,11 @@ def verify_real_pilot(
                 ).fetchall()
             }
             action_ids = set(mappings.get("recommended_action") or ())
-            action_fields = {
-                row["field_name"]
+            action_evidence = [
+                row
                 for row in connection.execute(
                     """
-                    SELECT field_name FROM evidence_items
+                    SELECT field_name,value_json FROM evidence_items
                     WHERE property_id=? AND evidence_id IN (
                         SELECT value FROM json_each(?)
                     )
@@ -386,7 +536,7 @@ def verify_real_pilot(
                         json.dumps(sorted(action_ids)),
                     ),
                 ).fetchall()
-            }
+            ]
             if (
                 all(mappings.get(group) for group in required_groups)
                 and ids
@@ -394,7 +544,19 @@ def verify_real_pilot(
             ):
                 evidence_linked += 1
                 expected = expected_action_fields.get(recommendation["action"])
-                if expected is None or action_fields & expected:
+                value_supported = any(
+                    _evidence_value_supports_action(
+                        recommendation["action"],
+                        row["field_name"],
+                        json.loads(row["value_json"]),
+                    )
+                    for row in action_evidence
+                    if row["value_json"] is not None
+                )
+                if expected is None or (
+                    {row["field_name"] for row in action_evidence} & expected
+                    and value_supported
+                ):
                     semantic_evidence += 1
 
         queue = json.loads((output_dir / "first" / "qualified_queue.json").read_text())
@@ -473,13 +635,11 @@ def verify_real_pilot(
             "PASS"
             if off_market_count > 0
             and 0 < len(queue) <= 10
-            and queue_has_mls
-            and queue_has_off_market
             else "FAIL",
             (
-                f"{off_market_count} live off-market intersections; "
-                f"{len(queue)} ranked tasks; MLS={queue_has_mls}; "
-                f"off_market={queue_has_off_market}"
+                f"{off_market_count} distinct active, confirmed, current-run "
+                f"off-market intersections; {len(queue)} ranked tasks; "
+                f"MLS={queue_has_mls}; off_market={queue_has_off_market}"
             ),
         ),
         GateResult(
@@ -518,14 +678,21 @@ def verify_real_pilot(
             "PASS"
             if first.database_counts["canonical_properties"]
             == second.database_counts["canonical_properties"]
+            == next_day.database_counts["canonical_properties"]
             and first.database_counts["listing_snapshots"]
             == second.database_counts["listing_snapshots"]
+            == next_day.database_counts["listing_snapshots"]
             and first.database_counts["property_signals"]
             == second.database_counts["property_signals"]
+            == next_day.database_counts["property_signals"]
             and first_change_count == second_change_count
             and first_hashes == second_hashes
+            and second_hashes == next_day_hashes
             and second_alerts == 0
+            and next_day_alerts == 0
             and second_unchanged == len(second_hashes)
+            and next_day_unchanged == len(next_day_hashes)
+            and repeat_transitions == 0
             else "FAIL",
             (
                 f"properties {first.database_counts['canonical_properties']} -> "
@@ -535,19 +702,22 @@ def verify_real_pilot(
                 f"{first_change_count} -> {second_change_count}; signals "
                 f"{first.database_counts['property_signals']} -> "
                 f"{second.database_counts['property_signals']}; "
-                f"false alerts={second_alerts}; unchanged={second_unchanged}"
+                f"same-day alerts={second_alerts}; next-day alerts={next_day_alerts}; "
+                f"same-day unchanged={second_unchanged}; "
+                f"next-day unchanged={next_day_unchanged}; transitions={repeat_transitions}"
             ),
         ),
         GateResult(
             "G10",
             "PASS"
-            if status_changes_after - status_changes_before == 1
+            if controlled_isolated
+            and status_changes_after - status_changes_before == 1
             and action_before != action_after
             else "FAIL",
             (
                 f"{controlled_description}; detected "
                 f"{status_changes_after - status_changes_before} status change; "
-                f"action {action_before} -> {action_after}"
+                f"isolated={controlled_isolated}; action {action_before} -> {action_after}"
             ),
         ),
         GateResult(
@@ -572,6 +742,11 @@ def verify_real_pilot(
             "run_id": second.run_id,
             "counts": second.database_counts,
         },
+        "next_day_run": {
+            "run_id": next_day.run_id,
+            "counts": next_day.database_counts,
+        },
+        "test_count": test_count,
         "controlled_run_id": controlled.run_id,
         "controlled_baseline_run_id": controlled_baseline.run_id,
         "failed_source_run_id": failed.run_id,
@@ -588,6 +763,7 @@ def verify_real_pilot(
         gates=gates,
         first_run_counts=first.database_counts,
         second_run_counts=second.database_counts,
+        next_day_run_counts=next_day.database_counts,
         controlled_change=payload["controlled_change"],
         source_statuses=live_sources,
         output_path=output_path,
