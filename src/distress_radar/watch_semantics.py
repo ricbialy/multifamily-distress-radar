@@ -39,6 +39,53 @@ SIGNAL_EVIDENCE_CLASSES = {
     "foreclosure": {"official_record"},
     "tax_delinquency": {"tax_delinquency"},
 }
+SIGNAL_SOURCES = {
+    "off_market_live_code_case": {"hialeah_tyler_energov"},
+    "recorded_liens": {"miami_dade_clerk_official_records"},
+    "lis_pendens": {"miami_dade_clerk_official_records"},
+    "foreclosure": {"miami_dade_clerk_official_records"},
+    "tax_delinquency": {"authorized_tax_csv"},
+}
+EVIDENCE_CLASS_SOURCES = {
+    "matrix_listing": {"matrix_csv"},
+    "validated_address": {"miami_dade_property_point_view"},
+    "public_property_record": {"miami_dade_property_point_view"},
+    "municipal_code_case": {"hialeah_tyler_energov"},
+    "official_record": {"miami_dade_clerk_official_records"},
+    "tax_delinquency": {"authorized_tax_csv"},
+}
+TRIGGER_EVENT_FIELDS = {
+    "new_record": {
+        "event_type",
+        "source_name",
+        "signal_type",
+    },
+    "material_evidence_change": {
+        "event_type",
+        "source_name",
+        "evidence_class",
+    },
+    "source_recovery": {
+        "event_type",
+        "source_name",
+        "evidence_class",
+        "previous_source_health_state",
+        "recovery_state",
+        "successful_recovery",
+        "reevaluate_evidence_ids",
+        "last_known_context",
+    },
+    "listing_price_reduction": {
+        "event_type",
+        "source_name",
+        "evidence_class",
+    },
+    "municipal_status_change": {
+        "event_type",
+        "source_name",
+        "evidence_class",
+    },
+}
 _GENERIC_TEXT = {
     "watch",
     "monitor",
@@ -92,6 +139,27 @@ class WatchSpecification:
         operator = str(self.recheck_condition.get("operator") or "")
         if not field or operator not in _OPERATORS:
             raise ValueError("watch recheck_condition is not machine-evaluable")
+        allowed_condition_fields = (
+            {"field", "operator", "value"}
+            if self.trigger_type in {"scheduled_recheck", "source_recovery"}
+            else {"field", "operator"}
+        )
+        unsupported_condition_fields = sorted(
+            set(self.recheck_condition) - allowed_condition_fields
+        )
+        if unsupported_condition_fields:
+            raise ValueError(
+                f"{self.trigger_type} does not permit condition fields: "
+                + ", ".join(unsupported_condition_fields)
+            )
+        missing_condition_fields = sorted(
+            {"field", "operator"} - set(self.recheck_condition)
+        )
+        if missing_condition_fields:
+            raise ValueError(
+                f"{self.trigger_type} requires condition fields: "
+                + ", ".join(missing_condition_fields)
+            )
 
         created = _timestamp(created_at, field="created_at")
         if self.trigger_type == "scheduled_recheck":
@@ -115,6 +183,20 @@ class WatchSpecification:
         event = self.evidence_event_trigger
         if not isinstance(event, dict):
             raise ValueError("event-driven watch requires structured evidence_event_trigger")
+        allowed_fields = TRIGGER_EVENT_FIELDS[self.trigger_type]
+        supplied_fields = set(event)
+        unsupported_fields = sorted(supplied_fields - allowed_fields)
+        if unsupported_fields:
+            raise ValueError(
+                f"{self.trigger_type} does not permit semantic fields: "
+                + ", ".join(unsupported_fields)
+            )
+        missing_fields = sorted(allowed_fields - supplied_fields)
+        if missing_fields:
+            raise ValueError(
+                f"{self.trigger_type} requires semantic fields: "
+                + ", ".join(missing_fields)
+            )
         source_name = str(event.get("source_name") or "").strip()
         if not source_name:
             raise ValueError("event-driven watch must name an exact source")
@@ -122,6 +204,12 @@ class WatchSpecification:
             raise ValueError("event trigger type must match trigger_type")
         if self.recheck_at is not None:
             raise ValueError("event-driven watch cannot use recheck_at")
+        watched_class = str(event.get("evidence_class") or "")
+        if watched_class and watched_class not in KNOWN_EVIDENCE_CLASSES:
+            raise ValueError(f"unknown evidence_class: {watched_class}")
+        watched_signal = str(event.get("signal_type") or "")
+        if watched_signal and watched_signal not in SIGNAL_EVIDENCE_CLASSES:
+            raise ValueError(f"unknown signal_type: {watched_signal}")
         if self.trigger_type == "source_recovery":
             _specific(
                 str(event.get("last_known_context") or ""),
@@ -148,19 +236,6 @@ class WatchSpecification:
                 raise ValueError(
                     "source_recovery must name the exact evidence IDs to reevaluate"
                 )
-        elif not (event.get("signal_type") or event.get("evidence_class")):
-            raise ValueError(
-                "event-driven watch must name a signal_type or evidence_class"
-            )
-        if self.trigger_type in {
-            "material_evidence_change",
-            "municipal_status_change",
-            "source_recovery",
-            "listing_price_reduction",
-        } and not event.get("evidence_class"):
-            raise ValueError(f"{self.trigger_type} requires an evidence_class")
-        if self.trigger_type == "new_record" and not event.get("signal_type"):
-            raise ValueError("new_record requires a signal_type")
         required_conditions = {
             "new_record": ("record_count", "increases"),
             "material_evidence_change": ("content_hash", "changes"),
@@ -188,6 +263,28 @@ class WatchEvidenceDescriptor:
     evidence_class: str
     source_name: str
     signal_types: tuple[str, ...] = ()
+    signal_links: tuple[WatchSignalDescriptor, ...] = ()
+
+
+@dataclass(frozen=True)
+class WatchSignalDescriptor:
+    signal_id: str
+    signal_type: str
+    property_id: str
+    source_name: str
+    status: str
+    confirmation_status: str
+    pilot_run_id: str | None
+    observation_statuses: tuple[str, ...] = ()
+    observations: tuple[WatchSignalObservationDescriptor, ...] = ()
+
+
+@dataclass(frozen=True)
+class WatchSignalObservationDescriptor:
+    observation_id: str
+    pilot_run_id: str
+    status: str
+    observed_at: str
 
 
 @dataclass(frozen=True)
@@ -317,7 +414,7 @@ def validate_watch(
                 "invalid_evidence_compatibility",
                 "Supporting evidence is incompatible with the selected trigger type.",
             )
-        if specification.trigger_type == "new_record":
+        if watched_signal:
             compatible_classes = SIGNAL_EVIDENCE_CLASSES.get(watched_signal)
             if not compatible_classes:
                 return outcome(
@@ -338,6 +435,33 @@ def validate_watch(
                     "invalid_evidence_compatibility",
                     "Supporting evidence is not linked to the exact watched signal type.",
                 )
+            if watched_source not in SIGNAL_SOURCES[watched_signal]:
+                return outcome(
+                    "invalid_evidence_compatibility",
+                    "Watched source is incompatible with the watched signal type.",
+                )
+            if any(
+                not any(
+                    link.signal_type == watched_signal
+                    and link.property_id == property_id
+                    and link.source_name == watched_source
+                    for link in item.signal_links
+                )
+                for item in evidence
+            ):
+                return outcome(
+                    "invalid_evidence_compatibility",
+                    "Supporting evidence lacks the exact immutable signal relationship.",
+                )
+        if any(
+            item.source_name
+            not in EVIDENCE_CLASS_SOURCES.get(item.evidence_class, set())
+            for item in evidence
+        ):
+            return outcome(
+                "invalid_evidence_compatibility",
+                "Supporting evidence source is incompatible with its evidence class.",
+            )
 
     if specification.trigger_type == "source_recovery":
         declared_previous = str(event["previous_source_health_state"])

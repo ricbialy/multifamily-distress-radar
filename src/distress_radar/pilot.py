@@ -562,6 +562,28 @@ def _evaluate_watch(
             "evidence_class": item.evidence_class,
             "source_name": item.source_name,
             "signal_types": item.signal_types,
+            "signal_links": [
+                {
+                    "signal_id": link.signal_id,
+                    "signal_type": link.signal_type,
+                    "property_id": link.property_id,
+                    "source_name": link.source_name,
+                    "status": link.status,
+                    "confirmation_status": link.confirmation_status,
+                    "pilot_run_id": link.pilot_run_id,
+                    "observation_statuses": link.observation_statuses,
+                    "observations": [
+                        {
+                            "observation_id": observation.observation_id,
+                            "pilot_run_id": observation.pilot_run_id,
+                            "status": observation.status,
+                            "observed_at": observation.observed_at,
+                        }
+                        for observation in link.observations
+                    ],
+                }
+                for link in item.signal_links
+            ],
         }
         for item in outcome.evidence
     ]

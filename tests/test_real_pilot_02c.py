@@ -515,6 +515,573 @@ class RealPilot02cAcceptanceTests(unittest.TestCase):
                     1,
                 )
 
+    def test_r12_resolved_immutable_signal_link_invalidates_watch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            database = root / "resolved-signal.sqlite"
+            _matrix(root / "matrix.csv", noi="", expenses="")
+            first_case = replace(case(), fetched_at=GENERATED_AT)
+            first = _run(
+                root,
+                database,
+                "first",
+                GENERATED_AT,
+                criteria=CRITERIA,
+                code_collector=VariableCodeCollector((first_case,)),
+            )
+            with IntelligenceStore(database) as store:
+                row = store.connection.execute(
+                    """
+                    SELECT r.property_id,r.content_hash,e.evidence_id,s.signal_id
+                    FROM recommendations r
+                    JOIN evidence_items e ON e.property_id=r.property_id
+                    JOIN signal_evidence_links l ON l.evidence_id=e.evidence_id
+                    JOIN property_signals s ON s.signal_id=l.signal_id
+                    WHERE r.pilot_run_id=? AND e.field_name='municipal_code_case'
+                      AND s.signal_type='off_market_live_code_case'
+                    ORDER BY e.evidence_id LIMIT 1
+                    """,
+                    (first.run_id,),
+                ).fetchone()
+                property_id = str(row["property_id"])
+                evidence_id = str(row["evidence_id"])
+                signal_id = str(row["signal_id"])
+                disposition_id = store.record_disposition(
+                    property_id,
+                    "watch",
+                    GENERATED_AT,
+                    baseline_content_hash=str(row["content_hash"]),
+                    watch_specification=WatchSpecification(
+                        watch_reason=(
+                            "Reconsider when a new municipal record is persisted"
+                        ),
+                        evidence_ids=(evidence_id,),
+                        trigger_type="new_record",
+                        recheck_condition={
+                            "field": "record_count",
+                            "operator": "increases",
+                        },
+                        evidence_event_trigger={
+                            "event_type": "new_record",
+                            "source_name": "hialeah_tyler_energov",
+                            "signal_type": "off_market_live_code_case",
+                        },
+                        expected_next_action="human_municipal_review",
+                        creator="analyst:test-suite",
+                    ),
+                )
+                original = dict(store.active_disposition(property_id))
+
+            unchanged_at = "2026-07-24T16:00:00+00:00"
+            _run(
+                root,
+                database,
+                "unchanged",
+                unchanged_at,
+                criteria=CRITERIA,
+                code_collector=VariableCodeCollector(
+                    (replace(first_case, fetched_at=unchanged_at),)
+                ),
+            )
+            unchanged_record = next(
+                item
+                for item in json.loads(
+                    (root / "unchanged/recommendations.json").read_text()
+                )
+                if item["property_id"] == property_id
+            )
+            self.assertEqual(unchanged_record["recommended_action"], "watch")
+            self.assertEqual(
+                unchanged_record["watch_semantics"]["validation_status"], "valid"
+            )
+            failed = _run(
+                root,
+                database,
+                "failed",
+                "2026-07-24T16:15:00+00:00",
+                criteria=CRITERIA,
+                code_collector=FailedCodeCollector(),
+            )
+            failed_record = next(
+                item
+                for item in json.loads(
+                    (root / "failed/recommendations.json").read_text()
+                )
+                if item["property_id"] == property_id
+            )
+            self.assertEqual(failed_record["recommended_action"], "manual_triage")
+            self.assertEqual(
+                failed_record["watch_semantics"]["validation_status"],
+                "invalid_source_unavailable",
+            )
+            self.assertEqual(
+                failed_record["watch_semantics"]["evidence_states"][evidence_id],
+                "last_known",
+            )
+            with sqlite3.connect(database) as connection:
+                self.assertEqual(
+                    connection.execute(
+                        """
+                        SELECT COUNT(*) FROM opportunity_alerts
+                        WHERE pilot_run_id=?
+                        """,
+                        (failed.run_id,),
+                    ).fetchone()[0],
+                    0,
+                )
+            recovered_at = "2026-07-24T16:30:00+00:00"
+            recovered = _run(
+                root,
+                database,
+                "recovered",
+                recovered_at,
+                criteria=CRITERIA,
+                code_collector=VariableCodeCollector(
+                    (replace(first_case, fetched_at=recovered_at),)
+                ),
+            )
+            recovered_record = next(
+                item
+                for item in json.loads(
+                    (root / "recovered/recommendations.json").read_text()
+                )
+                if item["property_id"] == property_id
+            )
+            self.assertEqual(recovered_record["recommended_action"], "watch")
+            self.assertEqual(
+                recovered_record["watch_semantics"]["validation_status"], "valid"
+            )
+            with IntelligenceStore(database) as store:
+                signal = store.connection.execute(
+                    """
+                    SELECT evidence_ids_json FROM property_signals
+                    WHERE signal_id=?
+                    """,
+                    (signal_id,),
+                ).fetchone()
+                self.assertNotIn(
+                    evidence_id, json.loads(signal["evidence_ids_json"])
+                )
+                self.assertEqual(
+                    store.connection.execute(
+                        """
+                        SELECT COUNT(*) FROM signal_evidence_links
+                        WHERE signal_id=? AND evidence_id=?
+                        """,
+                        (signal_id, evidence_id),
+                    ).fetchone()[0],
+                    1,
+                )
+                store.connection.execute(
+                    """
+                    INSERT INTO property_signals (
+                        signal_id,property_id,signal_type,observed_at,value_json,
+                        evidence_ids_json,status,pilot_run_id,confirmation_status,
+                        source_name
+                    ) VALUES (
+                        'unrelated-active-signal',?,'foreclosure',?,'{}',?,
+                        'active',?,'confirmed',
+                        'miami_dade_clerk_official_records'
+                    )
+                    """,
+                    (
+                        property_id,
+                        recovered_at,
+                        json.dumps([evidence_id]),
+                        recovered.run_id,
+                    ),
+                )
+                store.connection.execute(
+                    """
+                    INSERT INTO signal_evidence_links (
+                        signal_id,evidence_id,property_id,signal_type
+                    ) VALUES (
+                        'unrelated-active-signal',?,?,'foreclosure'
+                    )
+                    """,
+                    (evidence_id, property_id),
+                )
+                store.connection.commit()
+
+            disappeared = _run(
+                root,
+                database,
+                "disappeared",
+                "2026-07-24T17:00:00+00:00",
+                criteria=CRITERIA,
+                code_collector=VariableCodeCollector(()),
+            )
+            disappeared_record = next(
+                item
+                for item in json.loads(
+                    (root / "disappeared/recommendations.json").read_text()
+                )
+                if item["property_id"] == property_id
+            )
+            watch = disappeared_record["watch_semantics"]
+            self.assertEqual(disappeared_record["recommended_action"], "manual_triage")
+            self.assertEqual(
+                watch["validation_status"], "invalid_evidence_lifecycle"
+            )
+            self.assertEqual(watch["evidence_states"][evidence_id], "resolved")
+            exact_link = next(
+                link
+                for link in watch["supporting_evidence"][0]["signal_links"]
+                if link["signal_id"] == signal_id
+            )
+            self.assertEqual(exact_link["status"], "resolved")
+            self.assertEqual(exact_link["confirmation_status"], "resolved")
+            self.assertFalse(
+                any(
+                    item["property_id"] == property_id
+                    for item in json.loads(
+                        (root / "disappeared/acquisition_queue.json").read_text()
+                    )
+                )
+            )
+            self.assertEqual(
+                [
+                    item["property_id"]
+                    for item in json.loads(
+                        (root / "disappeared/manual_triage_queue.json").read_text()
+                    )
+                ],
+                [property_id],
+            )
+            self.assertIn(
+                "invalid_evidence_lifecycle",
+                (root / "disappeared/daily_brief.md").read_text(),
+            )
+            self.assertIn(
+                "invalid_evidence_lifecycle",
+                (root / "disappeared/recommendations.csv").read_text(),
+            )
+            self.assertIn(
+                "invalid_evidence_lifecycle",
+                (root / "disappeared/manual_triage_queue.md").read_text(),
+            )
+            with IntelligenceStore(database) as store:
+                resolved = store.connection.execute(
+                    """
+                    SELECT status,confirmation_status FROM property_signals
+                    WHERE signal_id=?
+                    """,
+                    (signal_id,),
+                ).fetchone()
+                self.assertEqual(tuple(resolved), ("resolved", "resolved"))
+                self.assertEqual(
+                    dict(store.active_disposition(property_id)),
+                    original,
+                )
+                self.assertEqual(
+                    [
+                        row["validation_status"]
+                        for row in store.connection.execute(
+                            """
+                            SELECT validation_status FROM watch_validation_events
+                            WHERE disposition_id=?
+                            ORDER BY validated_at,validation_event_id
+                            """,
+                            (disposition_id,),
+                        ).fetchall()
+                    ],
+                    [
+                        "valid",
+                        "valid",
+                        "invalid_source_unavailable",
+                        "valid",
+                        "invalid_evidence_lifecycle",
+                    ],
+                )
+                self.assertEqual(
+                    store.connection.execute(
+                        """
+                        SELECT COUNT(*) FROM watch_trigger_events
+                        WHERE disposition_id=?
+                        """,
+                        (disposition_id,),
+                    ).fetchone()[0],
+                    0,
+                )
+                self.assertEqual(
+                    store.connection.execute(
+                        """
+                        SELECT validation_status FROM watch_validation_events
+                        WHERE disposition_id=? AND pilot_run_id=?
+                        """,
+                        (disposition_id, disappeared.run_id),
+                    ).fetchone()[0],
+                    "invalid_evidence_lifecycle",
+                )
+
+    def test_r12_trigger_schema_rejects_ignored_or_incompatible_signals(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            database = root / "trigger-schema.sqlite"
+            _matrix(root / "matrix.csv", noi="", expenses="")
+            first_case = replace(case(), fetched_at=GENERATED_AT)
+            first = _run(
+                root,
+                database,
+                "first",
+                GENERATED_AT,
+                criteria=CRITERIA,
+                code_collector=VariableCodeCollector((first_case,)),
+            )
+            with IntelligenceStore(database) as store:
+                row = store.connection.execute(
+                    """
+                    SELECT r.property_id,r.content_hash,e.evidence_id
+                    FROM recommendations r
+                    JOIN evidence_items e ON e.property_id=r.property_id
+                    WHERE r.pilot_run_id=? AND e.field_name='municipal_code_case'
+                    ORDER BY e.evidence_id LIMIT 1
+                    """,
+                    (first.run_id,),
+                ).fetchone()
+                property_id = str(row["property_id"])
+                evidence_id = str(row["evidence_id"])
+                common = {
+                    "watch_reason": (
+                        "Reconsider only after a supported structured event"
+                    ),
+                    "evidence_ids": (evidence_id,),
+                    "expected_next_action": "human_municipal_review",
+                    "creator": "analyst:test-suite",
+                }
+                contradictory = WatchSpecification(
+                    **common,
+                    trigger_type="material_evidence_change",
+                    recheck_condition={
+                        "field": "content_hash",
+                        "operator": "changes",
+                    },
+                    evidence_event_trigger={
+                        "event_type": "material_evidence_change",
+                        "source_name": "hialeah_tyler_energov",
+                        "evidence_class": "municipal_code_case",
+                        "signal_type": "foreclosure",
+                    },
+                )
+                with self.assertRaisesRegex(
+                    ValueError, "does not permit semantic fields: signal_type"
+                ):
+                    store.record_disposition(
+                        property_id,
+                        "watch",
+                        GENERATED_AT,
+                        baseline_content_hash=str(row["content_hash"]),
+                        watch_specification=contradictory,
+                    )
+                for contradictory_specification in (
+                    replace(
+                        contradictory,
+                        recheck_condition={
+                            "field": "content_hash",
+                            "operator": "changes",
+                            "signal_type": "foreclosure",
+                        },
+                        evidence_event_trigger={
+                            "event_type": "material_evidence_change",
+                            "source_name": "hialeah_tyler_energov",
+                            "evidence_class": "municipal_code_case",
+                        },
+                    ),
+                    replace(
+                        contradictory,
+                        evidence_event_trigger={
+                            "event_type": "material_evidence_change",
+                            "source_name": "hialeah_tyler_energov",
+                            "evidence_class": "municipal_code_case",
+                            "municipal_status": "open",
+                        },
+                    ),
+                ):
+                    with self.subTest(
+                        extra_semantics=contradictory_specification
+                    ), self.assertRaises(ValueError):
+                        store.record_disposition(
+                            property_id,
+                            "watch",
+                            GENERATED_AT,
+                            baseline_content_hash=str(row["content_hash"]),
+                            watch_specification=contradictory_specification,
+                        )
+                forbidden_signal_specs = (
+                    WatchSpecification(
+                        **common,
+                        trigger_type="scheduled_recheck",
+                        recheck_condition={
+                            "field": "current_time",
+                            "operator": "at_or_after",
+                            "value": "2026-07-24T13:00:00+00:00",
+                        },
+                        recheck_at="2026-07-24T13:00:00+00:00",
+                        evidence_event_trigger={
+                            "event_type": "scheduled_recheck",
+                            "source_name": "hialeah_tyler_energov",
+                            "signal_type": "SIGNAL",
+                        },
+                    ),
+                    WatchSpecification(
+                        **common,
+                        trigger_type="material_evidence_change",
+                        recheck_condition={
+                            "field": "content_hash",
+                            "operator": "changes",
+                        },
+                        evidence_event_trigger={
+                            "event_type": "material_evidence_change",
+                            "source_name": "hialeah_tyler_energov",
+                            "evidence_class": "municipal_code_case",
+                            "signal_type": "SIGNAL",
+                        },
+                    ),
+                    WatchSpecification(
+                        **common,
+                        trigger_type="listing_price_reduction",
+                        recheck_condition={
+                            "field": "list_price",
+                            "operator": "decreases",
+                        },
+                        evidence_event_trigger={
+                            "event_type": "listing_price_reduction",
+                            "source_name": "matrix_csv",
+                            "evidence_class": "matrix_listing",
+                            "signal_type": "SIGNAL",
+                        },
+                    ),
+                    WatchSpecification(
+                        **common,
+                        trigger_type="municipal_status_change",
+                        recheck_condition={
+                            "field": "municipal_status",
+                            "operator": "changes",
+                        },
+                        evidence_event_trigger={
+                            "event_type": "municipal_status_change",
+                            "source_name": "hialeah_tyler_energov",
+                            "evidence_class": "municipal_code_case",
+                            "signal_type": "SIGNAL",
+                        },
+                    ),
+                    WatchSpecification(
+                        **common,
+                        trigger_type="source_recovery",
+                        recheck_condition={
+                            "field": "source_health",
+                            "operator": "equals",
+                            "value": "healthy",
+                        },
+                        evidence_event_trigger={
+                            "event_type": "source_recovery",
+                            "source_name": "hialeah_tyler_energov",
+                            "evidence_class": "municipal_code_case",
+                            "previous_source_health_state": "degraded",
+                            "recovery_state": "healthy",
+                            "successful_recovery": (
+                                "A completed healthy municipal source run"
+                            ),
+                            "reevaluate_evidence_ids": [evidence_id],
+                            "last_known_context": (
+                                "Municipal case from the prior healthy run"
+                            ),
+                            "signal_type": "SIGNAL",
+                        },
+                    ),
+                )
+                for signal_type in ("unknown_signal", "foreclosure"):
+                    for template in forbidden_signal_specs:
+                        event = {
+                            key: (
+                                signal_type if value == "SIGNAL" else value
+                            )
+                            for key, value in (
+                                template.evidence_event_trigger or {}
+                            ).items()
+                        }
+                        with self.subTest(
+                            trigger=template.trigger_type,
+                            signal_type=signal_type,
+                        ), self.assertRaises(ValueError):
+                            store.record_disposition(
+                                property_id,
+                                "watch",
+                                GENERATED_AT,
+                                baseline_content_hash=str(row["content_hash"]),
+                                watch_specification=replace(
+                                    template,
+                                    evidence_event_trigger=event,
+                                ),
+                            )
+                for signal_type in ("unknown_signal", "foreclosure"):
+                    with self.subTest(
+                        trigger="new_record", signal_type=signal_type
+                    ), self.assertRaises(ValueError):
+                        store.record_disposition(
+                            property_id,
+                            "watch",
+                            GENERATED_AT,
+                            baseline_content_hash=str(row["content_hash"]),
+                            watch_specification=WatchSpecification(
+                                **common,
+                                trigger_type="new_record",
+                                recheck_condition={
+                                    "field": "record_count",
+                                    "operator": "increases",
+                                },
+                                evidence_event_trigger={
+                                    "event_type": "new_record",
+                                    "source_name": "hialeah_tyler_energov",
+                                    "signal_type": signal_type,
+                                },
+                            ),
+                        )
+                valid_disposition = store.record_disposition(
+                    property_id,
+                    "watch",
+                    GENERATED_AT,
+                    baseline_content_hash=str(row["content_hash"]),
+                    watch_specification=WatchSpecification(
+                        **common,
+                        trigger_type="new_record",
+                        recheck_condition={
+                            "field": "record_count",
+                            "operator": "increases",
+                        },
+                        evidence_event_trigger={
+                            "event_type": "new_record",
+                            "source_name": "hialeah_tyler_energov",
+                            "signal_type": "off_market_live_code_case",
+                        },
+                    ),
+                )
+                self.assertIsNotNone(valid_disposition)
+            rerun_at = "2026-07-24T16:00:00+00:00"
+            _run(
+                root,
+                database,
+                "rerun",
+                rerun_at,
+                criteria=CRITERIA,
+                code_collector=VariableCodeCollector(
+                    (replace(first_case, fetched_at=rerun_at),)
+                ),
+            )
+            record = next(
+                item
+                for item in json.loads(
+                    (root / "rerun/recommendations.json").read_text()
+                )
+                if item["property_id"] == property_id
+            )
+            self.assertEqual(record["recommended_action"], "watch")
+            self.assertEqual(
+                record["watch_semantics"]["validation_status"], "valid"
+            )
+
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             database = root / "degraded-recovery.sqlite"

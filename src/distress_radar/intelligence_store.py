@@ -13,7 +13,11 @@ from distress_radar.domain.property import CanonicalProperty
 from distress_radar.sources.base import CoverageState, SourceHealthState
 from distress_radar.sources.mls.matrix_csv import detect_listing_changes
 from distress_radar.watch_semantics import (
+    SIGNAL_EVIDENCE_CLASSES,
+    SIGNAL_SOURCES,
     WatchEvidenceDescriptor,
+    WatchSignalDescriptor,
+    WatchSignalObservationDescriptor,
     WatchSpecification,
     WatchValidationOutcome,
     validate_watch,
@@ -685,47 +689,149 @@ class IntelligenceStore:
         return row
 
     def watch_evidence_states(
-        self, property_id: str, evidence_ids: tuple[str, ...]
+        self,
+        property_id: str,
+        evidence_ids: tuple[str, ...],
+        *,
+        pilot_run_id: str | None = None,
+        watched_source: str | None = None,
+        watched_signal_type: str | None = None,
+        signal_links: dict[str, tuple[WatchSignalDescriptor, ...]] | None = None,
     ) -> dict[str, str]:
         if not evidence_ids:
             return {}
         rows = self.connection.execute(
             f"""
-            SELECT evidence_id,property_id,freshness_status
+            SELECT evidence_id,property_id,field_name,source_name,freshness_status
             FROM evidence_items
             WHERE evidence_id IN ({','.join('?' for _ in evidence_ids)})
             """,
             evidence_ids,
         ).fetchall()
+        links_by_evidence = signal_links or self.watch_signal_links(
+            property_id, evidence_ids
+        )
         states: dict[str, str] = {}
-        signal_rows = self.connection.execute(
-            """
-            SELECT status,confirmation_status,evidence_ids_json
-            FROM property_signals WHERE property_id=?
-            """,
-            (property_id,),
-        ).fetchall()
-        signal_by_evidence: dict[str, tuple[str, str]] = {}
-        for signal in signal_rows:
-            for evidence_id in json.loads(signal["evidence_ids_json"]):
-                signal_by_evidence[evidence_id] = (
-                    str(signal["status"]),
-                    str(signal["confirmation_status"]),
-                )
         for row in rows:
             if row["property_id"] != property_id:
                 continue
-            signal_state = signal_by_evidence.get(str(row["evidence_id"]))
-            if signal_state and signal_state[0] == "resolved":
-                state = "resolved"
-            elif signal_state and signal_state[1] != "confirmed":
+            evidence_id = str(row["evidence_id"])
+            linked_signals = links_by_evidence.get(evidence_id, ())
+            matching_signals = tuple(
+                signal
+                for signal in linked_signals
+                if (
+                    signal.property_id == property_id
+                    and signal.source_name == str(row["source_name"])
+                    and (not watched_source or signal.source_name == watched_source)
+                    and (
+                        signal.signal_type == watched_signal_type
+                        if watched_signal_type
+                        else (
+                            str(row["field_name"])
+                            in SIGNAL_EVIDENCE_CLASSES.get(
+                                signal.signal_type, set()
+                            )
+                            and signal.source_name
+                            in SIGNAL_SOURCES.get(signal.signal_type, set())
+                        )
+                    )
+                )
+            )
+            if any(
+                signal.status == "active"
+                and signal.confirmation_status == "confirmed"
+                and (
+                    pilot_run_id is None
+                    or signal.pilot_run_id == pilot_run_id
+                )
+                for signal in matching_signals
+            ):
+                state = "current"
+            elif any(
+                signal.status == "active" for signal in matching_signals
+            ):
                 state = "last_known"
+            elif matching_signals and all(
+                signal.status == "resolved"
+                or signal.confirmation_status == "resolved"
+                for signal in matching_signals
+            ):
+                state = "resolved"
+            elif not watched_signal_type and linked_signals and any(
+                str(row["field_name"])
+                in classes
+                for classes in SIGNAL_EVIDENCE_CLASSES.values()
+            ):
+                state = "incompatible"
             elif row["freshness_status"] == "stale":
                 state = "stale"
             else:
                 state = "current"
-            states[str(row["evidence_id"])] = state
+            states[evidence_id] = state
         return states
+
+    def watch_signal_links(
+        self, property_id: str, evidence_ids: tuple[str, ...]
+    ) -> dict[str, tuple[WatchSignalDescriptor, ...]]:
+        if not evidence_ids:
+            return {}
+        rows = self.connection.execute(
+            f"""
+            SELECT l.evidence_id,s.signal_id,s.signal_type,s.property_id,
+                   s.source_name,s.status,s.confirmation_status,s.pilot_run_id
+            FROM signal_evidence_links l
+            JOIN property_signals s ON s.signal_id=l.signal_id
+            WHERE l.property_id=?
+              AND l.evidence_id IN ({','.join('?' for _ in evidence_ids)})
+            ORDER BY l.evidence_id,s.signal_type,s.signal_id
+            """,
+            (property_id, *evidence_ids),
+        ).fetchall()
+        links: dict[str, list[WatchSignalDescriptor]] = {
+            evidence_id: [] for evidence_id in evidence_ids
+        }
+        for row in rows:
+            observations = tuple(
+                WatchSignalObservationDescriptor(
+                    observation_id=str(observation["observation_id"]),
+                    pilot_run_id=str(observation["pilot_run_id"]),
+                    status=str(observation["status"]),
+                    observed_at=str(observation["observed_at"]),
+                )
+                for observation in self.connection.execute(
+                    """
+                    SELECT observation_id,pilot_run_id,status,observed_at
+                    FROM signal_observations
+                    WHERE signal_id=?
+                    ORDER BY observed_at,observation_id
+                    """,
+                    (row["signal_id"],),
+                ).fetchall()
+            )
+            links[str(row["evidence_id"])].append(
+                WatchSignalDescriptor(
+                    signal_id=str(row["signal_id"]),
+                    signal_type=str(row["signal_type"]),
+                    property_id=str(row["property_id"]),
+                    source_name=str(row["source_name"]),
+                    status=str(row["status"]),
+                    confirmation_status=str(row["confirmation_status"]),
+                    pilot_run_id=(
+                        str(row["pilot_run_id"])
+                        if row["pilot_run_id"] is not None
+                        else None
+                    ),
+                    observation_statuses=tuple(
+                        observation.status for observation in observations
+                    ),
+                    observations=observations,
+                )
+            )
+        return {
+            evidence_id: tuple(evidence_links)
+            for evidence_id, evidence_links in links.items()
+        }
 
     def validate_watch_specification(
         self,
@@ -736,10 +842,38 @@ class IntelligenceStore:
         reviewed_content_hash: str,
         pilot_run_id: str | None = None,
     ) -> WatchValidationOutcome:
-        evidence_states = self.watch_evidence_states(
-            property_id, specification.evidence_ids if specification else ()
-        )
         evidence_ids = specification.evidence_ids if specification else ()
+        effective_run_id = pilot_run_id or self.current_pilot_run_id
+        if effective_run_id is None:
+            latest = self.connection.execute(
+                """
+                SELECT pilot_run_id FROM recommendations
+                WHERE property_id=? AND pilot_run_id IS NOT NULL
+                ORDER BY generated_at DESC,recommendation_id DESC LIMIT 1
+                """,
+                (property_id,),
+            ).fetchone()
+            effective_run_id = str(latest["pilot_run_id"]) if latest else None
+        signal_links = self.watch_signal_links(property_id, evidence_ids)
+        event = specification.evidence_event_trigger if specification else None
+        watched_source = (
+            str(event.get("source_name") or "")
+            if isinstance(event, dict)
+            else ""
+        )
+        watched_signal_type = (
+            str(event.get("signal_type") or "")
+            if isinstance(event, dict)
+            else ""
+        )
+        evidence_states = self.watch_evidence_states(
+            property_id,
+            evidence_ids,
+            pilot_run_id=effective_run_id,
+            watched_source=watched_source or None,
+            watched_signal_type=watched_signal_type or None,
+            signal_links=signal_links,
+        )
         evidence_rows = []
         if evidence_ids:
             evidence_rows = self.connection.execute(
@@ -771,20 +905,10 @@ class IntelligenceStore:
                 evidence_class=str(row["field_name"]),
                 source_name=str(row["source_name"]),
                 signal_types=tuple(sorted(signal_types[str(row["evidence_id"])])),
+                signal_links=signal_links.get(str(row["evidence_id"]), ()),
             )
             for row in evidence_rows
         )
-        effective_run_id = pilot_run_id or self.current_pilot_run_id
-        if effective_run_id is None:
-            latest = self.connection.execute(
-                """
-                SELECT pilot_run_id FROM recommendations
-                WHERE property_id=? AND pilot_run_id IS NOT NULL
-                ORDER BY generated_at DESC,recommendation_id DESC LIMIT 1
-                """,
-                (property_id,),
-            ).fetchone()
-            effective_run_id = str(latest["pilot_run_id"]) if latest else None
         sources = {item.source_name for item in descriptors}
         source_health: dict[str, str] = {}
         previous_source_health: dict[str, str] = {}
@@ -878,6 +1002,38 @@ class IntelligenceStore:
                             "evidence_class": item.evidence_class,
                             "source_name": item.source_name,
                             "signal_types": item.signal_types,
+                            "signal_links": [
+                                {
+                                    "signal_id": link.signal_id,
+                                    "signal_type": link.signal_type,
+                                    "property_id": link.property_id,
+                                    "source_name": link.source_name,
+                                    "status": link.status,
+                                    "confirmation_status": (
+                                        link.confirmation_status
+                                    ),
+                                    "pilot_run_id": link.pilot_run_id,
+                                    "observation_statuses": (
+                                        link.observation_statuses
+                                    ),
+                                    "observations": [
+                                        {
+                                            "observation_id": (
+                                                observation.observation_id
+                                            ),
+                                            "pilot_run_id": (
+                                                observation.pilot_run_id
+                                            ),
+                                            "status": observation.status,
+                                            "observed_at": (
+                                                observation.observed_at
+                                            ),
+                                        }
+                                        for observation in link.observations
+                                    ],
+                                }
+                                for link in item.signal_links
+                            ],
                         }
                         for item in outcome.evidence
                     ],
