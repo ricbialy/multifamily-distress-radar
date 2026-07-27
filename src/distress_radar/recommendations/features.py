@@ -106,21 +106,51 @@ def _number(value: Any) -> float | None:
     return float(value) if isinstance(value, (int, float)) else None
 
 
-def acquisition_attractiveness(scores: ScoreDimensions) -> float:
-    """Evidence-backed acquisition potential; municipal risk is never a benefit."""
-    components = (
-        (scores.economics, 0.35),
+def acquisition_attractiveness_breakdown(
+    scores: ScoreDimensions,
+) -> dict[str, float | str]:
+    """Return the exact bounded calculation and its economics-state adjustment."""
+    other_components = (
         (scores.market_pressure, 0.25),
         (scores.owner_motivation, 0.25),
     )
-    available = tuple(
-        (value, weight) for value, weight in components if value is not None
+    other_numerator = sum(
+        value * weight for value, weight in other_components if value is not None
     )
-    if not available or not any(value != 0 for value, _ in available):
-        return 0.0
-    # A missing component makes no contribution. Do not renormalize the remaining
-    # components: doing so can make unknown economics outrank supported economics.
-    return round(sum(value * weight for value, weight in available), 2)
+    other_denominator = sum(
+        weight for value, weight in other_components if value is not None
+    )
+    other_score = other_numerator / other_denominator if other_denominator else 0.0
+    baseline = min(99.99, max(0.0, other_score))
+    if scores.economics is None:
+        raw_score = other_score
+        final_score = baseline
+        adjustment = "economics_weight_omitted"
+        denominator = other_denominator
+    else:
+        denominator = other_denominator + 0.35
+        raw_score = (other_numerator + scores.economics * 0.35) / denominator
+        if scores.economics > 0:
+            final_score = max(raw_score, min(100.0, baseline + 0.01))
+            adjustment = "supported_good_floor"
+        elif scores.economics < 0:
+            final_score = min(raw_score, baseline - 0.01)
+            adjustment = "demonstrably_bad_ceiling"
+        else:
+            final_score = baseline
+            adjustment = "supported_neutral_baseline"
+    return {
+        "raw_weighted_score": round(raw_score, 2),
+        "non_economic_baseline": round(baseline, 2),
+        "denominator": round(denominator, 2),
+        "adjustment": adjustment,
+        "final_score": round(max(-100.0, min(100.0, final_score)), 2),
+    }
+
+
+def acquisition_attractiveness(scores: ScoreDimensions) -> float:
+    """Evidence-backed acquisition potential; municipal risk is never a benefit."""
+    return float(acquisition_attractiveness_breakdown(scores)["final_score"])
 
 
 def municipal_review_urgency(

@@ -25,7 +25,7 @@ from distress_radar.models import (
 )
 from distress_radar.municipal_severity import classify_municipal_case
 from distress_radar.orchestration.refresh import run_fixture_demo
-from distress_radar.pilot import run_pilot
+from distress_radar.pilot import _acquisition_score_lines, run_pilot
 from distress_radar.pilot_verification import _evidence_value_supports_action
 from distress_radar.recommendations.features import (
     acquisition_attractiveness,
@@ -458,6 +458,31 @@ class RealPilot02bAcceptanceTests(unittest.TestCase):
         self.assertGreater(
             acquisition_attractiveness(common_dimensions),
             acquisition_attractiveness(negative),
+        )
+        all_other_components_maxed = replace(
+            common_dimensions,
+            market_pressure=100,
+            owner_motivation=100,
+        )
+        self.assertGreater(
+            acquisition_attractiveness(
+                replace(all_other_components_maxed, economics=1)
+            ),
+            acquisition_attractiveness(all_other_components_maxed),
+        )
+        self.assertGreater(
+            acquisition_attractiveness(all_other_components_maxed),
+            acquisition_attractiveness(
+                replace(all_other_components_maxed, economics=-1)
+            ),
+        )
+        gate_report = _acquisition_score_lines(
+            replace(all_other_components_maxed, economics=1)
+        )
+        self.assertIn("raw weighted score **59.24**", gate_report[0])
+        self.assertIn("supported_good_floor", gate_report[1])
+        self.assertIn(
+            "Final bounded acquisition-attractiveness score: **100.00**", gate_report[2]
         )
 
     def test_r8_one_production_scoring_implementation(self) -> None:

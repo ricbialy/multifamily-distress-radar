@@ -35,7 +35,9 @@ from distress_radar.municipal_severity import (
 )
 from distress_radar.recommendations.features import (
     RecommendationFeatures,
+    ScoreDimensions,
     acquisition_attractiveness,
+    acquisition_attractiveness_breakdown,
     calculate_evidence_scores,
     municipal_review_urgency,
 )
@@ -1772,6 +1774,30 @@ _HAZARD_PRIORITY = {
 }
 
 
+def _acquisition_score_lines(scores: ScoreDimensions) -> tuple[str, ...]:
+    breakdown = acquisition_attractiveness_breakdown(scores)
+    economics_display = (
+        f"{scores.economics:.2f}"
+        if scores.economics is not None
+        else "unknown; weight omitted"
+    )
+    score_terms = (
+        f"0.35×economics({economics_display})",
+        f"0.25×market_pressure({scores.market_pressure:.2f})",
+        f"0.25×owner_motivation({scores.owner_motivation:.2f})",
+    )
+    return (
+        "("
+        + " + ".join(score_terms)
+        + f") ÷ {breakdown['denominator']:.2f} "
+        + f"= raw weighted score **{breakdown['raw_weighted_score']:.2f}**",
+        "Non-economic baseline: "
+        + f"**{breakdown['non_economic_baseline']:.2f}**; "
+        + f"ordering adjustment: `{breakdown['adjustment']}`.",
+        f"Final bounded acquisition-attractiveness score: **{breakdown['final_score']:.2f}**",
+    )
+
+
 def _acquisition_sort_key(item: dict[str, Any]) -> tuple[Any, ...]:
     def component_value(component: str) -> float:
         value = item["scores"].get(component)
@@ -2254,21 +2280,11 @@ def _write_reports(
     ]
     if queue:
         top = queue[0]
-        economics_display = (
-            f"{top['scores']['economics']:.2f}"
-            if top["scores"]["economics"] is not None
-            else "unknown; weight omitted"
-        )
-        score_terms = [
-            f"0.35×economics({economics_display})",
-            f"0.25×market_pressure({top['scores']['market_pressure']:.2f})",
-            f"0.25×owner_motivation({top['scores']['owner_motivation']:.2f})",
-        ]
         brief_lines.extend(
             [
                 "## Exact scoring calculation for the top-ranked property",
                 "",
-                " + ".join(score_terms) + f" = **{top['qualification_score']:.2f}**",
+                *_acquisition_score_lines(ScoreDimensions(**top["scores"])),
                 "",
             ]
         )
