@@ -28,6 +28,14 @@ EXPECTED_HEADER_MAPPING = {
     "list_price": "Current Price",
     "property_class": "Type of Property",
 }
+AUTHORITATIVE_RUN_DIRECTORIES = (
+    "first",
+    "second",
+    "next-day",
+    "controlled-baseline",
+    "controlled",
+    "failed-source",
+)
 
 
 @dataclass(frozen=True)
@@ -285,6 +293,64 @@ def _run_tests(repository: Path) -> tuple[bool, int, str]:
     )
 
 
+def _repository_commit_sha(repository: Path) -> str:
+    status = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=repository,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if status.returncode != 0:
+        raise RuntimeError(
+            "Unable to verify clean repository state: "
+            + (status.stderr.strip() or "git status failed")
+        )
+    if status.stdout.strip():
+        raise ValueError(
+            "Authoritative acceptance requires a clean committed working tree"
+        )
+    revision = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repository,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    commit_sha = revision.stdout.strip().lower()
+    if (
+        revision.returncode != 0
+        or len(commit_sha) != 40
+        or any(character not in "0123456789abcdef" for character in commit_sha)
+    ):
+        raise RuntimeError(
+            "Unable to resolve the authoritative full commit SHA: "
+            + (revision.stderr.strip() or "git rev-parse returned an invalid SHA")
+        )
+    return commit_sha
+
+
+def _manifest_commit_shas(output_dir: Path) -> dict[str, str | None]:
+    return {
+        directory: json.loads(
+            (output_dir / directory / "run_manifest.json").read_text()
+        ).get("source_commit_sha")
+        for directory in AUTHORITATIVE_RUN_DIRECTORIES
+    }
+
+
+def _manifests_match_commit(
+    manifest_commit_shas: dict[str, str | None], source_commit_sha: str
+) -> bool:
+    return (
+        set(manifest_commit_shas) == set(AUTHORITATIVE_RUN_DIRECTORIES)
+        and all(
+            isinstance(commit_sha, str) and commit_sha == source_commit_sha
+            for commit_sha in manifest_commit_shas.values()
+        )
+    )
+
+
 def verify_real_pilot(
     *,
     matrix_path: Path,
@@ -294,6 +360,8 @@ def verify_real_pilot(
 ) -> VerificationResult:
     if database_path.exists():
         raise ValueError("Acceptance database must not already exist")
+    repository = Path(__file__).resolve().parents[2]
+    source_commit_sha = _repository_commit_sha(repository)
     output_dir.mkdir(parents=True, exist_ok=True)
     first_generated_at = datetime.now(UTC).replace(microsecond=0)
     first = run_pilot(
@@ -302,6 +370,7 @@ def verify_real_pilot(
         output_dir=output_dir / "first",
         municipality=municipality,
         generated_at=first_generated_at.isoformat(),
+        source_commit_sha=source_commit_sha,
     )
     with sqlite3.connect(database_path) as connection:
         first_change_count = _count(connection, "SELECT COUNT(*) FROM listing_changes")
@@ -311,6 +380,7 @@ def verify_real_pilot(
         output_dir=output_dir / "second",
         municipality=municipality,
         generated_at=(first_generated_at + timedelta(hours=1)).isoformat(),
+        source_commit_sha=source_commit_sha,
     )
     with sqlite3.connect(database_path) as connection:
         second_change_count = _count(connection, "SELECT COUNT(*) FROM listing_changes")
@@ -320,6 +390,7 @@ def verify_real_pilot(
         output_dir=output_dir / "next-day",
         municipality=municipality,
         generated_at=(first_generated_at + timedelta(days=1)).isoformat(),
+        source_commit_sha=source_commit_sha,
     )
 
     controlled_path = output_dir / "controlled" / matrix_path.name
@@ -332,6 +403,7 @@ def verify_real_pilot(
         database_path=controlled_database,
         output_dir=output_dir / "controlled-baseline",
         municipality=municipality,
+        source_commit_sha=source_commit_sha,
     )
     with sqlite3.connect(controlled_database) as connection:
         connection.row_factory = sqlite3.Row
@@ -361,6 +433,7 @@ def verify_real_pilot(
         database_path=controlled_database,
         output_dir=output_dir / "controlled",
         municipality=municipality,
+        source_commit_sha=source_commit_sha,
     )
     with sqlite3.connect(controlled_database) as connection:
         connection.row_factory = sqlite3.Row
@@ -415,8 +488,8 @@ def verify_real_pilot(
         output_dir=output_dir / "failed-source",
         municipality=municipality,
         simulate_source_failure=True,
+        source_commit_sha=source_commit_sha,
     )
-    repository = Path(__file__).resolve().parents[2]
     tests_passed, test_count, test_output = _run_tests(repository)
 
     required_outputs = {
@@ -711,6 +784,10 @@ def verify_real_pilot(
         )
 
     failure_brief = (output_dir / "failed-source" / "daily_brief.md").read_text()
+    manifest_commit_shas = _manifest_commit_shas(output_dir)
+    manifests_match_commit = _manifests_match_commit(
+        manifest_commit_shas, source_commit_sha
+    )
     gates = (
         GateResult(
             "G0",
@@ -794,8 +871,13 @@ def verify_real_pilot(
             "G8",
             "PASS"
             if {path.name for path in first.output_files} == required_outputs
+            and manifests_match_commit
             else "FAIL",
-            f"{len(first.output_files)} database-derived files",
+            (
+                f"{len(first.output_files)} database-derived files; "
+                f"authoritative_commit={source_commit_sha}; "
+                f"all_manifests_match={manifests_match_commit}"
+            ),
         ),
         GateResult(
             "G9",
@@ -858,6 +940,8 @@ def verify_real_pilot(
     )
     payload = {
         "status": status,
+        "source_commit_sha": source_commit_sha,
+        "manifest_commit_shas": manifest_commit_shas,
         "gates": [asdict(gate) for gate in gates],
         "first_run": {
             "run_id": first.run_id,

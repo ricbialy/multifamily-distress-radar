@@ -15,12 +15,85 @@ from distress_radar.pilot_verification import (
     _evidence_value_supports_action,
     _g10_is_valid,
     _g5_is_valid,
+    _manifest_commit_shas,
+    _manifests_match_commit,
+    _repository_commit_sha,
     _run_tests,
     verify_real_pilot,
 )
 
 
 class PilotVerificationTests(unittest.TestCase):
+    def test_all_six_authoritative_manifests_must_match_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            commit_sha = "b" * 40
+            directories = (
+                "first",
+                "second",
+                "next-day",
+                "controlled-baseline",
+                "controlled",
+                "failed-source",
+            )
+            for directory in directories:
+                run_directory = root / directory
+                run_directory.mkdir()
+                (run_directory / "run_manifest.json").write_text(
+                    '{"source_commit_sha": "' + commit_sha + '"}\n'
+                )
+            manifests = _manifest_commit_shas(root)
+            self.assertTrue(_manifests_match_commit(manifests, commit_sha))
+            manifests["failed-source"] = "c" * 40
+            self.assertFalse(_manifests_match_commit(manifests, commit_sha))
+            manifests["failed-source"] = commit_sha
+            del manifests["controlled"]
+            self.assertFalse(_manifests_match_commit(manifests, commit_sha))
+            manifests["controlled"] = commit_sha
+            manifests["extra"] = commit_sha
+            self.assertFalse(_manifests_match_commit(manifests, commit_sha))
+            del manifests["extra"]
+            manifests["failed-source"] = None
+            self.assertFalse(_manifests_match_commit(manifests, commit_sha))
+            manifests["failed-source"] = []
+            self.assertFalse(_manifests_match_commit(manifests, commit_sha))
+
+    def test_authoritative_commit_requires_clean_full_sha(self) -> None:
+        clean = SimpleNamespace(returncode=0, stdout="", stderr="")
+        revision = SimpleNamespace(
+            returncode=0,
+            stdout="a" * 40 + "\n",
+            stderr="",
+        )
+        with patch(
+            "distress_radar.pilot_verification.subprocess.run",
+            side_effect=(clean, revision),
+        ) as run:
+            self.assertEqual(_repository_commit_sha(Path("/repository")), "a" * 40)
+        self.assertEqual(run.call_count, 2)
+
+        dirty = SimpleNamespace(
+            returncode=0,
+            stdout=" M src/distress_radar/pilot.py\n",
+            stderr="",
+        )
+        with patch(
+            "distress_radar.pilot_verification.subprocess.run",
+            return_value=dirty,
+        ), self.assertRaisesRegex(ValueError, "clean committed working tree"):
+            _repository_commit_sha(Path("/repository"))
+
+        invalid_revision = SimpleNamespace(
+            returncode=0,
+            stdout="short\n",
+            stderr="",
+        )
+        with patch(
+            "distress_radar.pilot_verification.subprocess.run",
+            side_effect=(clean, invalid_revision),
+        ), self.assertRaisesRegex(RuntimeError, "full commit SHA"):
+            _repository_commit_sha(Path("/repository"))
+
     def test_verification_harness_runs_tests_and_compile_check(self) -> None:
         test_process = SimpleNamespace(
             returncode=0,
