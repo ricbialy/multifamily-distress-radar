@@ -30,8 +30,14 @@ PYTHONPATH=src .venv/bin/python -m distress_radar pilot-run \
   --matrix /absolute/path/to/Agent\ Single\ Line\ -\ COM.csv \
   --db /absolute/path/to/pilot.sqlite \
   --output-dir /absolute/path/to/pilot-output \
-  --municipality hialeah
+  --municipality hialeah \
+  --minimum-acceptable-cap-rate 0.04 \
+  --target-cap-rate 0.06
 ```
+
+Cap-rate criteria use decimal units and must be supplied together. If omitted,
+the run records `criteria_not_configured`; supported NOI may be displayed, but
+cap rate earns no credit and economics alone cannot qualify a property.
 
 The genuine export headers map as follows: `MLS # Link` → MLS number, `St` →
 listing status, `Address` → submitted street address, `Current Price` → list
@@ -72,6 +78,13 @@ PYTHONPATH=src .venv/bin/python -m distress_radar pilot-disposition \
 Dismissals reopen when material source evidence changes. Contact approval is
 also hash-bound and cannot bypass identity, scope, municipal-risk, or
 underwriting hard gates.
+
+A new `watch` additionally requires a specific reason, property-matched
+evidence IDs, a bounded trigger with a structured condition, an explicit next
+action, and a creator. Scheduled watches require a future recheck timestamp;
+event watches require an exact source and evidence or signal class. Incomplete
+legacy rows remain visible as `legacy_incomplete_watch` and do not run
+automatically.
 
 ```bash
 python3 -m venv .venv

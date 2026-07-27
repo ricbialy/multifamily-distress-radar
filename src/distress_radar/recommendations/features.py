@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, replace
+from math import isfinite
+from numbers import Real
 from typing import Any
 
 from distress_radar.domain.evidence import EvidenceItem
@@ -29,6 +31,38 @@ class ScoreDimensions:
                     "score dimensions must be between 0 and 100, except "
                     "demonstrably bad economics may be negative"
                 )
+
+
+@dataclass(frozen=True)
+class InvestmentCriteria:
+    """Explicit decimal-rate thresholds used to classify supported economics."""
+
+    minimum_acceptable_cap_rate: float
+    target_cap_rate: float
+
+    def __post_init__(self) -> None:
+        values = (
+            self.minimum_acceptable_cap_rate,
+            self.target_cap_rate,
+        )
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, Real)
+            or not isfinite(float(value))
+            for value in values
+        ):
+            raise ValueError("investment criteria must be finite numeric decimals")
+        minimum, target = (float(value) for value in values)
+        if minimum < 0:
+            raise ValueError("minimum acceptable cap rate must be nonnegative")
+        if minimum > 1 or target > 1:
+            raise ValueError(
+                "cap-rate criteria use decimal units between 0 and 1, not percentages"
+            )
+        if target < minimum:
+            raise ValueError("target cap rate must be greater than or equal to minimum")
+        object.__setattr__(self, "minimum_acceptable_cap_rate", minimum)
+        object.__setattr__(self, "target_cap_rate", target)
 
 
 @dataclass(frozen=True)
@@ -103,7 +137,10 @@ class EvidenceScoreResult:
 
 
 def _number(value: Any) -> float | None:
-    return float(value) if isinstance(value, (int, float)) else None
+    if isinstance(value, bool) or not isinstance(value, Real):
+        return None
+    number = float(value)
+    return number if isfinite(number) else None
 
 
 def acquisition_attractiveness_breakdown(
@@ -132,7 +169,11 @@ def acquisition_attractiveness_breakdown(
         raw_score = (other_numerator + scores.economics * 0.35) / denominator
         if scores.economics > 0:
             final_score = max(raw_score, min(100.0, baseline + 0.01))
-            adjustment = "supported_good_floor"
+            adjustment = (
+                "supported_good_floor"
+                if scores.economics >= 50
+                else "supported_neutral_floor"
+            )
         elif scores.economics < 0:
             final_score = min(raw_score, baseline - 0.01)
             adjustment = "demonstrably_bad_ceiling"
@@ -153,6 +194,23 @@ def acquisition_attractiveness(scores: ScoreDimensions) -> float:
     return float(acquisition_attractiveness_breakdown(scores)["final_score"])
 
 
+def is_acquisition_qualified(
+    scores: ScoreDimensions,
+    *,
+    economics_status: str,
+    in_scope: bool,
+    identity_verified: bool,
+) -> bool:
+    """One fail-closed acquisition qualification rule for all production outputs."""
+    if not in_scope or not identity_verified or economics_status == "demonstrably_bad":
+        return False
+    return bool(
+        economics_status == "supported_good"
+        or scores.market_pressure > 0
+        or scores.owner_motivation > 0
+    )
+
+
 def municipal_review_urgency(
     municipal: tuple[MunicipalSeverity, ...],
 ) -> float | None:
@@ -171,6 +229,7 @@ def calculate_evidence_scores(
     official_records: tuple[dict[str, Any], ...],
     tax_records: tuple[dict[str, Any], ...],
     missing_fields: tuple[str, ...],
+    investment_criteria: InvestmentCriteria | None = None,
 ) -> EvidenceScoreResult:
     components: dict[str, list[str]] = {
         "owner_motivation": [],
@@ -230,6 +289,23 @@ def calculate_evidence_scores(
     noi = _number(listing.get("noi"))
     expenses = _number(listing.get("expenses"))
     cap_rate_supported = False
+    metrics["investment_criteria"] = (
+        {
+            "state": "configured",
+            "unit": "decimal_rate",
+            "minimum_acceptable_cap_rate": (
+                investment_criteria.minimum_acceptable_cap_rate
+            ),
+            "target_cap_rate": investment_criteria.target_cap_rate,
+        }
+        if investment_criteria is not None
+        else {
+            "state": "criteria_not_configured",
+            "unit": "decimal_rate",
+            "minimum_acceptable_cap_rate": None,
+            "target_cap_rate": None,
+        }
+    )
     if noi is not None and noi <= 0:
         economics = -50.0
         metrics["economics_status"] = "demonstrably_bad"
@@ -244,9 +320,8 @@ def calculate_evidence_scores(
         and expenses >= 0
     ):
         cap_rate_supported = True
-        cap_rate = round(noi / price, 4)
-        metrics["reported_noi_cap_rate"] = cap_rate
-        cap_points = 30 if cap_rate >= 0.06 else 15 if cap_rate >= 0.045 else 0
+        cap_rate = noi / price
+        metrics["reported_noi_cap_rate"] = round(cap_rate, 6)
         ppu_points = (
             20
             if price_per_unit is not None and price_per_unit <= 100_000
@@ -256,14 +331,42 @@ def calculate_evidence_scores(
             if price_per_unit is not None and price_per_unit <= 200_000
             else 0
         )
-        economics = float(cap_points + ppu_points)
-        metrics["economics_status"] = (
-            "supported_good" if economics > 0 else "supported_neutral"
-        )
-        components["economics"].append(
-            f"Supported NOI/asking-price rate {cap_rate:.2%}: +{cap_points}; "
-            f"supported price-per-unit contribution: +{ppu_points}."
-        )
+        if investment_criteria is None:
+            metrics["economics_status"] = "unknown"
+            metrics["cap_rate_status"] = "criteria_not_configured"
+            components["economics"].append(
+                f"Supported NOI/asking-price rate {cap_rate:.2%}, but investment "
+                "criteria are not configured; no cap-rate or price-per-unit credit."
+            )
+        elif cap_rate < investment_criteria.minimum_acceptable_cap_rate:
+            economics = -50.0
+            metrics["economics_status"] = "demonstrably_bad"
+            metrics["cap_rate_status"] = "below_minimum"
+            components["economics"].append(
+                f"Supported NOI/asking-price rate {cap_rate:.2%} is below the "
+                f"configured {investment_criteria.minimum_acceptable_cap_rate:.2%} "
+                "minimum: -50. Price per unit cannot override adverse income evidence."
+            )
+        elif cap_rate < investment_criteria.target_cap_rate:
+            economics = float(1 + min(ppu_points, 10))
+            metrics["economics_status"] = "supported_neutral"
+            metrics["cap_rate_status"] = "minimum_met_target_not_met"
+            components["economics"].append(
+                f"Supported NOI/asking-price rate {cap_rate:.2%} meets the "
+                f"{investment_criteria.minimum_acceptable_cap_rate:.2%} minimum but "
+                f"is below the {investment_criteria.target_cap_rate:.2%} target; "
+                f"neutral contribution {economics:.0f}, including bounded "
+                f"price-per-unit context {min(ppu_points, 10)}."
+            )
+        else:
+            economics = float(50 + ppu_points)
+            metrics["economics_status"] = "supported_good"
+            metrics["cap_rate_status"] = "target_met"
+            components["economics"].append(
+                f"Supported NOI/asking-price rate {cap_rate:.2%} meets the configured "
+                f"{investment_criteria.target_cap_rate:.2%} target: +50; supported "
+                f"price-per-unit context: +{ppu_points}."
+            )
     else:
         metrics["economics_status"] = "unknown"
         components["economics"].append(

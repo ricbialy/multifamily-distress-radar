@@ -28,6 +28,7 @@ from distress_radar.orchestration.refresh import run_fixture_demo
 from distress_radar.pilot import _acquisition_score_lines, run_pilot
 from distress_radar.pilot_verification import _evidence_value_supports_action
 from distress_radar.recommendations.features import (
+    InvestmentCriteria,
     acquisition_attractiveness,
     calculate_evidence_scores,
 )
@@ -427,6 +428,7 @@ class RealPilot02bAcceptanceTests(unittest.TestCase):
                 "official_records": ({"signal_type": "recorded_liens"},),
                 "tax_records": (),
                 "missing_fields": (),
+                "investment_criteria": InvestmentCriteria(0.04, 0.06),
             }
             good = calculate_evidence_scores(
                 listing={**listing, "noi": 80_000}, **common
@@ -480,7 +482,7 @@ class RealPilot02bAcceptanceTests(unittest.TestCase):
             replace(all_other_components_maxed, economics=1)
         )
         self.assertIn("raw weighted score **59.24**", gate_report[0])
-        self.assertIn("supported_good_floor", gate_report[1])
+        self.assertIn("supported_neutral_floor", gate_report[1])
         self.assertIn(
             "Final bounded acquisition-attractiveness score: **100.00**", gate_report[2]
         )

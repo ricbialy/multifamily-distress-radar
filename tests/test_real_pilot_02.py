@@ -28,6 +28,7 @@ from distress_radar.pilot import (
     run_pilot,
 )
 from distress_radar.recommendations.features import (
+    InvestmentCriteria,
     acquisition_attractiveness,
     calculate_evidence_scores,
     municipal_review_urgency,
@@ -324,6 +325,7 @@ class EvidenceScoringTests(unittest.TestCase):
             official_records=({"signal_type": "recorded_liens"},),
             tax_records=({"amount_due": 12_000, "status": "unpaid"},),
             missing_fields=("rent_roll", "T12"),
+            investment_criteria=InvestmentCriteria(0.04, 0.06),
         )
 
         self.assertGreater(scores.dimensions.owner_motivation, 0)

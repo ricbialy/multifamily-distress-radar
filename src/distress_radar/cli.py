@@ -162,6 +162,8 @@ def build_parser() -> argparse.ArgumentParser:
     pilot_run.add_argument("--output-dir", type=Path, required=True)
     pilot_run.add_argument("--municipality", default="hialeah")
     pilot_run.add_argument("--simulate-source-failure", action="store_true")
+    pilot_run.add_argument("--minimum-acceptable-cap-rate", type=float)
+    pilot_run.add_argument("--target-cap-rate", type=float)
     pilot_verify = subparsers.add_parser(
         "pilot-verify",
         help="Run the repeat, controlled-change, failure, and G0-G11 acceptance harness",
@@ -189,6 +191,24 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     pilot_disposition.add_argument("--notes")
+    pilot_disposition.add_argument("--watch-reason")
+    pilot_disposition.add_argument("--watch-evidence-id", action="append")
+    pilot_disposition.add_argument(
+        "--watch-trigger-type",
+        choices=(
+            "scheduled_recheck",
+            "new_record",
+            "material_evidence_change",
+            "source_recovery",
+            "listing_price_reduction",
+            "municipal_status_change",
+        ),
+    )
+    pilot_disposition.add_argument("--watch-condition-json")
+    pilot_disposition.add_argument("--watch-recheck-at")
+    pilot_disposition.add_argument("--watch-event-json")
+    pilot_disposition.add_argument("--watch-next-action")
+    pilot_disposition.add_argument("--creator")
     return parser
 
 
@@ -202,6 +222,7 @@ def main(argv: list[str] | None = None) -> None:
         if args.command == "pilot-disposition":
             from distress_radar.intelligence_store import IntelligenceStore
             from distress_radar.pilot import _migrate_pilot
+            from distress_radar.watch_semantics import WatchSpecification
 
             with IntelligenceStore(args.db) as store:
                 _migrate_pilot(store)
@@ -218,12 +239,33 @@ def main(argv: list[str] | None = None) -> None:
                         f"No recommendation exists for property {args.property_id}"
                     )
                 baseline_content_hash = str(row["content_hash"])
+                watch_specification = None
+                if args.disposition == "watch":
+                    if not args.watch_condition_json:
+                        raise ValueError(
+                            "watch requires --watch-condition-json and complete semantics"
+                        )
+                    watch_specification = WatchSpecification(
+                        watch_reason=args.watch_reason or "",
+                        evidence_ids=tuple(args.watch_evidence_id or ()),
+                        trigger_type=args.watch_trigger_type or "",
+                        recheck_condition=json.loads(args.watch_condition_json),
+                        recheck_at=args.watch_recheck_at,
+                        evidence_event_trigger=(
+                            json.loads(args.watch_event_json)
+                            if args.watch_event_json
+                            else None
+                        ),
+                        expected_next_action=args.watch_next_action or "",
+                        creator=args.creator or "",
+                    )
                 disposition_id = store.record_disposition(
                     args.property_id,
                     args.disposition,
                     datetime.now(timezone.utc).isoformat(),
                     notes=args.notes,
                     baseline_content_hash=baseline_content_hash,
+                    watch_specification=watch_specification,
                 )
             print(
                 json.dumps(
@@ -273,6 +315,26 @@ def main(argv: list[str] | None = None) -> None:
 
         if args.command == "pilot-run":
             from distress_radar.pilot import run_pilot
+            from distress_radar.recommendations.features import InvestmentCriteria
+
+            criteria_values = (
+                args.minimum_acceptable_cap_rate,
+                args.target_cap_rate,
+            )
+            if any(value is not None for value in criteria_values) and not all(
+                value is not None for value in criteria_values
+            ):
+                raise ValueError(
+                    "both minimum and target cap rates are required when configuring criteria"
+                )
+            investment_criteria = (
+                InvestmentCriteria(
+                    minimum_acceptable_cap_rate=args.minimum_acceptable_cap_rate,
+                    target_cap_rate=args.target_cap_rate,
+                )
+                if all(value is not None for value in criteria_values)
+                else None
+            )
 
             result = run_pilot(
                 matrix_path=args.matrix,
@@ -280,6 +342,7 @@ def main(argv: list[str] | None = None) -> None:
                 output_dir=args.output_dir,
                 municipality=args.municipality,
                 simulate_source_failure=args.simulate_source_failure,
+                investment_criteria=investment_criteria,
             )
             print(
                 json.dumps(

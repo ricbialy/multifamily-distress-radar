@@ -34,6 +34,8 @@ REQUIRED_TEST_MARKERS = {
     "R8": "test_r8_one_production_scoring",
     "R9": "test_r9_action_semantics",
     "R10": "test_r10_same_and_next_day",
+    "R11": "test_r11_economics_threshold",
+    "R12": "test_r12_watch_semantic",
 }
 
 
@@ -65,7 +67,7 @@ def evaluate_acceptance_output(output: str, returncode: int) -> RankingVerificat
         and all(gate.status == "PASS" for gate in gates)
     )
     return RankingVerification(
-        status="REAL-PILOT-02b: PASS" if passed else "REAL-PILOT-02b: FAIL",
+        status="REAL-PILOT-02c: PASS" if passed else "REAL-PILOT-02c: FAIL",
         test_count=test_count,
         gates=gates,
         command=(),
@@ -83,7 +85,7 @@ def run_ranking_validity_acceptance(
         "-s",
         "tests",
         "-p",
-        "test_real_pilot_02b.py",
+        "real_pilot_02c_acceptance.py",
         "-v",
     )
     process = subprocess.run(
@@ -103,16 +105,16 @@ def run_ranking_validity_acceptance(
         command=command,
     )
     output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "R1-R10-test-results.txt").write_text(raw_output, encoding="utf-8")
-    (output_dir / "R1-R10-acceptance.json").write_text(
+    (output_dir / "R1-R12-test-results.txt").write_text(raw_output, encoding="utf-8")
+    (output_dir / "R1-R12-acceptance.json").write_text(
         json.dumps(asdict(result), indent=2) + "\n",
         encoding="utf-8",
     )
     rows = "\n".join(
         f"| {gate.gate} | {gate.status} | {gate.evidence} |" for gate in result.gates
     )
-    (output_dir / "R1-R10-acceptance.md").write_text(
-        "# REAL-PILOT-02b R1–R10 acceptance\n\n"
+    (output_dir / "R1-R12-acceptance.md").write_text(
+        "# REAL-PILOT-02c R1–R12 acceptance\n\n"
         "| Gate | Result | Evidence |\n"
         "|---|---|---|\n"
         f"{rows}\n\n"

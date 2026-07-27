@@ -12,6 +12,10 @@ from distress_radar.domain.listing import ListingChange, ListingSnapshot
 from distress_radar.domain.property import CanonicalProperty
 from distress_radar.sources.base import CoverageState, SourceHealthState
 from distress_radar.sources.mls.matrix_csv import detect_listing_changes
+from distress_radar.watch_semantics import (
+    WatchSpecification,
+    watch_validation_status,
+)
 
 
 def utc_now() -> str:
@@ -26,6 +30,7 @@ class IntelligenceStore:
         self.connection = sqlite3.connect(path)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys = ON")
+        self.current_pilot_run_id: str | None = None
         self._migrate()
 
     def __enter__(self) -> Self:
@@ -99,7 +104,8 @@ class IntelligenceStore:
                 source_name TEXT NOT NULL, source_record_id TEXT NOT NULL,
                 source_url TEXT, fetched_at TEXT NOT NULL,
                 freshness_status TEXT NOT NULL, confidence REAL,
-                value_type TEXT NOT NULL, metadata_json TEXT NOT NULL
+                value_type TEXT NOT NULL, metadata_json TEXT NOT NULL,
+                pilot_run_id TEXT
             );
             CREATE TABLE IF NOT EXISTS property_signals (
                 signal_id TEXT PRIMARY KEY, property_id TEXT NOT NULL
@@ -130,6 +136,15 @@ class IntelligenceStore:
                     REFERENCES canonical_properties(property_id),
                 disposition TEXT NOT NULL, decided_at TEXT NOT NULL, notes TEXT,
                 baseline_content_hash TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE TABLE IF NOT EXISTS watch_trigger_events (
+                trigger_event_id TEXT PRIMARY KEY,
+                disposition_id TEXT NOT NULL REFERENCES human_dispositions(disposition_id),
+                property_id TEXT NOT NULL REFERENCES canonical_properties(property_id),
+                trigger_fingerprint TEXT NOT NULL,
+                triggered_at TEXT NOT NULL,
+                trigger_payload_json TEXT NOT NULL,
+                UNIQUE(disposition_id,trigger_fingerprint)
             );
             CREATE TABLE IF NOT EXISTS acquisition_outcomes (
                 outcome_id TEXT PRIMARY KEY, property_id TEXT NOT NULL
@@ -167,6 +182,35 @@ class IntelligenceStore:
             );
             """
         )
+        disposition_columns = {
+            row["name"]
+            for row in self.connection.execute(
+                "PRAGMA table_info(human_dispositions)"
+            )
+        }
+        for column, definition in (
+            ("watch_reason", "TEXT"),
+            ("watch_evidence_ids_json", "TEXT"),
+            ("watch_trigger_type", "TEXT"),
+            ("watch_recheck_condition_json", "TEXT"),
+            ("watch_recheck_at", "TEXT"),
+            ("watch_event_trigger_json", "TEXT"),
+            ("watch_expected_next_action", "TEXT"),
+            ("creator", "TEXT"),
+            ("watch_validation_status", "TEXT"),
+        ):
+            if column not in disposition_columns:
+                self.connection.execute(
+                    f"ALTER TABLE human_dispositions ADD COLUMN {column} {definition}"
+                )
+        evidence_columns = {
+            row["name"]
+            for row in self.connection.execute("PRAGMA table_info(evidence_items)")
+        }
+        if "pilot_run_id" not in evidence_columns:
+            self.connection.execute(
+                "ALTER TABLE evidence_items ADD COLUMN pilot_run_id TEXT"
+            )
         self.connection.commit()
 
     def upsert_property(self, prop: CanonicalProperty) -> None:
@@ -204,8 +248,8 @@ class IntelligenceStore:
             INSERT INTO evidence_items (
                 evidence_id,property_id,field_name,value_json,source_name,
                 source_record_id,source_url,fetched_at,freshness_status,
-                confidence,value_type,metadata_json
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                confidence,value_type,metadata_json,pilot_run_id
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 evidence_id,
@@ -220,6 +264,7 @@ class IntelligenceStore:
                 evidence.confidence,
                 evidence.value_type.value,
                 json.dumps(evidence.metadata, sort_keys=True),
+                self.current_pilot_run_id,
             ),
         )
         self.connection.commit()
@@ -477,6 +522,7 @@ class IntelligenceStore:
         *,
         baseline_content_hash: str,
         notes: str | None = None,
+        watch_specification: WatchSpecification | None = None,
     ) -> str:
         allowed = {
             "investigate",
@@ -488,6 +534,23 @@ class IntelligenceStore:
         }
         if disposition not in allowed:
             raise ValueError(f"unsupported disposition: {disposition}")
+        if disposition != "watch" and watch_specification is not None:
+            raise ValueError("watch specification is only valid for a watch disposition")
+        evidence_states: dict[str, str] = {}
+        watch_status: str | None = None
+        if disposition == "watch":
+            if watch_specification is None:
+                raise ValueError("new watch dispositions require complete watch semantics")
+            watch_status, evidence_states = self.validate_watch_specification(
+                property_id,
+                watch_specification,
+                created_at=decided_at,
+            )
+            if watch_status != "valid":
+                raise ValueError(
+                    "watch evidence or semantics failed closed validation: "
+                    f"{watch_status}"
+                )
         disposition_id = str(uuid4())
         self.connection.execute(
             """
@@ -500,8 +563,11 @@ class IntelligenceStore:
             """
             INSERT INTO human_dispositions (
                 disposition_id,property_id,disposition,decided_at,notes,
-                baseline_content_hash,active
-            ) VALUES (?,?,?,?,?,?,1)
+                baseline_content_hash,active,watch_reason,watch_evidence_ids_json,
+                watch_trigger_type,watch_recheck_condition_json,watch_recheck_at,
+                watch_event_trigger_json,watch_expected_next_action,creator,
+                watch_validation_status
+            ) VALUES (?,?,?,?,?,?,1,?,?,?,?,?,?,?,?,?)
             """,
             (
                 disposition_id,
@@ -510,6 +576,35 @@ class IntelligenceStore:
                 decided_at,
                 notes,
                 baseline_content_hash,
+                watch_specification.watch_reason if watch_specification else None,
+                (
+                    json.dumps(watch_specification.evidence_ids)
+                    if watch_specification
+                    else None
+                ),
+                watch_specification.trigger_type if watch_specification else None,
+                (
+                    json.dumps(
+                        watch_specification.recheck_condition, sort_keys=True
+                    )
+                    if watch_specification
+                    else None
+                ),
+                watch_specification.recheck_at if watch_specification else None,
+                (
+                    json.dumps(
+                        watch_specification.evidence_event_trigger, sort_keys=True
+                    )
+                    if watch_specification
+                    else None
+                ),
+                (
+                    watch_specification.expected_next_action
+                    if watch_specification
+                    else None
+                ),
+                watch_specification.creator if watch_specification else None,
+                watch_status,
             ),
         )
         self.connection.commit()
@@ -526,7 +621,7 @@ class IntelligenceStore:
     def active_disposition(self, property_id: str) -> sqlite3.Row | None:
         row = self.connection.execute(
             """
-            SELECT disposition,baseline_content_hash
+            SELECT *
             FROM human_dispositions
             WHERE property_id=? AND active=1
             ORDER BY decided_at DESC,disposition_id DESC LIMIT 1
@@ -534,6 +629,105 @@ class IntelligenceStore:
             (property_id,),
         ).fetchone()
         return row
+
+    def watch_evidence_states(
+        self, property_id: str, evidence_ids: tuple[str, ...]
+    ) -> dict[str, str]:
+        if not evidence_ids:
+            return {}
+        rows = self.connection.execute(
+            f"""
+            SELECT evidence_id,property_id,freshness_status
+            FROM evidence_items
+            WHERE evidence_id IN ({','.join('?' for _ in evidence_ids)})
+            """,
+            evidence_ids,
+        ).fetchall()
+        states: dict[str, str] = {}
+        signal_rows = self.connection.execute(
+            """
+            SELECT status,confirmation_status,evidence_ids_json
+            FROM property_signals WHERE property_id=?
+            """,
+            (property_id,),
+        ).fetchall()
+        signal_by_evidence: dict[str, tuple[str, str]] = {}
+        for signal in signal_rows:
+            for evidence_id in json.loads(signal["evidence_ids_json"]):
+                signal_by_evidence[evidence_id] = (
+                    str(signal["status"]),
+                    str(signal["confirmation_status"]),
+                )
+        for row in rows:
+            if row["property_id"] != property_id:
+                continue
+            signal_state = signal_by_evidence.get(str(row["evidence_id"]))
+            if signal_state and signal_state[0] == "resolved":
+                state = "resolved"
+            elif signal_state and signal_state[1] != "confirmed":
+                state = "last_known"
+            elif row["freshness_status"] == "stale":
+                state = "stale"
+            else:
+                state = "current"
+            states[str(row["evidence_id"])] = state
+        return states
+
+    def validate_watch_specification(
+        self,
+        property_id: str,
+        specification: WatchSpecification | None,
+        *,
+        created_at: str,
+        preserve_existing_during_unavailability: bool = False,
+    ) -> tuple[str, dict[str, str]]:
+        evidence_states = self.watch_evidence_states(
+            property_id, specification.evidence_ids if specification else ()
+        )
+        status = watch_validation_status(
+            specification,
+            created_at=created_at,
+            evidence_states=evidence_states,
+        )
+        if (
+            status == "invalid_watch"
+            and preserve_existing_during_unavailability
+            and specification is not None
+            and set(specification.evidence_ids) == set(evidence_states)
+            and set(evidence_states.values()) <= {"current", "last_known", "stale"}
+        ):
+            try:
+                specification.validate_structure(created_at=created_at)
+            except ValueError:
+                pass
+            else:
+                status = "valid"
+        if status != "valid" or specification is None:
+            return status, evidence_states
+        evidence_rows = self.connection.execute(
+            f"""
+            SELECT evidence_id,field_name,source_name FROM evidence_items
+            WHERE evidence_id IN (
+                {','.join('?' for _ in specification.evidence_ids)}
+            )
+            """,
+            specification.evidence_ids,
+        ).fetchall()
+        event = specification.evidence_event_trigger or {}
+        event_source = event.get("source_name")
+        required_fields = {
+            "listing_price_reduction": {"matrix_listing", "list_price"},
+            "municipal_status_change": {"municipal_code_case"},
+        }.get(specification.trigger_type)
+        if event_source and not any(
+            row["source_name"] == event_source for row in evidence_rows
+        ):
+            status = "invalid_watch"
+        if required_fields and not any(
+            row["field_name"] in required_fields for row in evidence_rows
+        ):
+            status = "invalid_watch"
+        return status, evidence_states
 
     def record_outcome(
         self,

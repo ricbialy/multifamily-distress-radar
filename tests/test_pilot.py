@@ -221,6 +221,7 @@ class PilotTests(unittest.TestCase):
             "source_health_warnings.json",
             "evidence_state.json",
             "human_dispositions.json",
+            "watch_trigger_events.json",
             "change_summary.json",
             "opportunity_changes.json",
         }

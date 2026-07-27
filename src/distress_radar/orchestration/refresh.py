@@ -21,6 +21,7 @@ from distress_radar.identity.address_validation import (
 from distress_radar.identity.folio_resolver import normalize_folio
 from distress_radar.models import PropertyRecord
 from distress_radar.recommendations.features import (
+    InvestmentCriteria,
     RecommendationFeatures,
     acquisition_attractiveness,
     calculate_evidence_scores,
@@ -115,6 +116,7 @@ def run_fixture_demo(
     output_dir: Path,
     generated_at: str,
     property_records: tuple[PropertyRecord, ...] = (),
+    investment_criteria: InvestmentCriteria | None = None,
 ) -> FixtureDemoResult:
     listings = MatrixCsvImporter().import_file(matrix_path, fetched_at=generated_at)
     off_market_candidates = OffMarketCsvImporter().import_file(
@@ -226,6 +228,7 @@ def run_fixture_demo(
             official_records=official_records,
             tax_records=tax_records,
             missing_fields=missing_data,
+            investment_criteria=investment_criteria,
         )
         scores = score_result.dimensions
         features = RecommendationFeatures(

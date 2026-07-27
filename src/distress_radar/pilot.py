@@ -34,15 +34,20 @@ from distress_radar.municipal_severity import (
     severity_from_mapping,
 )
 from distress_radar.recommendations.features import (
+    InvestmentCriteria,
     RecommendationFeatures,
     ScoreDimensions,
     acquisition_attractiveness,
     acquisition_attractiveness_breakdown,
     calculate_evidence_scores,
+    is_acquisition_qualified,
     municipal_review_urgency,
 )
 from distress_radar.recommendations.rule_engine import recommend
 from distress_radar.sources.base import CoverageState, SourceHealthState
+from distress_radar.watch_semantics import (
+    watch_specification_from_mapping,
+)
 from distress_radar.sources.mls.matrix_csv import MatrixCsvImporter
 from distress_radar.tax_import import import_tax_csv, is_unpaid_status
 from distress_radar.underwriting.commercial_multifamily import (
@@ -113,7 +118,7 @@ def _migrate_pilot(store: IntelligenceStore) -> None:
             run_id TEXT PRIMARY KEY, input_filename TEXT NOT NULL,
             input_sha256 TEXT NOT NULL, municipality TEXT NOT NULL,
             started_at TEXT NOT NULL, completed_at TEXT, status TEXT NOT NULL,
-            source_commit_sha TEXT
+            source_commit_sha TEXT, investment_criteria_json TEXT
         );
         CREATE TABLE IF NOT EXISTS import_ledger (
             run_id TEXT NOT NULL REFERENCES pilot_runs(run_id),
@@ -145,6 +150,10 @@ def _migrate_pilot(store: IntelligenceStore) -> None:
     if "source_commit_sha" not in pilot_run_columns:
         store.connection.execute(
             "ALTER TABLE pilot_runs ADD COLUMN source_commit_sha TEXT"
+        )
+    if "investment_criteria_json" not in pilot_run_columns:
+        store.connection.execute(
+            "ALTER TABLE pilot_runs ADD COLUMN investment_criteria_json TEXT"
         )
     recommendation_columns = {
         row["name"]
@@ -483,8 +492,16 @@ def _apply_disposition_action(
     serious_municipal: bool,
     underwriting_complete: bool,
     broker_contact_available: bool = False,
+    watch_status: str | None = None,
+    watch_triggered_action: str | None = None,
 ) -> str:
-    if not disposition or baseline_content_hash != current_content_hash:
+    if not disposition:
+        return default_action
+    if disposition == "watch":
+        if watch_status != "valid":
+            return "manual_triage"
+        return watch_triggered_action or "watch"
+    if baseline_content_hash != current_content_hash:
         return default_action
     if disposition == "approved_for_contact" and (
         not identity_verified
@@ -505,6 +522,242 @@ def _apply_disposition_action(
             else "contact_owner"
         ),
     }.get(disposition, default_action)
+
+
+def _evaluate_watch(
+    store: IntelligenceStore,
+    *,
+    row: Any,
+    property_id: str,
+    current_content_hash: str,
+    generated_at: str,
+    pilot_run_id: str,
+) -> tuple[str, str | None, dict[str, str]]:
+    specification = watch_specification_from_mapping(row)
+    status, evidence_states = store.validate_watch_specification(
+        property_id,
+        specification,
+        created_at=str(row["decided_at"]),
+        preserve_existing_during_unavailability=(
+            row["watch_validation_status"] == "valid"
+        ),
+    )
+    if status != "valid" or specification is None:
+        return status, None, evidence_states
+
+    def source_field_transition(
+        source_name: str, field_name: str
+    ) -> tuple[list[Any], list[Any]] | None:
+        current_source = store.connection.execute(
+            """
+            SELECT state FROM source_runs
+            WHERE pilot_run_id=? AND source_name=?
+            ORDER BY started_at DESC,run_id DESC LIMIT 1
+            """,
+            (pilot_run_id, source_name),
+        ).fetchone()
+        if (
+            not current_source
+            or current_source["state"] != SourceHealthState.HEALTHY.value
+        ):
+            return None
+        current_rows = store.connection.execute(
+            """
+            SELECT source_record_id,value_json FROM evidence_items
+            WHERE property_id=? AND source_name=? AND field_name=?
+              AND pilot_run_id=?
+            ORDER BY source_record_id,evidence_id
+            """,
+            (property_id, source_name, field_name, pilot_run_id),
+        ).fetchall()
+        previous_run_id = store.connection.execute(
+            """
+            SELECT pilot_run_id FROM source_runs
+            WHERE source_name=? AND state=? AND pilot_run_id IS NOT NULL
+              AND pilot_run_id<>?
+            ORDER BY started_at DESC,run_id DESC LIMIT 1
+            """,
+            (
+                source_name,
+                SourceHealthState.HEALTHY.value,
+                pilot_run_id,
+            ),
+        ).fetchone()
+        if previous_run_id is None:
+            return None
+        previous_rows = store.connection.execute(
+            """
+            SELECT source_record_id,value_json FROM evidence_items
+            WHERE property_id=? AND source_name=? AND field_name=?
+              AND pilot_run_id=?
+            ORDER BY source_record_id,evidence_id
+            """,
+            (
+                property_id,
+                source_name,
+                field_name,
+                previous_run_id["pilot_run_id"],
+            ),
+        ).fetchall()
+        current_values = [
+            (row["source_record_id"], json.loads(row["value_json"]))
+            for row in current_rows
+        ]
+        previous_values = [
+            (row["source_record_id"], json.loads(row["value_json"]))
+            for row in previous_rows
+        ]
+        return previous_values, current_values
+
+    event_payload: dict[str, Any] | None = None
+    if specification.trigger_type == "scheduled_recheck":
+        now = datetime.fromisoformat(generated_at.replace("Z", "+00:00"))
+        due = datetime.fromisoformat(
+            str(specification.recheck_at).replace("Z", "+00:00")
+        )
+        if now >= due:
+            event_payload = {
+                "trigger_type": specification.trigger_type,
+                "recheck_at": specification.recheck_at,
+            }
+    else:
+        event = specification.evidence_event_trigger or {}
+        source_name = str(event["source_name"])
+        if specification.trigger_type == "listing_price_reduction":
+            price_change = store.connection.execute(
+                """
+                SELECT lc.before_json,lc.after_json
+                FROM listing_changes lc
+                JOIN listing_snapshots ls ON ls.mls_number=lc.mls_number
+                WHERE ls.property_id=? AND lc.change_type='price_change'
+                  AND lc.detected_at=?
+                ORDER BY lc.change_id DESC LIMIT 1
+                """,
+                (property_id, generated_at),
+            ).fetchone()
+            if (
+                price_change
+                and json.loads(price_change["before_json"])
+                > json.loads(price_change["after_json"])
+            ):
+                event_payload = {
+                    "trigger_type": specification.trigger_type,
+                    "source_name": source_name,
+                    "before": json.loads(price_change["before_json"]),
+                    "after": json.loads(price_change["after_json"]),
+                }
+        elif specification.trigger_type == "new_record":
+            watched_signal_type = event.get("signal_type")
+            signal = store.connection.execute(
+                """
+                SELECT s.signal_id,s.signal_type
+                FROM signal_observations o
+                JOIN property_signals s ON s.signal_id=o.signal_id
+                WHERE s.property_id=? AND s.source_name=? AND o.pilot_run_id=?
+                  AND o.status='active' AND s.status='active'
+                  AND s.confirmation_status='confirmed'
+                  AND (? IS NULL OR s.signal_type=?)
+                ORDER BY s.signal_id LIMIT 1
+                """,
+                (
+                    property_id,
+                    source_name,
+                    pilot_run_id,
+                    watched_signal_type,
+                    watched_signal_type,
+                ),
+            ).fetchone()
+            if signal:
+                event_payload = {
+                    "trigger_type": specification.trigger_type,
+                    "source_name": source_name,
+                    "signal_id": signal["signal_id"],
+                    "signal_type": signal["signal_type"],
+                }
+        elif specification.trigger_type == "source_recovery":
+            current = store.connection.execute(
+                """
+                SELECT state FROM source_runs
+                WHERE pilot_run_id=? AND source_name=?
+                ORDER BY started_at DESC,run_id DESC LIMIT 1
+                """,
+                (pilot_run_id, source_name),
+            ).fetchone()
+            previous = store.connection.execute(
+                """
+                SELECT state FROM source_runs
+                WHERE pilot_run_id<>? AND source_name=?
+                ORDER BY started_at DESC,run_id DESC LIMIT 1
+                """,
+                (pilot_run_id, source_name),
+            ).fetchone()
+            if (
+                current
+                and current["state"] == SourceHealthState.HEALTHY.value
+                and previous
+                and previous["state"] != SourceHealthState.HEALTHY.value
+            ):
+                event_payload = {
+                    "trigger_type": specification.trigger_type,
+                    "source_name": source_name,
+                    "from_state": previous["state"],
+                    "to_state": current["state"],
+                }
+        elif specification.trigger_type in {
+            "material_evidence_change",
+            "municipal_status_change",
+        }:
+            evidence_class = str(event["evidence_class"])
+            transition = source_field_transition(source_name, evidence_class)
+            if transition is not None:
+                before, after = transition
+                if specification.trigger_type == "municipal_status_change":
+                    before = [
+                        (identity, value.get("status"))
+                        for identity, value in before
+                        if isinstance(value, dict)
+                    ]
+                    after = [
+                        (identity, value.get("status"))
+                        for identity, value in after
+                        if isinstance(value, dict)
+                    ]
+                if before != after:
+                    event_payload = {
+                        "trigger_type": specification.trigger_type,
+                        "source_name": source_name,
+                        "evidence_class": evidence_class,
+                        "before": before,
+                        "after": after,
+                    }
+
+    if event_payload is None:
+        return status, None, evidence_states
+    fingerprint = hashlib.sha256(_json(event_payload).encode()).hexdigest()
+    inserted = store.connection.execute(
+        """
+        INSERT OR IGNORE INTO watch_trigger_events (
+            trigger_event_id,disposition_id,property_id,trigger_fingerprint,
+            triggered_at,trigger_payload_json
+        ) VALUES (?,?,?,?,?,?)
+        """,
+        (
+            str(uuid4()),
+            row["disposition_id"],
+            property_id,
+            fingerprint,
+            generated_at,
+            _json(event_payload),
+        ),
+    ).rowcount
+    if inserted:
+        store.connection.execute(
+            "UPDATE human_dispositions SET active=0 WHERE disposition_id=?",
+            (row["disposition_id"],),
+        )
+        store.connection.commit()
+        return status, specification.expected_next_action, evidence_states
+    return status, None, evidence_states
 
 
 def _case_detail_is_substantive(original: CodeCase, enriched: CodeCase) -> bool:
@@ -1119,7 +1372,11 @@ def _persist_off_market(
 
 
 def _persist_underwriting_and_recommendations(
-    store: IntelligenceStore, *, generated_at: str, pilot_run_id: str
+    store: IntelligenceStore,
+    *,
+    generated_at: str,
+    pilot_run_id: str,
+    investment_criteria: InvestmentCriteria | None,
 ) -> None:
     for prop in _canonical_properties(store):
         property_id = prop.property_id
@@ -1355,6 +1612,7 @@ def _persist_underwriting_and_recommendations(
             official_records=official_records,
             tax_records=tax_records,
             missing_fields=missing,
+            investment_criteria=investment_criteria,
         )
         scores = score_result.dimensions
         channels = tuple(
@@ -1488,15 +1746,43 @@ def _persist_underwriting_and_recommendations(
             else tax_records
         )
         stable_payload = {
+            "scoring_semantics_version": "real-pilot-02c",
             "property_id": property_id,
             "listing": listing,
             "county": county,
             "municipal": material_municipal,
             "official_records": material_official,
             "tax_records": material_tax,
+            "investment_criteria": (
+                {
+                    "unit": "decimal_rate",
+                    "minimum_acceptable_cap_rate": (
+                        investment_criteria.minimum_acceptable_cap_rate
+                    ),
+                    "target_cap_rate": investment_criteria.target_cap_rate,
+                }
+                if investment_criteria is not None
+                else {"state": "criteria_not_configured"}
+            ),
         }
         content_hash = _material_content_hash(stable_payload)
         disposition_row = store.active_disposition(property_id)
+        watch_status: str | None = None
+        watch_triggered_action: str | None = None
+        watch_evidence_states: dict[str, str] = {}
+        if disposition_row and disposition_row["disposition"] == "watch":
+            (
+                watch_status,
+                watch_triggered_action,
+                watch_evidence_states,
+            ) = _evaluate_watch(
+                store,
+                row=disposition_row,
+                property_id=property_id,
+                current_content_hash=content_hash,
+                generated_at=generated_at,
+                pilot_run_id=pilot_run_id,
+            )
         action = _apply_disposition_action(
             disposition=(
                 str(disposition_row["disposition"]) if disposition_row else None
@@ -1514,6 +1800,8 @@ def _persist_underwriting_and_recommendations(
             serious_municipal=serious_municipal,
             underwriting_complete=underwriting.status == "complete",
             broker_contact_available=False,
+            watch_status=watch_status,
+            watch_triggered_action=watch_triggered_action,
         )
 
         evidence_rows = store.connection.execute(
@@ -1568,6 +1856,10 @@ def _persist_underwriting_and_recommendations(
             action_ids = motivation_ids
         elif action in {"insufficient_data", "manual_triage"}:
             action_ids = diligence_evidence_ids
+        elif action == "watch" and disposition_row:
+            action_ids = tuple(
+                json.loads(disposition_row["watch_evidence_ids_json"] or "[]")
+            )
         elif action == "reject":
             action_ids = by_field["matrix_listing"]
         else:
@@ -1600,6 +1892,7 @@ def _persist_underwriting_and_recommendations(
                 "dismiss": "A hash-bound analyst dismissal remains effective.",
                 "contact_owner": "A hash-bound approval and all hard gates permit contact.",
                 "contact_broker": "A hash-bound approval and all hard gates permit contact.",
+                "watch": "A current validated watch has bounded evidence and recheck semantics.",
             }.get(action, "No action-specific support is defined."),
             "missing_information": missing,
             "next_step": {
@@ -1616,10 +1909,25 @@ def _persist_underwriting_and_recommendations(
                 "dismiss": "Take no action while the reviewed content hash is unchanged.",
                 "contact_owner": "Human may initiate the approved contact.",
                 "contact_broker": "Human may initiate the approved contact.",
+                "watch": "Wait for the persisted date or bounded evidence event, then perform the named next action.",
             }.get(action, "Do not act."),
             "completion_or_revisit_condition": (
-                "Complete when the named evidence is obtained; revisit on a material "
-                "source-evidence hash change or hard-gate change."
+                (
+                    "Reconsider when "
+                    + (
+                        disposition_row["watch_recheck_at"]
+                        if disposition_row["watch_recheck_at"]
+                        else disposition_row["watch_recheck_condition_json"]
+                    )
+                    + "; then "
+                    + disposition_row["watch_expected_next_action"]
+                    + "."
+                )
+                if action == "watch" and disposition_row
+                else (
+                    "Complete when the named evidence is obtained; revisit on a material "
+                    "source-evidence hash change or hard-gate change."
+                )
             ),
         }
         explanation = {
@@ -1650,13 +1958,13 @@ def _persist_underwriting_and_recommendations(
             "identity_verified": identity_verified,
             "in_scope": in_scope,
             "acquisition_qualified": bool(
-                in_scope
-                and identity_verified
-                and score_result.metrics.get("economics_status") != "demonstrably_bad"
-                and (
-                    (scores.economics is not None and scores.economics > 0)
-                    or scores.market_pressure > 0
-                    or scores.owner_motivation > 0
+                is_acquisition_qualified(
+                    scores,
+                    economics_status=str(
+                        score_result.metrics.get("economics_status")
+                    ),
+                    in_scope=in_scope,
+                    identity_verified=identity_verified,
                 )
             ),
             "underwriting_status": underwriting.status,
@@ -1676,6 +1984,36 @@ def _persist_underwriting_and_recommendations(
                 ),
             },
             "action_support": action_support,
+            "watch_semantics": (
+                {
+                    "validation_status": watch_status,
+                    "watch_reason": disposition_row["watch_reason"],
+                    "evidence_ids": json.loads(
+                        disposition_row["watch_evidence_ids_json"] or "[]"
+                    ),
+                    "evidence_states": watch_evidence_states,
+                    "trigger_type": disposition_row["watch_trigger_type"],
+                    "recheck_condition": json.loads(
+                        disposition_row["watch_recheck_condition_json"] or "{}"
+                    ),
+                    "recheck_at": disposition_row["watch_recheck_at"],
+                    "evidence_event_trigger": (
+                        json.loads(disposition_row["watch_event_trigger_json"])
+                        if disposition_row["watch_event_trigger_json"]
+                        else None
+                    ),
+                    "expected_next_action": disposition_row[
+                        "watch_expected_next_action"
+                    ],
+                    "creator": disposition_row["creator"],
+                    "reviewed_content_hash": disposition_row[
+                        "baseline_content_hash"
+                    ],
+                    "triggered_action": watch_triggered_action,
+                }
+                if disposition_row and disposition_row["disposition"] == "watch"
+                else None
+            ),
             "offer_gate": {
                 "status": "not_available",
                 "reason": "insufficient_property_specific_underwriting_data",
@@ -1751,6 +2089,7 @@ def _database_counts(store: IntelligenceStore) -> dict[str, int]:
         "recommendations",
         "opportunity_alerts",
         "human_dispositions",
+        "watch_trigger_events",
     )
     return {
         table: store.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
@@ -2034,6 +2373,7 @@ def _report_records(store: IntelligenceStore) -> list[dict[str, Any]]:
                 "municipal_evidence_state": explanation.get("municipal_evidence_state")
                 or {},
                 "action_support": explanation.get("action_support") or {},
+                "watch_semantics": explanation.get("watch_semantics"),
                 "source_links": source_links,
             }
         )
@@ -2444,6 +2784,30 @@ def _write_reports(
         if not matching:
             brief_lines.append("- None.")
         brief_lines.append("")
+    brief_lines.append("## Validated watch workflows")
+    watched = [
+        item for item in recommendations if item.get("watch_semantics")
+    ]
+    for item in watched:
+        watch = item["watch_semantics"]
+        trigger = (
+            f"at {watch['recheck_at']}"
+            if watch.get("recheck_at")
+            else _json(watch.get("evidence_event_trigger"))
+        )
+        evidence_states = ", ".join(
+            f"{key}={value}"
+            for key, value in watch["evidence_states"].items()
+        )
+        brief_lines.append(
+            f"- {item['address']}: {watch['validation_status']} — "
+            f"{watch['watch_reason']}; evidence {evidence_states}; "
+            f"recheck {trigger}; then {watch['expected_next_action']}. "
+            f"Unknowns: {', '.join(item['missing_data']) or 'none recorded'}."
+        )
+    if not watched:
+        brief_lines.append("- None.")
+    brief_lines.append("")
     brief_lines.append("## Source failures and stale data")
     warnings = [
         row
@@ -2514,8 +2878,31 @@ def _write_reports(
                 dict(row)
                 for row in store.connection.execute(
                     """
-                    SELECT * FROM human_dispositions
+                    SELECT *,
+                      CASE
+                        WHEN disposition='watch' AND watch_validation_status IS NULL
+                          THEN 'legacy_incomplete_watch'
+                        ELSE watch_validation_status
+                      END AS effective_watch_validation_status
+                    FROM human_dispositions
                     ORDER BY property_id,decided_at,disposition_id
+                    """
+                ).fetchall()
+            ],
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    watch_triggers_path = output_dir / "watch_trigger_events.json"
+    watch_triggers_path.write_text(
+        json.dumps(
+            [
+                dict(row)
+                for row in store.connection.execute(
+                    """
+                    SELECT * FROM watch_trigger_events
+                    ORDER BY triggered_at,trigger_event_id
                     """
                 ).fetchall()
             ],
@@ -2674,6 +3061,7 @@ def _write_reports(
         source_warnings_path,
         evidence_state_path,
         dispositions_path,
+        watch_triggers_path,
         change_summary_path,
         opportunity_changes_path,
         trace_json,
@@ -2694,6 +3082,7 @@ def run_pilot(
     tax_collector: Any | None = None,
     source_commit_sha: str | None = None,
     simulate_source_failure: bool = False,
+    investment_criteria: InvestmentCriteria | None = None,
 ) -> PilotRunResult:
     if not matrix_path.is_file():
         raise FileNotFoundError(matrix_path)
@@ -2713,12 +3102,13 @@ def run_pilot(
     run_id = str(uuid4())
     with IntelligenceStore(database_path) as store:
         _migrate_pilot(store)
+        store.current_pilot_run_id = run_id
         store.connection.execute(
             """
             INSERT INTO pilot_runs (
                 run_id,input_filename,input_sha256,municipality,started_at,status,
-                source_commit_sha
-            ) VALUES (?,?,?,?,?,'running',?)
+                source_commit_sha,investment_criteria_json
+            ) VALUES (?,?,?,?,?,'running',?,?)
             """,
             (
                 run_id,
@@ -2729,6 +3119,23 @@ def run_pilot(
                 source_commit_sha
                 or os.environ.get("RADAR_SOURCE_COMMIT")
                 or "uncommitted",
+                _json(
+                    {
+                        "state": "configured",
+                        "unit": "decimal_rate",
+                        "minimum_acceptable_cap_rate": (
+                            investment_criteria.minimum_acceptable_cap_rate
+                        ),
+                        "target_cap_rate": investment_criteria.target_cap_rate,
+                    }
+                    if investment_criteria is not None
+                    else {
+                        "state": "criteria_not_configured",
+                        "unit": "decimal_rate",
+                        "minimum_acceptable_cap_rate": None,
+                        "target_cap_rate": None,
+                    }
+                ),
             ),
         )
         store.connection.executemany(
@@ -3213,7 +3620,10 @@ def run_pilot(
             observed_at=generated_at,
         )
         _persist_underwriting_and_recommendations(
-            store, generated_at=generated_at, pilot_run_id=run_id
+            store,
+            generated_at=generated_at,
+            pilot_run_id=run_id,
+            investment_criteria=investment_criteria,
         )
         store.connection.execute(
             """

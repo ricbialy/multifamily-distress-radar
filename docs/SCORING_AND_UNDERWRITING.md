@@ -2,12 +2,14 @@
 
 ## Score dimensions
 
-Scores are retained independently on a 0–100 scale:
+Scores are retained independently on a 0–100 scale, except demonstrably bad
+economics may be negative:
 
-- Owner motivation: explicit delinquency, lis pendens, recorded liens, long
-  ownership, absentee ownership, and inactive entity signals.
-- Economics: current/stabilized NOI relative to evidence-backed value or list
-  price in the fixture baseline.
+- Owner motivation: objective unresolved Clerk or unpaid-tax evidence. Long
+  ownership and absentee ownership remain unscored screening context.
+- Economics: supported NOI relative to current asking price and explicit
+  decimal-rate criteria. Price per unit can refine a supported state but cannot
+  override below-minimum income performance.
 - MLS market pressure: DOM/CDOM, motivated-language, expired/withdrawn status,
   and material snapshot changes.
 - Property risk: liens, code escalation, and unsafe-structure evidence.
@@ -18,6 +20,13 @@ Scores are retained independently on a 0–100 scale:
 Unknown fields do not create positive “clean” signals. High property risk can
 produce `reject_high_risk` or a human/municipal review action even when owner
 motivation is high.
+
+Economics states order as `supported_good > supported_neutral > unknown >
+demonstrably_bad`. Unknown economics is omitted from the acquisition-score
+denominator. Missing expenses, missing asking price, unsupported broker
+cap-rate claims, or unconfigured investment criteria remain unknown. NOI at or
+below zero and a supported cap rate below the configured minimum are
+demonstrably bad.
 
 ## Two-to-four units
 
