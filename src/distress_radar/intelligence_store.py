@@ -23,6 +23,16 @@ from distress_radar.watch_semantics import (
     validate_watch,
 )
 
+_AUTHORITATIVE_ABSENCE_EVIDENCE = {
+    ("miami_dade_property_point_view", "validated_address"),
+    ("miami_dade_property_point_view", "public_property_record"),
+}
+_UNKNOWN_COVERAGE_STATES = {
+    CoverageState.UNKNOWN_FAILED.value,
+    CoverageState.UNKNOWN_NOT_RUN.value,
+    CoverageState.UNKNOWN_STALE.value,
+}
+
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat()
@@ -198,7 +208,8 @@ class IntelligenceStore:
                 mls_number TEXT NOT NULL, source_name TEXT NOT NULL,
                 fetched_at TEXT NOT NULL, status TEXT, list_price REAL,
                 dom INTEGER, cdom INTEGER, normalized_json TEXT NOT NULL,
-                raw_payload_json TEXT NOT NULL,
+                raw_payload_json TEXT NOT NULL, pilot_run_id TEXT,
+                last_observed_pilot_run_id TEXT,
                 UNIQUE(mls_number, source_name, fetched_at)
             );
             CREATE TABLE IF NOT EXISTS listing_changes (
@@ -237,6 +248,17 @@ class IntelligenceStore:
             self.connection.execute(
                 "ALTER TABLE evidence_items ADD COLUMN pilot_run_id TEXT"
             )
+        listing_columns = {
+            row["name"]
+            for row in self.connection.execute(
+                "PRAGMA table_info(listing_snapshots)"
+            )
+        }
+        for column in ("pilot_run_id", "last_observed_pilot_run_id"):
+            if column not in listing_columns:
+                self.connection.execute(
+                    f"ALTER TABLE listing_snapshots ADD COLUMN {column} TEXT"
+                )
         self.connection.execute(
             """
             INSERT OR IGNORE INTO signal_evidence_links (
@@ -457,14 +479,19 @@ class IntelligenceStore:
         return [dict(row) for row in rows]
 
     def save_listing_snapshot(
-        self, snapshot: ListingSnapshot, property_id: str | None = None
+        self,
+        snapshot: ListingSnapshot,
+        property_id: str | None = None,
+        *,
+        pilot_run_id: str | None = None,
     ) -> tuple[ListingChange, ...]:
+        effective_pilot_run_id = pilot_run_id or self.current_pilot_run_id
         previous_row = self.connection.execute(
             """
-            SELECT fetched_at,normalized_json,raw_payload_json
+            SELECT snapshot_id,fetched_at,normalized_json,raw_payload_json
             FROM listing_snapshots
             WHERE mls_number=? AND source_name=?
-            ORDER BY fetched_at DESC LIMIT 1
+            ORDER BY rowid DESC LIMIT 1
             """,
             (snapshot.source_record_id, snapshot.source_name),
         ).fetchone()
@@ -476,23 +503,29 @@ class IntelligenceStore:
                 raw_payload=json.loads(previous_row["raw_payload_json"]),
             )
         if previous is not None and previous.stable_dict() == snapshot.stable_dict():
-            if property_id is not None:
-                self.connection.execute(
-                    """
-                    UPDATE listing_snapshots SET property_id=?
-                    WHERE mls_number=? AND source_name=?
-                    """,
-                    (property_id, snapshot.source_record_id, snapshot.source_name),
-                )
-                self.connection.commit()
+            self.connection.execute(
+                """
+                UPDATE listing_snapshots
+                SET property_id=COALESCE(?,property_id),
+                    last_observed_pilot_run_id=?
+                WHERE snapshot_id=?
+                """,
+                (
+                    property_id,
+                    effective_pilot_run_id,
+                    previous_row["snapshot_id"],
+                ),
+            )
+            self.connection.commit()
             return ()
         changes = detect_listing_changes(previous, snapshot)
         self.connection.execute(
             """
             INSERT INTO listing_snapshots (
                 snapshot_id,property_id,mls_number,source_name,fetched_at,
-                status,list_price,dom,cdom,normalized_json,raw_payload_json
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                status,list_price,dom,cdom,normalized_json,raw_payload_json,
+                pilot_run_id,last_observed_pilot_run_id
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 str(uuid4()),
@@ -506,6 +539,8 @@ class IntelligenceStore:
                 snapshot.cdom,
                 json.dumps(snapshot.stable_dict(), sort_keys=True),
                 json.dumps(snapshot.raw_payload, sort_keys=True),
+                effective_pilot_run_id,
+                effective_pilot_run_id,
             ),
         )
         self.connection.executemany(
@@ -647,9 +682,12 @@ class IntelligenceStore:
         if disposition == "watch":
             pilot_run = self.connection.execute(
                 """
-                SELECT pilot_run_id FROM recommendations
-                WHERE property_id=? AND content_hash=? AND pilot_run_id IS NOT NULL
-                ORDER BY generated_at DESC,recommendation_id DESC LIMIT 1
+                SELECT r.pilot_run_id
+                FROM recommendations r
+                JOIN pilot_runs p ON p.run_id=r.pilot_run_id
+                WHERE r.property_id=? AND r.content_hash=?
+                  AND r.pilot_run_id IS NOT NULL
+                ORDER BY p.rowid DESC,r.rowid DESC LIMIT 1
                 """,
                 (property_id, baseline_content_hash),
             ).fetchone()
@@ -702,7 +740,8 @@ class IntelligenceStore:
             return {}
         rows = self.connection.execute(
             f"""
-            SELECT evidence_id,property_id,field_name,source_name,freshness_status
+            SELECT evidence_id,property_id,field_name,source_name,
+                   source_record_id,freshness_status
             FROM evidence_items
             WHERE evidence_id IN ({','.join('?' for _ in evidence_ids)})
             """,
@@ -764,6 +803,81 @@ class IntelligenceStore:
                 for classes in SIGNAL_EVIDENCE_CLASSES.values()
             ):
                 state = "incompatible"
+            elif (
+                str(row["source_name"]),
+                str(row["field_name"]),
+            ) in _AUTHORITATIVE_ABSENCE_EVIDENCE:
+                coverage = self.connection.execute(
+                    """
+                    SELECT c.state,s.pilot_run_id
+                    FROM property_source_coverage c
+                    LEFT JOIN source_runs s ON s.run_id=c.run_id
+                    WHERE c.property_id=? AND c.source_name=?
+                    """,
+                    (property_id, row["source_name"]),
+                ).fetchone()
+                coverage_is_current = bool(
+                    coverage
+                    and pilot_run_id
+                    and coverage["pilot_run_id"] == pilot_run_id
+                )
+                if not coverage_is_current:
+                    state = "last_known"
+                elif coverage["state"] in _UNKNOWN_COVERAGE_STATES:
+                    previous = self.connection.execute(
+                        """
+                        SELECT r.explanation_json
+                        FROM recommendations r
+                        JOIN pilot_runs p ON p.run_id=r.pilot_run_id
+                        WHERE r.property_id=?
+                        ORDER BY p.rowid DESC,r.rowid DESC
+                        LIMIT 1
+                        """,
+                        (property_id,),
+                    ).fetchone()
+                    previous_explanation = (
+                        json.loads(previous["explanation_json"]) if previous else {}
+                    )
+                    previous_county_state = previous_explanation.get(
+                        "county_identity_material_state"
+                    )
+                    if previous_county_state is None:
+                        legacy_state = previous_explanation.get(
+                            "county_identity_evidence_state"
+                        )
+                        if legacy_state in {
+                            CoverageState.CONFIRMED_PRESENT.value,
+                            CoverageState.CONFIRMED_ABSENT.value,
+                        }:
+                            previous_county_state = legacy_state
+                    state = (
+                        "resolved"
+                        if previous_county_state
+                        == CoverageState.CONFIRMED_ABSENT.value
+                        else "last_known"
+                    )
+                elif coverage["state"] == CoverageState.CONFIRMED_ABSENT.value:
+                    state = "resolved"
+                elif coverage["state"] == CoverageState.CONFIRMED_PRESENT.value:
+                    reconfirmed = self.connection.execute(
+                        """
+                        SELECT 1 FROM evidence_items
+                        WHERE property_id=? AND source_name=? AND field_name=?
+                          AND source_record_id=? AND pilot_run_id=?
+                          AND value_type!='unknown'
+                        LIMIT 1
+                        """,
+                        (
+                            property_id,
+                            row["source_name"],
+                            row["field_name"],
+                            row["source_record_id"],
+                            pilot_run_id,
+                        ),
+                    ).fetchone()
+                    state = "current" if reconfirmed else "last_known"
+                else:
+                    state = "incompatible"
             elif row["freshness_status"] == "stale":
                 state = "stale"
             else:
@@ -847,9 +961,11 @@ class IntelligenceStore:
         if effective_run_id is None:
             latest = self.connection.execute(
                 """
-                SELECT pilot_run_id FROM recommendations
-                WHERE property_id=? AND pilot_run_id IS NOT NULL
-                ORDER BY generated_at DESC,recommendation_id DESC LIMIT 1
+                SELECT r.pilot_run_id
+                FROM recommendations r
+                JOIN pilot_runs p ON p.run_id=r.pilot_run_id
+                WHERE r.property_id=? AND r.pilot_run_id IS NOT NULL
+                ORDER BY p.rowid DESC,r.rowid DESC LIMIT 1
                 """,
                 (property_id,),
             ).fetchone()

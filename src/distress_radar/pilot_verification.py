@@ -351,6 +351,42 @@ def _manifests_match_commit(
     )
 
 
+def _manifest_chronology(
+    output_dir: Path,
+) -> dict[str, dict[str, str | bool | None]]:
+    chronology: dict[str, dict[str, str | bool | None]] = {}
+    for directory in AUTHORITATIVE_RUN_DIRECTORIES:
+        manifest = json.loads(
+            (output_dir / directory / "run_manifest.json").read_text()
+        )
+        started_at = manifest.get("started_at")
+        completed_at = manifest.get("completed_at")
+        effective_at = manifest.get("effective_at")
+        try:
+            started = datetime.fromisoformat(str(started_at).replace("Z", "+00:00"))
+            completed = datetime.fromisoformat(
+                str(completed_at).replace("Z", "+00:00")
+            )
+            effective = datetime.fromisoformat(
+                str(effective_at).replace("Z", "+00:00")
+            )
+            valid = bool(
+                started.tzinfo
+                and completed.tzinfo
+                and effective.tzinfo
+                and started <= completed
+            )
+        except ValueError:
+            valid = False
+        chronology[directory] = {
+            "started_at": started_at,
+            "effective_at": effective_at,
+            "completed_at": completed_at,
+            "valid": valid,
+        }
+    return chronology
+
+
 def verify_real_pilot(
     *,
     matrix_path: Path,
@@ -788,6 +824,10 @@ def verify_real_pilot(
     manifests_match_commit = _manifests_match_commit(
         manifest_commit_shas, source_commit_sha
     )
+    manifest_chronology = _manifest_chronology(output_dir)
+    manifest_chronology_valid = all(
+        bool(run["valid"]) for run in manifest_chronology.values()
+    )
     gates = (
         GateResult(
             "G0",
@@ -872,11 +912,13 @@ def verify_real_pilot(
             "PASS"
             if {path.name for path in first.output_files} == required_outputs
             and manifests_match_commit
+            and manifest_chronology_valid
             else "FAIL",
             (
                 f"{len(first.output_files)} database-derived files; "
                 f"authoritative_commit={source_commit_sha}; "
-                f"all_manifests_match={manifests_match_commit}"
+                f"all_manifests_match={manifests_match_commit}; "
+                f"chronology_valid={manifest_chronology_valid}"
             ),
         ),
         GateResult(
@@ -942,6 +984,7 @@ def verify_real_pilot(
         "status": status,
         "source_commit_sha": source_commit_sha,
         "manifest_commit_shas": manifest_commit_shas,
+        "manifest_chronology": manifest_chronology,
         "gates": [asdict(gate) for gate in gates],
         "first_run": {
             "run_id": first.run_id,

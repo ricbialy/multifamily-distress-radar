@@ -922,8 +922,24 @@ class QualifiedQueueIntegrationTests(unittest.TestCase):
                     """,
                     (second.run_id,),
                 ).fetchone()[0]
+                county_coverage = connection.execute(
+                    """
+                    SELECT c.state,c.error_message,s.pilot_run_id
+                    FROM property_source_coverage c
+                    JOIN source_runs s ON s.run_id=c.run_id
+                    WHERE c.property_id=(
+                        SELECT property_id FROM canonical_properties
+                        WHERE folio='0400000000002'
+                    )
+                      AND c.source_name='miami_dade_property_point_view'
+                    """
+                ).fetchone()
         self.assertEqual(signal, ("active", "last_known"))
         self.assertEqual(resolutions, 0)
+        self.assertEqual(
+            county_coverage,
+            ("unknown_failed", "inventory unavailable", second.run_id),
+        )
 
     def test_failure_after_resolution_does_not_resurrect_old_material_content(
         self,

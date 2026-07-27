@@ -6,6 +6,7 @@ import sqlite3
 import tempfile
 import unittest
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 
 from test_real_pilot_02 import (
@@ -21,7 +22,7 @@ from test_real_pilot_02b import (
 )
 
 from distress_radar.intelligence_store import IntelligenceStore
-from distress_radar.models import CollectionResult
+from distress_radar.models import CollectionResult, PropertyCollectionResult
 from distress_radar.pilot import run_pilot
 from distress_radar.recommendations.features import (
     InvestmentCriteria,
@@ -29,7 +30,6 @@ from distress_radar.recommendations.features import (
     calculate_evidence_scores,
 )
 from distress_radar.watch_semantics import WatchSpecification
-
 
 CRITERIA = InvestmentCriteria(0.04, 0.06)
 
@@ -87,6 +87,7 @@ def _run(
     *,
     criteria: InvestmentCriteria | None,
     code_collector: object | None = None,
+    property_collector: object | None = None,
 ):
     return run_pilot(
         matrix_path=root / "matrix.csv",
@@ -94,7 +95,7 @@ def _run(
         output_dir=root / output_name,
         municipality="hialeah",
         generated_at=generated_at,
-        property_collector=TargetedPropertyCollector(),
+        property_collector=property_collector or TargetedPropertyCollector(),
         code_collector=code_collector or EmptyCodeCollector(),
         clerk_collector=EmptyClerkCollector(),
         tax_collector=EmptyTaxCollector(),
@@ -127,6 +128,44 @@ class VariableCodeCollector:
             for record in records
         )
         return CollectionResult(enriched, (), ("Notice of Violation",))
+
+
+class VariablePropertyCollector:
+    def __init__(
+        self,
+        state: str,
+        fetched_at: str,
+        *,
+        units: int = 12,
+        owner_name: str = "REMOTE OWNER LLC",
+    ) -> None:
+        base = TargetedPropertyCollector()
+        self.state = state
+        self.matrix = replace(
+            base.matrix,
+            address="100 MAIN ST",
+            fetched_at=fetched_at,
+            unit_count=units,
+            owner_name=owner_name,
+        )
+        self.off_market = replace(base.off_market, fetched_at=fetched_at)
+
+    def lookup_address(self, address: str) -> PropertyCollectionResult:
+        if self.state == "failed":
+            raise RuntimeError("simulated county lookup failure")
+        return PropertyCollectionResult(
+            (self.matrix,) if self.state == "present" else (),
+            (),
+        )
+
+    def lookup_exact_folio(self, folio: str) -> PropertyCollectionResult:
+        return PropertyCollectionResult(
+            (self.matrix,) if self.state == "present" else (),
+            (),
+        )
+
+    def collect(self) -> PropertyCollectionResult:
+        return PropertyCollectionResult((self.matrix, self.off_market), ())
 
 
 class RealPilot02cAcceptanceTests(unittest.TestCase):
@@ -321,7 +360,16 @@ class RealPilot02cAcceptanceTests(unittest.TestCase):
             root = Path(temporary)
             database = root / "pilot.sqlite"
             _matrix(root / "matrix.csv", noi="", expenses="")
-            first = _run(root, database, "first", GENERATED_AT, criteria=CRITERIA)
+            first = _run(
+                root,
+                database,
+                "first",
+                GENERATED_AT,
+                criteria=CRITERIA,
+                property_collector=VariablePropertyCollector(
+                    "present", GENERATED_AT
+                ),
+            )
             with IntelligenceStore(database) as store:
                 row = store.connection.execute(
                     """
@@ -448,6 +496,9 @@ class RealPilot02cAcceptanceTests(unittest.TestCase):
                 "unchanged",
                 "2026-07-24T12:30:00+00:00",
                 criteria=CRITERIA,
+                property_collector=VariablePropertyCollector(
+                    "present", "2026-07-24T12:30:00+00:00"
+                ),
             )
             unchanged = json.loads(
                 (root / "unchanged/recommendations.json").read_text()
@@ -474,6 +525,9 @@ class RealPilot02cAcceptanceTests(unittest.TestCase):
                 "2026-07-24T12:40:00+00:00",
                 criteria=CRITERIA,
                 code_collector=FailedCodeCollector(),
+                property_collector=VariablePropertyCollector(
+                    "present", "2026-07-24T12:40:00+00:00"
+                ),
             )
             unrelated_outage = json.loads(
                 (
@@ -496,6 +550,9 @@ class RealPilot02cAcceptanceTests(unittest.TestCase):
                 "due",
                 "2026-07-24T13:01:00+00:00",
                 criteria=CRITERIA,
+                property_collector=VariablePropertyCollector(
+                    "present", "2026-07-24T13:01:00+00:00"
+                ),
             )
             due = json.loads((root / "due/recommendations.json").read_text())[0]
             self.assertEqual(due["recommended_action"], "manual_triage")
@@ -506,6 +563,9 @@ class RealPilot02cAcceptanceTests(unittest.TestCase):
                 "repeat",
                 "2026-07-24T13:02:00+00:00",
                 criteria=CRITERIA,
+                property_collector=VariablePropertyCollector(
+                    "present", "2026-07-24T13:02:00+00:00"
+                ),
             )
             with sqlite3.connect(database) as connection:
                 self.assertEqual(
@@ -618,7 +678,43 @@ class RealPilot02cAcceptanceTests(unittest.TestCase):
                 failed_record["watch_semantics"]["evidence_states"][evidence_id],
                 "last_known",
             )
+            self.assertEqual(
+                failed_record["county_identity_evidence_state"], "last_known"
+            )
+            self.assertEqual(
+                failed_record["county_identity_coverage_state"],
+                "unknown_not_run",
+            )
+            coverage_row = next(
+                item
+                for item in json.loads(
+                    (root / "failed/source_coverage.json").read_text()
+                )
+                if item["property_id"] == property_id
+                and item["source_name"]
+                == "miami_dade_property_point_view"
+            )
+            self.assertEqual(coverage_row["state"], "unknown_not_run")
+            for path in (
+                root / "failed/recommendations.csv",
+                root / "failed/daily_brief.md",
+            ):
+                self.assertIn("unknown_not_run", path.read_text())
             with sqlite3.connect(database) as connection:
+                persisted_coverage = connection.execute(
+                    """
+                    SELECT c.state,s.pilot_run_id
+                    FROM property_source_coverage c
+                    JOIN source_runs s ON s.run_id=c.run_id
+                    WHERE c.property_id=?
+                      AND c.source_name='miami_dade_property_point_view'
+                    """,
+                    (property_id,),
+                ).fetchone()
+                self.assertEqual(
+                    persisted_coverage,
+                    ("unknown_not_run", failed.run_id),
+                )
                 self.assertEqual(
                     connection.execute(
                         """
@@ -812,6 +908,628 @@ class RealPilot02cAcceptanceTests(unittest.TestCase):
                         (disposition_id, disappeared.run_id),
                     ).fetchone()[0],
                     "invalid_evidence_lifecycle",
+                )
+
+    def test_r12_county_absence_invalidates_non_signal_watch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            database = root / "county-lifecycle.sqlite"
+            _matrix(root / "matrix.csv", noi="", expenses="")
+
+            def county_run(
+                name: str,
+                generated_at: str,
+                state: str,
+                *,
+                units: int = 12,
+                owner_name: str = "REMOTE OWNER LLC",
+                price: int = 1_000_000,
+            ):
+                _matrix(
+                    root / "matrix.csv",
+                    noi="",
+                    expenses="",
+                    price=price,
+                )
+                result = _run(
+                    root,
+                    database,
+                    name,
+                    generated_at,
+                    criteria=CRITERIA,
+                    property_collector=VariablePropertyCollector(
+                        state,
+                        generated_at,
+                        units=units,
+                        owner_name=owner_name,
+                    ),
+                )
+                manifest = json.loads((root / name / "run_manifest.json").read_text())
+                self.assertEqual(manifest["effective_at"], generated_at)
+                self.assertLessEqual(
+                    datetime.fromisoformat(manifest["started_at"]),
+                    datetime.fromisoformat(manifest["completed_at"]),
+                )
+                return result
+
+            first = county_run("county-first", GENERATED_AT, "present")
+            with IntelligenceStore(database) as store:
+                row = store.connection.execute(
+                    """
+                    SELECT r.property_id,r.content_hash,e.evidence_id,
+                           e.source_record_id
+                    FROM recommendations r
+                    JOIN evidence_items e ON e.property_id=r.property_id
+                    WHERE r.pilot_run_id=? AND e.field_name='validated_address'
+                      AND e.value_type='reported'
+                    ORDER BY e.evidence_id LIMIT 1
+                    """,
+                    (first.run_id,),
+                ).fetchone()
+                property_id = str(row["property_id"])
+                evidence_id = str(row["evidence_id"])
+                source_record_id = str(row["source_record_id"])
+                disposition_id = store.record_disposition(
+                    property_id,
+                    "watch",
+                    GENERATED_AT,
+                    baseline_content_hash=str(row["content_hash"]),
+                    watch_specification=WatchSpecification(
+                        watch_reason=(
+                            "Recheck the county-validated address before acquisition review"
+                        ),
+                        evidence_ids=(evidence_id,),
+                        trigger_type="scheduled_recheck",
+                        recheck_condition={
+                            "field": "current_time",
+                            "operator": "at_or_after",
+                            "value": "2026-08-01T12:00:00+00:00",
+                        },
+                        recheck_at="2026-08-01T12:00:00+00:00",
+                        expected_next_action="manual_triage",
+                        creator="analyst:test-suite",
+                    ),
+                )
+                original_disposition = dict(store.active_disposition(property_id))
+
+            # Effective/as-of times intentionally run backward. Execution chronology,
+            # not simulated time, must select the predecessor and current report.
+            present_at = "2026-07-23T13:00:00+00:00"
+            present = county_run(
+                "county-present",
+                present_at,
+                "present",
+                units=14,
+                owner_name="SECOND OWNER LLC",
+                price=900_000,
+            )
+            present_record = next(
+                item
+                for item in json.loads(
+                    (root / "county-present/recommendations.json").read_text()
+                )
+                if item["property_id"] == property_id
+            )
+            self.assertEqual(present_record["recommended_action"], "watch")
+            self.assertEqual(
+                present_record["watch_semantics"]["validation_status"], "valid"
+            )
+            self.assertEqual(
+                present_record["watch_semantics"]["evidence_states"][evidence_id],
+                "current",
+            )
+            self.assertEqual(
+                present_record["county_identity_evidence_state"], "current"
+            )
+            self.assertEqual(
+                present_record["county_identity_coverage_state"],
+                "confirmed_present",
+            )
+            self.assertEqual(present_record["owner"], "SECOND OWNER LLC")
+            self.assertEqual(present_record["verified_units"], 14)
+            self.assertEqual(present_record["asking_price"], 900_000)
+            with IntelligenceStore(database) as store:
+                current_reconfirmation = store.connection.execute(
+                    """
+                    SELECT COUNT(*) FROM evidence_items
+                    WHERE property_id=? AND field_name='validated_address'
+                      AND source_name='miami_dade_property_point_view'
+                      AND source_record_id=? AND fetched_at=?
+                      AND value_type='reported'
+                    """,
+                    (property_id, source_record_id, present_at),
+                ).fetchone()[0]
+                self.assertEqual(current_reconfirmation, 1)
+                for unknown_state in ("unknown_not_run", "unknown_stale"):
+                    store.connection.execute(
+                        """
+                        UPDATE property_source_coverage SET state=?
+                        WHERE property_id=?
+                          AND source_name='miami_dade_property_point_view'
+                        """,
+                        (unknown_state, property_id),
+                    )
+                    store.connection.commit()
+                    self.assertEqual(
+                        store.watch_evidence_states(
+                            property_id,
+                            (evidence_id,),
+                            pilot_run_id=present.run_id,
+                        )[evidence_id],
+                        "last_known",
+                    )
+                store.connection.execute(
+                    """
+                    UPDATE property_source_coverage SET state='confirmed_present'
+                    WHERE property_id=?
+                      AND source_name='miami_dade_property_point_view'
+                    """,
+                    (property_id,),
+                )
+                store.connection.commit()
+
+            failed_at = "2026-07-22T14:00:00+00:00"
+            county_run(
+                "county-failed",
+                failed_at,
+                "failed",
+                units=14,
+                owner_name="SECOND OWNER LLC",
+                price=900_000,
+            )
+            failed_record = next(
+                item
+                for item in json.loads(
+                    (root / "county-failed/recommendations.json").read_text()
+                )
+                if item["property_id"] == property_id
+            )
+            self.assertEqual(failed_record["recommended_action"], "manual_triage")
+            self.assertEqual(
+                failed_record["watch_semantics"]["validation_status"],
+                "invalid_source_unavailable",
+            )
+            self.assertEqual(
+                failed_record["watch_semantics"]["evidence_states"][evidence_id],
+                "last_known",
+            )
+            self.assertEqual(
+                failed_record["county_identity_evidence_state"], "last_known"
+            )
+            self.assertEqual(
+                failed_record["county_identity_coverage_state"], "unknown_failed"
+            )
+            self.assertEqual(failed_record["owner"], "SECOND OWNER LLC")
+            self.assertEqual(failed_record["verified_units"], 14)
+            self.assertEqual(failed_record["asking_price"], 900_000)
+
+            recovered_at = "2026-07-21T15:00:00+00:00"
+            county_run(
+                "county-recovered",
+                recovered_at,
+                "present",
+                units=16,
+                owner_name="RECOVERY OWNER LLC",
+                price=800_000,
+            )
+            recovered_record = next(
+                item
+                for item in json.loads(
+                    (root / "county-recovered/recommendations.json").read_text()
+                )
+                if item["property_id"] == property_id
+            )
+            self.assertEqual(recovered_record["recommended_action"], "watch")
+            self.assertEqual(
+                recovered_record["watch_semantics"]["validation_status"], "valid"
+            )
+            self.assertEqual(
+                recovered_record["watch_semantics"]["evidence_states"][evidence_id],
+                "current",
+            )
+            self.assertEqual(recovered_record["owner"], "RECOVERY OWNER LLC")
+            self.assertEqual(recovered_record["verified_units"], 16)
+            self.assertEqual(recovered_record["asking_price"], 800_000)
+
+            absent_at = "2026-07-20T16:00:00+00:00"
+            absent = county_run(
+                "county-absent",
+                absent_at,
+                "absent",
+                price=800_000,
+            )
+            absent_record = next(
+                item
+                for item in json.loads(
+                    (root / "county-absent/recommendations.json").read_text()
+                )
+                if item["property_id"] == property_id
+            )
+            watch = absent_record["watch_semantics"]
+            self.assertEqual(absent_record["recommended_action"], "manual_triage")
+            self.assertEqual(
+                watch["validation_status"], "invalid_evidence_lifecycle"
+            )
+            self.assertEqual(watch["evidence_states"][evidence_id], "resolved")
+            self.assertEqual(
+                absent_record["county_identity_evidence_state"], "resolved"
+            )
+            self.assertEqual(
+                absent_record["county_identity_coverage_state"],
+                "confirmed_absent",
+            )
+            self.assertIsNone(absent_record["owner"])
+            self.assertIsNone(absent_record["verified_units"])
+            self.assertEqual(absent_record["asking_price"], 800_000)
+            self.assertFalse(
+                any(
+                    item["property_id"] == property_id
+                    for item in json.loads(
+                        (root / "county-absent/acquisition_queue.json").read_text()
+                    )
+                )
+            )
+            self.assertTrue(
+                any(
+                    item["property_id"] == property_id
+                    for item in json.loads(
+                        (root / "county-absent/manual_triage_queue.json").read_text()
+                    )
+                )
+            )
+            self.assertFalse(
+                any(
+                    item["property_id"] == property_id
+                    and item["recommended_action"] == "watch"
+                    for item in json.loads(
+                        (root / "county-absent/recommendations.json").read_text()
+                    )
+                )
+            )
+            change = next(
+                item
+                for item in json.loads(
+                    (root / "county-absent/opportunity_changes.json").read_text()
+                )
+                if item["property_id"] == property_id
+            )
+            self.assertEqual(change["change_type"], "materially_changed")
+            for path in (
+                root / "county-absent/recommendations.csv",
+                root / "county-absent/daily_brief.md",
+                root / "county-absent/manual_triage_queue.md",
+            ):
+                text = path.read_text()
+                self.assertIn("invalid_evidence_lifecycle", text)
+                self.assertIn("resolved", text)
+                self.assertIn("confirmed_absent", text)
+            evidence_state = json.loads(
+                (root / "county-absent/evidence_state.json").read_text()
+            )
+            property_state = next(
+                item
+                for item in evidence_state["properties"]
+                if item["property_id"] == property_id
+            )
+            self.assertEqual(
+                property_state["county_identity"],
+                {
+                    "lifecycle": "resolved",
+                    "coverage": "confirmed_absent",
+                },
+            )
+            source_coverage = json.loads(
+                (root / "county-absent/source_coverage.json").read_text()
+            )
+            self.assertTrue(
+                any(
+                    item["property_id"] == property_id
+                    and item["source_name"]
+                    == "miami_dade_property_point_view"
+                    and item["state"] == "confirmed_absent"
+                    and item["records_matched"] == 0
+                    for item in source_coverage
+                )
+            )
+            with IntelligenceStore(database) as store:
+                self.assertEqual(
+                    dict(store.active_disposition(property_id)),
+                    original_disposition,
+                )
+                self.assertEqual(
+                    store.connection.execute(
+                        """
+                        SELECT validation_status FROM watch_validation_events
+                        WHERE disposition_id=? AND pilot_run_id=?
+                        """,
+                        (disposition_id, absent.run_id),
+                    ).fetchone()[0],
+                    "invalid_evidence_lifecycle",
+                )
+                self.assertEqual(
+                    store.connection.execute(
+                        """
+                        SELECT COUNT(*) FROM opportunity_alerts
+                        WHERE pilot_run_id=? AND property_id=?
+                        """,
+                        (absent.run_id, property_id),
+                    ).fetchone()[0],
+                    1,
+                )
+
+            still_absent = county_run(
+                "county-still-absent",
+                "2026-07-19T17:00:00+00:00",
+                "absent",
+                price=800_000,
+            )
+            still_absent_record = next(
+                item
+                for item in json.loads(
+                    (root / "county-still-absent/recommendations.json").read_text()
+                )
+                if item["property_id"] == property_id
+            )
+            self.assertEqual(
+                still_absent_record["watch_semantics"]["validation_status"],
+                "invalid_evidence_lifecycle",
+            )
+            self.assertEqual(
+                still_absent_record["watch_semantics"]["evidence_states"][
+                    evidence_id
+                ],
+                "resolved",
+            )
+            with sqlite3.connect(database) as connection:
+                self.assertEqual(
+                    connection.execute(
+                        """
+                        SELECT COUNT(*) FROM opportunity_alerts
+                        WHERE pilot_run_id=? AND property_id=?
+                        """,
+                        (still_absent.run_id, property_id),
+                    ).fetchone()[0],
+                    0,
+                )
+                history = [
+                    row[0]
+                    for row in connection.execute(
+                        """
+                        SELECT v.validation_status
+                        FROM watch_validation_events v
+                        JOIN pilot_runs p ON p.run_id=v.pilot_run_id
+                        WHERE v.disposition_id=?
+                        ORDER BY p.rowid,v.rowid
+                        """,
+                        (disposition_id,),
+                    ).fetchall()
+                ]
+                self.assertEqual(
+                    history,
+                    [
+                        "valid",
+                        "valid",
+                        "invalid_source_unavailable",
+                        "valid",
+                        "invalid_evidence_lifecycle",
+                        "invalid_evidence_lifecycle",
+                    ],
+                )
+            failed_after_absence = county_run(
+                "county-failed-after-absence",
+                "2026-07-18T18:00:00+00:00",
+                "failed",
+                price=800_000,
+            )
+            failed_after_absence_record = next(
+                item
+                for item in json.loads(
+                    (
+                        root
+                        / "county-failed-after-absence/recommendations.json"
+                    ).read_text()
+                )
+                if item["property_id"] == property_id
+            )
+            self.assertEqual(
+                failed_after_absence_record["watch_semantics"]["validation_status"],
+                "invalid_source_unavailable",
+            )
+            self.assertEqual(
+                failed_after_absence_record["watch_semantics"]["evidence_states"][
+                    evidence_id
+                ],
+                "resolved",
+            )
+            self.assertEqual(
+                failed_after_absence_record["county_identity_evidence_state"],
+                "resolved",
+            )
+            self.assertEqual(
+                failed_after_absence_record["county_identity_coverage_state"],
+                "unknown_failed",
+            )
+            self.assertIsNone(failed_after_absence_record["owner"])
+            self.assertIsNone(failed_after_absence_record["verified_units"])
+            with sqlite3.connect(database) as connection:
+                self.assertEqual(
+                    connection.execute(
+                        """
+                        SELECT COUNT(*) FROM opportunity_alerts
+                        WHERE pilot_run_id=? AND property_id=?
+                        """,
+                        (failed_after_absence.run_id, property_id),
+                    ).fetchone()[0],
+                    0,
+                )
+
+    def test_r12_non_watch_county_absence_is_disclosed_in_brief(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            database = root / "non-watch-absence.sqlite"
+            _matrix(root / "matrix.csv", noi="", expenses="")
+            _run(
+                root,
+                database,
+                "non-watch-present",
+                GENERATED_AT,
+                criteria=CRITERIA,
+                property_collector=VariablePropertyCollector(
+                    "present", GENERATED_AT
+                ),
+            )
+            property_id = next(
+                item["property_id"]
+                for item in json.loads(
+                    (root / "non-watch-present/recommendations.json").read_text()
+                )
+                if item["folio"] == "0400000000001"
+            )
+            _run(
+                root,
+                database,
+                "non-watch-absent",
+                "2026-07-23T12:00:00+00:00",
+                criteria=CRITERIA,
+                property_collector=VariablePropertyCollector(
+                    "absent", "2026-07-23T12:00:00+00:00"
+                ),
+            )
+            record = next(
+                item
+                for item in json.loads(
+                    (root / "non-watch-absent/recommendations.json").read_text()
+                )
+                if item["property_id"] == property_id
+            )
+            self.assertIsNone(record["watch_semantics"])
+            self.assertEqual(
+                record["county_identity_evidence_state"], "resolved"
+            )
+            self.assertEqual(
+                record["county_identity_coverage_state"], "confirmed_absent"
+            )
+            self.assertIsNone(record["owner"])
+            self.assertIsNone(record["verified_units"])
+            daily_brief = (
+                root / "non-watch-absent/daily_brief.md"
+            ).read_text()
+            self.assertIn(
+                "county identity resolved (confirmed_absent)", daily_brief
+            )
+
+    def test_r12_partial_matrix_absence_does_not_resolve_listing_evidence(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            database = root / "partial-matrix.sqlite"
+            _matrix(root / "matrix.csv", noi="", expenses="")
+            first = _run(
+                root,
+                database,
+                "matrix-first",
+                GENERATED_AT,
+                criteria=CRITERIA,
+            )
+            with IntelligenceStore(database) as store:
+                row = store.connection.execute(
+                    """
+                    SELECT r.property_id,r.content_hash,e.evidence_id
+                    FROM recommendations r
+                    JOIN evidence_items e ON e.property_id=r.property_id
+                    WHERE r.pilot_run_id=? AND e.field_name='matrix_listing'
+                    ORDER BY e.evidence_id LIMIT 1
+                    """,
+                    (first.run_id,),
+                ).fetchone()
+                property_id = str(row["property_id"])
+                evidence_id = str(row["evidence_id"])
+                store.record_disposition(
+                    property_id,
+                    "watch",
+                    GENERATED_AT,
+                    baseline_content_hash=str(row["content_hash"]),
+                    watch_specification=WatchSpecification(
+                        watch_reason=(
+                            "Recheck the listing after the next complete Matrix review"
+                        ),
+                        evidence_ids=(evidence_id,),
+                        trigger_type="scheduled_recheck",
+                        recheck_condition={
+                            "field": "current_time",
+                            "operator": "at_or_after",
+                            "value": "2026-08-01T12:00:00+00:00",
+                        },
+                        recheck_at="2026-08-01T12:00:00+00:00",
+                        expected_next_action="request_documents",
+                        creator="analyst:test-suite",
+                    ),
+                )
+
+            with (root / "matrix.csv").open(
+                "w", newline="", encoding="utf-8"
+            ) as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=(
+                        "MLS Number",
+                        "Address",
+                        "City",
+                        "Folio",
+                        "Status",
+                        "List Price",
+                        "DOM",
+                        "CDOM",
+                        "Units",
+                        "NOI",
+                        "Expenses",
+                        "Remarks",
+                    ),
+                )
+                writer.writeheader()
+            second = _run(
+                root,
+                database,
+                "matrix-partial",
+                "2026-07-24T13:00:00+00:00",
+                criteria=CRITERIA,
+            )
+            record = next(
+                item
+                for item in json.loads(
+                    (root / "matrix-partial/recommendations.json").read_text()
+                )
+                if item["property_id"] == property_id
+            )
+            self.assertEqual(record["recommended_action"], "watch")
+            self.assertEqual(
+                record["watch_semantics"]["validation_status"], "valid"
+            )
+            self.assertEqual(
+                record["watch_semantics"]["evidence_states"][evidence_id],
+                "current",
+            )
+            with sqlite3.connect(database) as connection:
+                self.assertEqual(
+                    connection.execute(
+                        """
+                        SELECT state FROM source_runs
+                        WHERE source_name='matrix_csv' AND pilot_run_id=?
+                        """,
+                        (second.run_id,),
+                    ).fetchone()[0],
+                    "healthy",
+                )
+                self.assertEqual(
+                    connection.execute(
+                        """
+                        SELECT COUNT(*) FROM opportunity_alerts
+                        WHERE pilot_run_id=? AND property_id=?
+                        """,
+                        (second.run_id, property_id),
+                    ).fetchone()[0],
+                    0,
                 )
 
     def test_r12_trigger_schema_rejects_ignored_or_incompatible_signals(
@@ -1501,7 +2219,16 @@ class RealPilot02cAcceptanceTests(unittest.TestCase):
             root = Path(temporary)
             database = root / "same-source-cross-class.sqlite"
             _matrix(root / "matrix.csv", noi="", expenses="")
-            first = _run(root, database, "first", GENERATED_AT, criteria=CRITERIA)
+            first = _run(
+                root,
+                database,
+                "first",
+                GENERATED_AT,
+                criteria=CRITERIA,
+                property_collector=VariablePropertyCollector(
+                    "present", GENERATED_AT
+                ),
+            )
             with IntelligenceStore(database) as store:
                 row = store.connection.execute(
                     """
@@ -1651,6 +2378,9 @@ class RealPilot02cAcceptanceTests(unittest.TestCase):
                 "reevaluated",
                 "2026-07-24T12:05:00+00:00",
                 criteria=CRITERIA,
+                property_collector=VariablePropertyCollector(
+                    "present", "2026-07-24T12:05:00+00:00"
+                ),
             )
             reevaluated = next(
                 item

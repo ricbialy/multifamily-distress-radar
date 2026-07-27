@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -13,8 +14,9 @@ from distress_radar.pilot_verification import (
     _controlled_copy,
     _disposition_supports_action,
     _evidence_value_supports_action,
-    _g10_is_valid,
     _g5_is_valid,
+    _g10_is_valid,
+    _manifest_chronology,
     _manifest_commit_shas,
     _manifests_match_commit,
     _repository_commit_sha,
@@ -40,10 +42,20 @@ class PilotVerificationTests(unittest.TestCase):
                 run_directory = root / directory
                 run_directory.mkdir()
                 (run_directory / "run_manifest.json").write_text(
-                    '{"source_commit_sha": "' + commit_sha + '"}\n'
+                    json.dumps(
+                        {
+                            "source_commit_sha": commit_sha,
+                            "started_at": "2026-07-27T12:00:00+00:00",
+                            "effective_at": "2026-07-28T12:00:00+00:00",
+                            "completed_at": "2026-07-27T12:01:00+00:00",
+                        }
+                    )
+                    + "\n"
                 )
             manifests = _manifest_commit_shas(root)
             self.assertTrue(_manifests_match_commit(manifests, commit_sha))
+            chronology = _manifest_chronology(root)
+            self.assertTrue(all(run["valid"] for run in chronology.values()))
             manifests["failed-source"] = "c" * 40
             self.assertFalse(_manifests_match_commit(manifests, commit_sha))
             manifests["failed-source"] = commit_sha
@@ -57,6 +69,12 @@ class PilotVerificationTests(unittest.TestCase):
             self.assertFalse(_manifests_match_commit(manifests, commit_sha))
             manifests["failed-source"] = []
             self.assertFalse(_manifests_match_commit(manifests, commit_sha))
+            failed_manifest = root / "failed-source/run_manifest.json"
+            failed_payload = json.loads(failed_manifest.read_text())
+            failed_payload["completed_at"] = "2026-07-27T11:59:00+00:00"
+            failed_manifest.write_text(json.dumps(failed_payload) + "\n")
+            chronology = _manifest_chronology(root)
+            self.assertFalse(chronology["failed-source"]["valid"])
 
     def test_authoritative_commit_requires_clean_full_sha(self) -> None:
         clean = SimpleNamespace(returncode=0, stdout="", stderr="")

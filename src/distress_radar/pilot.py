@@ -45,14 +45,14 @@ from distress_radar.recommendations.features import (
 )
 from distress_radar.recommendations.rule_engine import recommend
 from distress_radar.sources.base import CoverageState, SourceHealthState
-from distress_radar.watch_semantics import (
-    watch_specification_from_mapping,
-)
 from distress_radar.sources.mls.matrix_csv import MatrixCsvImporter
 from distress_radar.tax_import import import_tax_csv, is_unpaid_status
 from distress_radar.underwriting.commercial_multifamily import (
     CommercialMultifamilyInputs,
     underwrite_commercial,
+)
+from distress_radar.watch_semantics import (
+    watch_specification_from_mapping,
 )
 
 COUNTY_SOURCE = "miami_dade_property_point_view"
@@ -60,6 +60,11 @@ CODE_SOURCE = "hialeah_tyler_energov"
 CODE_DETAIL_SOURCE = "hialeah_tyler_energov_case_detail"
 CLERK_SOURCE = "miami_dade_clerk_official_records"
 TAX_SOURCE = "authorized_tax_csv"
+_UNKNOWN_COVERAGE_STATES = {
+    CoverageState.UNKNOWN_FAILED.value,
+    CoverageState.UNKNOWN_NOT_RUN.value,
+    CoverageState.UNKNOWN_STALE.value,
+}
 MISSING_DILIGENCE = (
     "rent_roll",
     "T12",
@@ -118,7 +123,8 @@ def _migrate_pilot(store: IntelligenceStore) -> None:
             run_id TEXT PRIMARY KEY, input_filename TEXT NOT NULL,
             input_sha256 TEXT NOT NULL, municipality TEXT NOT NULL,
             started_at TEXT NOT NULL, completed_at TEXT, status TEXT NOT NULL,
-            source_commit_sha TEXT, investment_criteria_json TEXT
+            effective_at TEXT, source_commit_sha TEXT,
+            investment_criteria_json TEXT
         );
         CREATE TABLE IF NOT EXISTS import_ledger (
             run_id TEXT NOT NULL REFERENCES pilot_runs(run_id),
@@ -154,6 +160,10 @@ def _migrate_pilot(store: IntelligenceStore) -> None:
     if "investment_criteria_json" not in pilot_run_columns:
         store.connection.execute(
             "ALTER TABLE pilot_runs ADD COLUMN investment_criteria_json TEXT"
+        )
+    if "effective_at" not in pilot_run_columns:
+        store.connection.execute(
+            "ALTER TABLE pilot_runs ADD COLUMN effective_at TEXT"
         )
     recommendation_columns = {
         row["name"]
@@ -426,15 +436,18 @@ def _material_content_hash(payload: dict[str, Any]) -> str:
     return hashlib.sha256(_json(_material_value(payload)).encode()).hexdigest()
 
 
-def _has_verified_address_evidence(store: IntelligenceStore, property_id: str) -> bool:
+def _has_verified_address_evidence(
+    store: IntelligenceStore, property_id: str, pilot_run_id: str
+) -> bool:
     row = store.connection.execute(
         """
         SELECT value_json,value_type,metadata_json
         FROM evidence_items
         WHERE property_id=? AND field_name='validated_address'
-        ORDER BY fetched_at DESC,rowid DESC LIMIT 1
+          AND pilot_run_id=?
+        ORDER BY rowid DESC LIMIT 1
         """,
-        (property_id,),
+        (property_id, pilot_run_id),
     ).fetchone()
     if not row or row["value_type"] != ValueType.REPORTED.value:
         return False
@@ -1095,7 +1108,7 @@ def _record_for_matrix(
         """
         SELECT property_id FROM listing_snapshots
         WHERE mls_number=? AND source_name=? AND property_id IS NOT NULL
-        ORDER BY fetched_at DESC LIMIT 1
+        ORDER BY rowid DESC LIMIT 1
         """,
         (listing.source_record_id, listing.source_name),
     ).fetchone()
@@ -1468,7 +1481,7 @@ def _persist_underwriting_and_recommendations(
             """
             SELECT mls_number,status,list_price,dom,cdom,normalized_json,source_name
             FROM listing_snapshots WHERE property_id=?
-            ORDER BY fetched_at DESC,snapshot_id DESC LIMIT 1
+            ORDER BY rowid DESC LIMIT 1
             """,
             (property_id,),
         ).fetchone()
@@ -1501,24 +1514,155 @@ def _persist_underwriting_and_recommendations(
         county_coverage = next(
             (row for row in coverage if row["source_name"] == COUNTY_SOURCE), None
         )
+        county_coverage_run = (
+            store.connection.execute(
+                "SELECT pilot_run_id FROM source_runs WHERE run_id=?",
+                (county_coverage["run_id"],),
+            ).fetchone()
+            if county_coverage and county_coverage.get("run_id")
+            else None
+        )
+        county_coverage_is_current = bool(
+            county_coverage_run
+            and county_coverage_run["pilot_run_id"] == pilot_run_id
+        )
+        if not county_coverage_is_current:
+            current_county_run = store.connection.execute(
+                """
+                SELECT run_id,state,error_message FROM source_runs
+                WHERE source_name=? AND pilot_run_id=?
+                ORDER BY rowid DESC LIMIT 1
+                """,
+                (COUNTY_SOURCE, pilot_run_id),
+            ).fetchone()
+            if current_county_run:
+                coverage_state = (
+                    CoverageState.UNKNOWN_NOT_RUN
+                    if current_county_run["state"]
+                    == SourceHealthState.HEALTHY.value
+                    else CoverageState.UNKNOWN_FAILED
+                )
+                store.set_source_coverage(
+                    property_id=property_id,
+                    source_name=COUNTY_SOURCE,
+                    state=coverage_state,
+                    query_scope="property-specific lookup not run in current pilot run",
+                    records_examined=0,
+                    records_matched=0,
+                    run_id=str(current_county_run["run_id"]),
+                    checked_at=generated_at,
+                    error_message=(
+                        str(current_county_run["error_message"])
+                        if current_county_run["error_message"]
+                        else None
+                    ),
+                )
+                coverage = store.property_source_coverage(property_id)
+                county_coverage = next(
+                    (
+                        row
+                        for row in coverage
+                        if row["source_name"] == COUNTY_SOURCE
+                    ),
+                    None,
+                )
+                county_coverage_is_current = True
         identity_verified = bool(
             prop.folio
             and county_coverage
+            and county_coverage_is_current
             and county_coverage["state"] == CoverageState.CONFIRMED_PRESENT.value
             and (
                 listing_row is None
-                or _has_verified_address_evidence(store, property_id)
+                or _has_verified_address_evidence(
+                    store, property_id, pilot_run_id
+                )
             )
         )
-        county_row = store.connection.execute(
+        previous_recommendation = store.connection.execute(
             """
-            SELECT value_json FROM evidence_items
-            WHERE property_id=? AND field_name='public_property_record'
-            ORDER BY fetched_at DESC,rowid DESC LIMIT 1
+            SELECT r.explanation_json
+            FROM recommendations r
+            JOIN pilot_runs p ON p.run_id=r.pilot_run_id
+            WHERE r.property_id=?
+            ORDER BY p.rowid DESC,r.rowid DESC
+            LIMIT 1
             """,
             (property_id,),
         ).fetchone()
+        previous_explanation = (
+            json.loads(previous_recommendation["explanation_json"])
+            if previous_recommendation
+            else {}
+        )
+        previous_county_state = previous_explanation.get(
+            "county_identity_material_state"
+        )
+        if previous_county_state is None:
+            legacy_state = previous_explanation.get(
+                "county_identity_evidence_state"
+            )
+            if legacy_state in {
+                CoverageState.CONFIRMED_PRESENT.value,
+                CoverageState.CONFIRMED_ABSENT.value,
+            }:
+                previous_county_state = legacy_state
+        county_coverage_state = (
+            str(county_coverage["state"])
+            if county_coverage and county_coverage_is_current
+            else CoverageState.UNKNOWN_NOT_RUN.value
+        )
+        if county_coverage_state == CoverageState.CONFIRMED_PRESENT.value:
+            county_row = store.connection.execute(
+                """
+                SELECT value_json FROM evidence_items
+                WHERE property_id=? AND field_name='public_property_record'
+                  AND pilot_run_id=?
+                ORDER BY rowid DESC LIMIT 1
+                """,
+                (property_id, pilot_run_id),
+            ).fetchone()
+        else:
+            county_row = store.connection.execute(
+                """
+                SELECT e.value_json
+                FROM evidence_items e
+                JOIN pilot_runs p ON p.run_id=e.pilot_run_id
+                WHERE e.property_id=? AND e.field_name='public_property_record'
+                ORDER BY p.rowid DESC,e.rowid DESC LIMIT 1
+                """,
+                (property_id,),
+            ).fetchone()
         county = json.loads(county_row["value_json"]) if county_row else {}
+        if county_coverage_state in {
+            CoverageState.CONFIRMED_PRESENT.value,
+            CoverageState.CONFIRMED_ABSENT.value,
+        }:
+            material_county_state = county_coverage_state
+        elif previous_county_state:
+            material_county_state = str(previous_county_state)
+        else:
+            material_county_state = (
+                CoverageState.CONFIRMED_PRESENT.value
+                if county_row
+                else "unknown_not_run"
+            )
+        if county_coverage_state == CoverageState.CONFIRMED_PRESENT.value:
+            county_evidence_state = "current"
+        elif county_coverage_state == CoverageState.CONFIRMED_ABSENT.value:
+            county_evidence_state = "resolved"
+        elif (
+            county_coverage_state in _UNKNOWN_COVERAGE_STATES
+            and material_county_state == CoverageState.CONFIRMED_ABSENT.value
+        ):
+            county_evidence_state = "resolved"
+        elif county_coverage_state in _UNKNOWN_COVERAGE_STATES:
+            county_evidence_state = "last_known"
+        else:
+            county_evidence_state = "incompatible"
+        if material_county_state == CoverageState.CONFIRMED_ABSENT.value:
+            county = {}
+            identity_verified = False
         units = county.get("verified_units", county.get("units"))
 
         municipal_rows = store.connection.execute(
@@ -1834,6 +1978,7 @@ def _persist_underwriting_and_recommendations(
             "property_id": property_id,
             "listing": listing,
             "county": county,
+            "county_identity_material_state": material_county_state,
             "municipal": material_municipal,
             "official_records": material_official,
             "tax_records": material_tax,
@@ -2072,6 +2217,9 @@ def _persist_underwriting_and_recommendations(
             "ranking_tiebreakers": ranking_tiebreakers,
             "discovery_channels": channels,
             "identity_verified": identity_verified,
+            "county_identity_evidence_state": county_evidence_state,
+            "county_identity_coverage_state": county_coverage_state,
+            "county_identity_material_state": material_county_state,
             "in_scope": in_scope,
             "acquisition_qualified": bool(
                 is_acquisition_qualified(
@@ -2141,9 +2289,12 @@ def _persist_underwriting_and_recommendations(
         }
         previous = store.connection.execute(
             """
-            SELECT content_hash FROM recommendations
-            WHERE property_id=? AND content_hash IS NOT NULL
-            ORDER BY generated_at DESC,recommendation_id DESC LIMIT 1
+            SELECT r.content_hash
+            FROM recommendations r
+            JOIN pilot_runs p ON p.run_id=r.pilot_run_id
+            WHERE r.property_id=? AND r.content_hash IS NOT NULL
+            ORDER BY p.rowid DESC,r.rowid DESC
+            LIMIT 1
             """,
             (property_id,),
         ).fetchone()
@@ -2384,37 +2535,54 @@ def _municipal_rank_reason(
     )
 
 
-def _report_records(store: IntelligenceStore) -> list[dict[str, Any]]:
+def _report_records(
+    store: IntelligenceStore, pilot_run_id: str
+) -> list[dict[str, Any]]:
     rows = store.connection.execute(
         """
         SELECT p.*,r.action,r.scores_json,r.explanation_json,r.generated_at,
                r.pilot_run_id,r.content_hash,r.change_type
         FROM canonical_properties p
-        JOIN recommendations r ON r.recommendation_id=(
-            SELECT r2.recommendation_id FROM recommendations r2
-            WHERE r2.property_id=p.property_id
-            ORDER BY r2.generated_at DESC,r2.recommendation_id DESC LIMIT 1
-        )
-        """
+        JOIN recommendations r ON r.property_id=p.property_id
+        WHERE r.pilot_run_id=?
+        """,
+        (pilot_run_id,),
     ).fetchall()
     records: list[dict[str, Any]] = []
     for row in rows:
         explanation = json.loads(row["explanation_json"])
         scores = json.loads(row["scores_json"])
-        county_row = store.connection.execute(
-            """
-            SELECT value_json,source_url FROM evidence_items
-            WHERE property_id=? AND field_name='public_property_record'
-            ORDER BY fetched_at DESC,rowid DESC LIMIT 1
-            """,
-            (row["property_id"],),
-        ).fetchone()
+        county_evidence_state = explanation.get(
+            "county_identity_evidence_state", "incompatible"
+        )
+        county_row = None
+        if county_evidence_state == "current":
+            county_row = store.connection.execute(
+                """
+                SELECT value_json,source_url FROM evidence_items
+                WHERE property_id=? AND field_name='public_property_record'
+                  AND pilot_run_id=?
+                ORDER BY rowid DESC LIMIT 1
+                """,
+                (row["property_id"], pilot_run_id),
+            ).fetchone()
+        elif county_evidence_state == "last_known":
+            county_row = store.connection.execute(
+                """
+                SELECT e.value_json,e.source_url
+                FROM evidence_items e
+                JOIN pilot_runs p ON p.run_id=e.pilot_run_id
+                WHERE e.property_id=? AND e.field_name='public_property_record'
+                ORDER BY p.rowid DESC,e.rowid DESC LIMIT 1
+                """,
+                (row["property_id"],),
+            ).fetchone()
         county = json.loads(county_row["value_json"]) if county_row else {}
         listing_row = store.connection.execute(
             """
             SELECT mls_number,status,list_price,dom,cdom,normalized_json
             FROM listing_snapshots WHERE property_id=?
-            ORDER BY fetched_at DESC,snapshot_id DESC LIMIT 1
+            ORDER BY rowid DESC LIMIT 1
             """,
             (row["property_id"],),
         ).fetchone()
@@ -2465,6 +2633,10 @@ def _report_records(store: IntelligenceStore) -> list[dict[str, Any]]:
                 "underwriting_run_id": explanation["underwriting_run_id"],
                 "offer_gate": explanation["offer_gate"],
                 "identity_verified": explanation["identity_verified"],
+                "county_identity_evidence_state": county_evidence_state,
+                "county_identity_coverage_state": explanation.get(
+                    "county_identity_coverage_state", "unknown_not_run"
+                ),
                 "in_scope": bool(explanation.get("in_scope")),
                 "acquisition_qualified": bool(explanation.get("acquisition_qualified")),
                 "generated_at": row["generated_at"],
@@ -2551,7 +2723,7 @@ def _write_reports(
     counts = _database_counts(store)
     summary_path.write_text(json.dumps(counts, indent=2) + "\n", encoding="utf-8")
 
-    recommendations = _report_records(store)
+    recommendations = _report_records(store, run_id)
     recommendations_json = output_dir / "recommendations.json"
     recommendations_json.write_text(
         json.dumps(recommendations, indent=2) + "\n", encoding="utf-8"
@@ -2568,6 +2740,8 @@ def _write_reports(
         "evidence_ids",
         "underwriting_status",
         "identity_verified",
+        "county_identity_evidence_state",
+        "county_identity_coverage_state",
         "watch_validation_status",
         "watch_validation_reason",
         "watch_trigger_type",
@@ -2742,6 +2916,12 @@ def _write_reports(
             "watch_source_health": (
                 (item.get("watch_semantics") or {}).get("source_health") or {}
             ),
+            "county_identity_evidence_state": item[
+                "county_identity_evidence_state"
+            ],
+            "county_identity_coverage_state": item[
+                "county_identity_coverage_state"
+            ],
             "supporting_evidence": (
                 (item.get("watch_semantics") or {}).get("supporting_evidence") or []
             ),
@@ -2763,6 +2943,8 @@ def _write_reports(
         "watch_validation_reason",
         "watch_trigger_type",
         "watch_source_health",
+        "county_identity_evidence_state",
+        "county_identity_coverage_state",
         "next_step",
     )
     manual_triage_csv = output_dir / "manual_triage_queue.csv"
@@ -2786,7 +2968,9 @@ def _write_reports(
         + (
             "\n".join(
                 f"- {item['address']} — {item['watch_validation_status'] or 'manual_triage'}: "
-                f"{item['watch_validation_reason'] or item['next_step']}"
+                f"{item['watch_validation_reason'] or item['next_step']}; "
+                f"county identity {item['county_identity_evidence_state']} "
+                f"({item['county_identity_coverage_state']})"
                 for item in manual_triage
             )
             if manual_triage
@@ -2982,7 +3166,10 @@ def _write_reports(
         brief_lines.extend(
             (
                 f"- {item['address']} ({item['folio'] or 'folio unverified'}): "
-                f"{item['recommended_action']}; evidence {', '.join(item['evidence_ids'])}"
+                f"{item['recommended_action']}; evidence "
+                f"{', '.join(item['evidence_ids'])}; county identity "
+                f"{item['county_identity_evidence_state']} "
+                f"({item['county_identity_coverage_state']})"
             )
             for item in matching
         )
@@ -3009,6 +3196,8 @@ def _write_reports(
             f"{watch['validation_reason']} {watch['watch_reason']}; "
             f"evidence {evidence_states}; source health "
             f"{_json(watch.get('source_health') or {})}; "
+            f"county identity {item['county_identity_evidence_state']} "
+            f"({item['county_identity_coverage_state']}); "
             f"recheck {trigger}; then {watch['expected_next_action']}. "
             f"Unknowns: {', '.join(item['missing_data']) or 'none recorded'}."
         )
@@ -3057,6 +3246,14 @@ def _write_reports(
                             ],
                             "last_known": item["municipal_cases_last_known"],
                             "coverage": item["municipal_evidence_state"],
+                        },
+                        "county_identity": {
+                            "lifecycle": item[
+                                "county_identity_evidence_state"
+                            ],
+                            "coverage": item[
+                                "county_identity_coverage_state"
+                            ],
                         },
                     }
                     for item in recommendations
@@ -3143,8 +3340,9 @@ def _write_reports(
                 dict(row)
                 for row in store.connection.execute(
                     """
-                    SELECT * FROM watch_validation_events
-                    ORDER BY validated_at,validation_event_id
+                    SELECT v.* FROM watch_validation_events v
+                    LEFT JOIN pilot_runs p ON p.run_id=v.pilot_run_id
+                    ORDER BY p.rowid,v.rowid
                     """
                 ).fetchall()
             ],
@@ -3261,7 +3459,7 @@ def _write_reports(
                 """
                 SELECT mls_number,source_name,fetched_at,status,list_price,
                        normalized_json
-                FROM listing_snapshots WHERE property_id=? ORDER BY fetched_at
+                FROM listing_snapshots WHERE property_id=? ORDER BY rowid
                 """,
                 (property_id,),
             ).fetchall()
@@ -3333,6 +3531,7 @@ def run_pilot(
     if not matrix_path.is_file():
         raise FileNotFoundError(matrix_path)
     generated_at = generated_at or utc_now()
+    execution_started_at = utc_now()
     matrix_sha = _sha256(matrix_path)
     config = load_city_config("hialeah_fl")
     property_collector = property_collector or ArcGisPropertyCollector(config)
@@ -3352,15 +3551,16 @@ def run_pilot(
         store.connection.execute(
             """
             INSERT INTO pilot_runs (
-                run_id,input_filename,input_sha256,municipality,started_at,status,
-                source_commit_sha,investment_criteria_json
-            ) VALUES (?,?,?,?,?,'running',?,?)
+                run_id,input_filename,input_sha256,municipality,started_at,
+                effective_at,status,source_commit_sha,investment_criteria_json
+            ) VALUES (?,?,?,?,?,?,'running',?,?)
             """,
             (
                 run_id,
                 matrix_path.name,
                 matrix_sha,
                 municipality,
+                execution_started_at,
                 generated_at,
                 source_commit_sha
                 or os.environ.get("RADAR_SOURCE_COMMIT")
@@ -3875,7 +4075,13 @@ def run_pilot(
             """
             UPDATE pilot_runs SET completed_at=?,status='completed' WHERE run_id=?
             """,
-            (utc_now(), run_id),
+            (
+                max(
+                    datetime.fromisoformat(execution_started_at),
+                    datetime.fromisoformat(utc_now()),
+                ).isoformat(),
+                run_id,
+            ),
         )
         store.connection.commit()
         output_files = _write_reports(store, output_dir, run_id)
