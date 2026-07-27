@@ -13,6 +13,8 @@ from distress_radar.pilot_verification import (
     _controlled_copy,
     _disposition_supports_action,
     _evidence_value_supports_action,
+    _g10_is_valid,
+    _g5_is_valid,
     _run_tests,
     verify_real_pilot,
 )
@@ -121,6 +123,10 @@ class PilotVerificationTests(unittest.TestCase):
             ],
         )
         self.assertEqual(_active_intersection_count(connection, "run-2"), 1)
+        self.assertTrue(_g5_is_valid(1, 0))
+        self.assertTrue(_g5_is_valid(1, 10))
+        self.assertFalse(_g5_is_valid(0, 0))
+        self.assertFalse(_g5_is_valid(1, 11))
 
     def test_g7_checks_evidence_values_not_only_identifiers(self) -> None:
         self.assertTrue(
@@ -140,6 +146,30 @@ class PilotVerificationTests(unittest.TestCase):
                 "human_municipal_review",
                 "municipal_code_case",
                 {"case_number": "C-1", "currently_active": False},
+            )
+        )
+        self.assertTrue(
+            _evidence_value_supports_action(
+                "human_municipal_review",
+                "municipal_code_case",
+                {
+                    "case_number": "C-2",
+                    "currently_active": True,
+                    "enforcement_stage": "lien",
+                    "substantive_hazard": "cosmetic",
+                },
+            )
+        )
+        self.assertFalse(
+            _evidence_value_supports_action(
+                "human_municipal_review",
+                "municipal_code_case",
+                {
+                    "case_number": "C-3",
+                    "currently_active": True,
+                    "enforcement_stage": "warning",
+                    "substantive_hazard": "cosmetic",
+                },
             )
         )
         self.assertTrue(
@@ -200,6 +230,15 @@ class PilotVerificationTests(unittest.TestCase):
         )
 
     def test_g10_requires_exact_target_and_zero_unrelated_changes(self) -> None:
+        self.assertTrue(
+            _g10_is_valid(controlled_isolated=True, status_change_count=1)
+        )
+        self.assertFalse(
+            _g10_is_valid(controlled_isolated=False, status_change_count=1)
+        )
+        self.assertFalse(
+            _g10_is_valid(controlled_isolated=True, status_change_count=2)
+        )
         changes = [
             {
                 "mls_number": "A12057467",

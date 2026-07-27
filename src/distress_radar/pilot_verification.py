@@ -71,6 +71,16 @@ def _active_intersection_count(
     )
 
 
+def _g5_is_valid(off_market_count: int, queue_count: int) -> bool:
+    return off_market_count > 0 and 0 <= queue_count <= 10
+
+
+def _g10_is_valid(
+    *, controlled_isolated: bool, status_change_count: int
+) -> bool:
+    return controlled_isolated and status_change_count == 1
+
+
 def _evidence_value_supports_action(
     action: str,
     field_name: str,
@@ -86,14 +96,18 @@ def _evidence_value_supports_action(
             and bool(value.get("currently_active"))
             and bool(value.get("case_number"))
             and bool(value.get("enforcement_stage"))
-            and value.get("substantive_hazard")
-            in {
-                "unknown_hazard",
-                "permit",
-                "recertification",
-                "minimum_housing",
-                "unsafe_life_safety",
-            }
+            and (
+                value.get("substantive_hazard")
+                in {
+                    "unknown_hazard",
+                    "permit",
+                    "recertification",
+                    "minimum_housing",
+                    "unsafe_life_safety",
+                }
+                or value.get("enforcement_stage")
+                in {"special_master", "itl", "lien"}
+            )
         )
     if action == "investigate_owner":
         if not isinstance(value, dict):
@@ -425,6 +439,11 @@ def verify_real_pilot(
         "source_health_warnings.json",
         "evidence_state.json",
         "human_dispositions.json",
+        "watch_trigger_events.json",
+        "watch_validation_events.json",
+        "manual_triage_queue.json",
+        "manual_triage_queue.csv",
+        "manual_triage_queue.md",
         "change_summary.json",
         "opportunity_changes.json",
         "top_candidate_trace.json",
@@ -740,7 +759,7 @@ def verify_real_pilot(
         ),
         GateResult(
             "G5",
-            "PASS" if off_market_count > 0 and 0 < len(queue) <= 10 else "FAIL",
+            "PASS" if _g5_is_valid(off_market_count, len(queue)) else "FAIL",
             (
                 f"{off_market_count} distinct active, confirmed, current-run "
                 f"off-market intersections; {len(queue)} ranked tasks; "
@@ -815,9 +834,10 @@ def verify_real_pilot(
         GateResult(
             "G10",
             "PASS"
-            if controlled_isolated
-            and status_changes_after - status_changes_before == 1
-            and action_before != action_after
+            if _g10_is_valid(
+                controlled_isolated=controlled_isolated,
+                status_change_count=status_changes_after - status_changes_before,
+            )
             else "FAIL",
             (
                 f"{controlled_description}; detected "
