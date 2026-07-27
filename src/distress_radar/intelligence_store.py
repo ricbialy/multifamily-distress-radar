@@ -13,8 +13,10 @@ from distress_radar.domain.property import CanonicalProperty
 from distress_radar.sources.base import CoverageState, SourceHealthState
 from distress_radar.sources.mls.matrix_csv import detect_listing_changes
 from distress_radar.watch_semantics import (
+    WatchEvidenceDescriptor,
     WatchSpecification,
-    watch_validation_status,
+    WatchValidationOutcome,
+    validate_watch,
 )
 
 
@@ -114,6 +116,13 @@ class IntelligenceStore:
                 value_json TEXT, evidence_ids_json TEXT NOT NULL,
                 status TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS signal_evidence_links (
+                signal_id TEXT NOT NULL REFERENCES property_signals(signal_id),
+                evidence_id TEXT NOT NULL REFERENCES evidence_items(evidence_id),
+                property_id TEXT NOT NULL REFERENCES canonical_properties(property_id),
+                signal_type TEXT NOT NULL,
+                PRIMARY KEY(signal_id,evidence_id)
+            );
             CREATE TABLE IF NOT EXISTS underwriting_runs (
                 run_id TEXT PRIMARY KEY, property_id TEXT NOT NULL
                     REFERENCES canonical_properties(property_id),
@@ -145,6 +154,19 @@ class IntelligenceStore:
                 triggered_at TEXT NOT NULL,
                 trigger_payload_json TEXT NOT NULL,
                 UNIQUE(disposition_id,trigger_fingerprint)
+            );
+            CREATE TABLE IF NOT EXISTS watch_validation_events (
+                validation_event_id TEXT PRIMARY KEY,
+                disposition_id TEXT NOT NULL REFERENCES human_dispositions(disposition_id),
+                property_id TEXT NOT NULL REFERENCES canonical_properties(property_id),
+                pilot_run_id TEXT NOT NULL,
+                validated_at TEXT NOT NULL,
+                validation_status TEXT NOT NULL,
+                validation_reason TEXT NOT NULL,
+                evidence_states_json TEXT NOT NULL,
+                source_health_json TEXT NOT NULL,
+                evidence_descriptors_json TEXT NOT NULL,
+                UNIQUE(disposition_id,pilot_run_id)
             );
             CREATE TABLE IF NOT EXISTS acquisition_outcomes (
                 outcome_id TEXT PRIMARY KEY, property_id TEXT NOT NULL
@@ -211,6 +233,16 @@ class IntelligenceStore:
             self.connection.execute(
                 "ALTER TABLE evidence_items ADD COLUMN pilot_run_id TEXT"
             )
+        self.connection.execute(
+            """
+            INSERT OR IGNORE INTO signal_evidence_links (
+                signal_id,evidence_id,property_id,signal_type
+            )
+            SELECT s.signal_id,j.value,s.property_id,s.signal_type
+            FROM property_signals s,json_each(s.evidence_ids_json) j
+            JOIN evidence_items e ON e.evidence_id=j.value
+            """
+        )
         self.connection.commit()
 
     def upsert_property(self, prop: CanonicalProperty) -> None:
@@ -536,20 +568,21 @@ class IntelligenceStore:
             raise ValueError(f"unsupported disposition: {disposition}")
         if disposition != "watch" and watch_specification is not None:
             raise ValueError("watch specification is only valid for a watch disposition")
-        evidence_states: dict[str, str] = {}
         watch_status: str | None = None
         if disposition == "watch":
             if watch_specification is None:
                 raise ValueError("new watch dispositions require complete watch semantics")
-            watch_status, evidence_states = self.validate_watch_specification(
+            outcome = self.validate_watch_specification(
                 property_id,
                 watch_specification,
                 created_at=decided_at,
+                reviewed_content_hash=baseline_content_hash,
             )
+            watch_status = outcome.status
             if watch_status != "valid":
                 raise ValueError(
                     "watch evidence or semantics failed closed validation: "
-                    f"{watch_status}"
+                    f"{watch_status}: {outcome.reason}"
                 )
         disposition_id = str(uuid4())
         self.connection.execute(
@@ -607,7 +640,28 @@ class IntelligenceStore:
                 watch_status,
             ),
         )
-        self.connection.commit()
+        if disposition == "watch":
+            pilot_run = self.connection.execute(
+                """
+                SELECT pilot_run_id FROM recommendations
+                WHERE property_id=? AND content_hash=? AND pilot_run_id IS NOT NULL
+                ORDER BY generated_at DESC,recommendation_id DESC LIMIT 1
+                """,
+                (property_id, baseline_content_hash),
+            ).fetchone()
+            if pilot_run is None:
+                raise ValueError(
+                    "watch creation requires a reviewed recommendation run"
+                )
+            self.record_watch_validation_event(
+                disposition_id=disposition_id,
+                property_id=property_id,
+                pilot_run_id=str(pilot_run["pilot_run_id"]),
+                validated_at=decided_at,
+                outcome=outcome,
+            )
+        else:
+            self.connection.commit()
         return disposition_id
 
     def effective_disposition(
@@ -679,55 +733,159 @@ class IntelligenceStore:
         specification: WatchSpecification | None,
         *,
         created_at: str,
-        preserve_existing_during_unavailability: bool = False,
-    ) -> tuple[str, dict[str, str]]:
+        reviewed_content_hash: str,
+        pilot_run_id: str | None = None,
+    ) -> WatchValidationOutcome:
         evidence_states = self.watch_evidence_states(
             property_id, specification.evidence_ids if specification else ()
         )
-        status = watch_validation_status(
+        evidence_ids = specification.evidence_ids if specification else ()
+        evidence_rows = []
+        if evidence_ids:
+            evidence_rows = self.connection.execute(
+                f"""
+                SELECT evidence_id,property_id,field_name,source_name
+                FROM evidence_items
+                WHERE evidence_id IN ({','.join('?' for _ in evidence_ids)})
+                """,
+                evidence_ids,
+            ).fetchall()
+        signal_types: dict[str, set[str]] = {
+            str(row["evidence_id"]): set() for row in evidence_rows
+        }
+        if evidence_ids:
+            for signal in self.connection.execute(
+                """
+                SELECT signal_type,evidence_id
+                FROM signal_evidence_links WHERE property_id=?
+                """,
+                (property_id,),
+            ).fetchall():
+                evidence_id = str(signal["evidence_id"])
+                if evidence_id in signal_types:
+                    signal_types[evidence_id].add(str(signal["signal_type"]))
+        descriptors = tuple(
+            WatchEvidenceDescriptor(
+                evidence_id=str(row["evidence_id"]),
+                property_id=str(row["property_id"]),
+                evidence_class=str(row["field_name"]),
+                source_name=str(row["source_name"]),
+                signal_types=tuple(sorted(signal_types[str(row["evidence_id"])])),
+            )
+            for row in evidence_rows
+        )
+        effective_run_id = pilot_run_id or self.current_pilot_run_id
+        if effective_run_id is None:
+            latest = self.connection.execute(
+                """
+                SELECT pilot_run_id FROM recommendations
+                WHERE property_id=? AND pilot_run_id IS NOT NULL
+                ORDER BY generated_at DESC,recommendation_id DESC LIMIT 1
+                """,
+                (property_id,),
+            ).fetchone()
+            effective_run_id = str(latest["pilot_run_id"]) if latest else None
+        sources = {item.source_name for item in descriptors}
+        source_health: dict[str, str] = {}
+        previous_source_health: dict[str, str] = {}
+        for source_name in sources:
+            current = (
+                self.connection.execute(
+                    """
+                    SELECT state FROM source_runs
+                    WHERE pilot_run_id=? AND source_name=?
+                    ORDER BY started_at DESC,run_id DESC LIMIT 1
+                    """,
+                    (effective_run_id, source_name),
+                ).fetchone()
+                if effective_run_id
+                else None
+            )
+            source_health[source_name] = (
+                str(current["state"]) if current else "unknown_not_run"
+            )
+            previous = (
+                self.connection.execute(
+                    """
+                    SELECT state FROM source_runs
+                    WHERE source_name=? AND pilot_run_id IS NOT NULL
+                      AND pilot_run_id<>?
+                    ORDER BY started_at DESC,run_id DESC LIMIT 1
+                    """,
+                    (source_name, effective_run_id),
+                ).fetchone()
+                if effective_run_id
+                else None
+            )
+            if previous:
+                previous_source_health[source_name] = str(previous["state"])
+        return validate_watch(
             specification,
             created_at=created_at,
+            reviewed_content_hash=reviewed_content_hash,
+            property_id=property_id,
+            evidence=descriptors,
             evidence_states=evidence_states,
+            source_health=source_health,
+            previous_source_health=previous_source_health,
+            reviewed_hash_exists=(
+                self.connection.execute(
+                    """
+                    SELECT 1 FROM recommendations
+                    WHERE property_id=? AND content_hash=?
+                      AND pilot_run_id IS NOT NULL
+                    LIMIT 1
+                    """,
+                    (property_id, reviewed_content_hash),
+                ).fetchone()
+                is not None
+            ),
         )
-        if (
-            status == "invalid_watch"
-            and preserve_existing_during_unavailability
-            and specification is not None
-            and set(specification.evidence_ids) == set(evidence_states)
-            and set(evidence_states.values()) <= {"current", "last_known", "stale"}
-        ):
-            try:
-                specification.validate_structure(created_at=created_at)
-            except ValueError:
-                pass
-            else:
-                status = "valid"
-        if status != "valid" or specification is None:
-            return status, evidence_states
-        evidence_rows = self.connection.execute(
-            f"""
-            SELECT evidence_id,field_name,source_name FROM evidence_items
-            WHERE evidence_id IN (
-                {','.join('?' for _ in specification.evidence_ids)}
-            )
+
+    def record_watch_validation_event(
+        self,
+        *,
+        disposition_id: str,
+        property_id: str,
+        pilot_run_id: str,
+        validated_at: str,
+        outcome: WatchValidationOutcome,
+    ) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO watch_validation_events (
+                validation_event_id,disposition_id,property_id,pilot_run_id,
+                validated_at,validation_status,validation_reason,
+                evidence_states_json,source_health_json,evidence_descriptors_json
+            ) VALUES (?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(disposition_id,pilot_run_id) DO NOTHING
             """,
-            specification.evidence_ids,
-        ).fetchall()
-        event = specification.evidence_event_trigger or {}
-        event_source = event.get("source_name")
-        required_fields = {
-            "listing_price_reduction": {"matrix_listing", "list_price"},
-            "municipal_status_change": {"municipal_code_case"},
-        }.get(specification.trigger_type)
-        if event_source and not any(
-            row["source_name"] == event_source for row in evidence_rows
-        ):
-            status = "invalid_watch"
-        if required_fields and not any(
-            row["field_name"] in required_fields for row in evidence_rows
-        ):
-            status = "invalid_watch"
-        return status, evidence_states
+            (
+                str(uuid4()),
+                disposition_id,
+                property_id,
+                pilot_run_id,
+                validated_at,
+                outcome.status,
+                outcome.reason,
+                json.dumps(outcome.evidence_states, sort_keys=True),
+                json.dumps(outcome.source_health, sort_keys=True),
+                json.dumps(
+                    [
+                        {
+                            "evidence_id": item.evidence_id,
+                            "property_id": item.property_id,
+                            "evidence_class": item.evidence_class,
+                            "source_name": item.source_name,
+                            "signal_types": item.signal_types,
+                        }
+                        for item in outcome.evidence
+                    ],
+                    sort_keys=True,
+                ),
+            ),
+        )
+        self.connection.commit()
 
     def record_outcome(
         self,

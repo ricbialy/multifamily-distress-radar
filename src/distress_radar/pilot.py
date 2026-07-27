@@ -532,18 +532,48 @@ def _evaluate_watch(
     current_content_hash: str,
     generated_at: str,
     pilot_run_id: str,
-) -> tuple[str, str | None, dict[str, str]]:
+) -> tuple[
+    str,
+    str | None,
+    dict[str, str],
+    str,
+    dict[str, str],
+    list[dict[str, Any]],
+]:
     specification = watch_specification_from_mapping(row)
-    status, evidence_states = store.validate_watch_specification(
+    outcome = store.validate_watch_specification(
         property_id,
         specification,
         created_at=str(row["decided_at"]),
-        preserve_existing_during_unavailability=(
-            row["watch_validation_status"] == "valid"
-        ),
+        reviewed_content_hash=str(row["baseline_content_hash"]),
+        pilot_run_id=pilot_run_id,
     )
-    if status != "valid" or specification is None:
-        return status, None, evidence_states
+    store.record_watch_validation_event(
+        disposition_id=str(row["disposition_id"]),
+        property_id=property_id,
+        pilot_run_id=pilot_run_id,
+        validated_at=generated_at,
+        outcome=outcome,
+    )
+    evidence_descriptors = [
+        {
+            "evidence_id": item.evidence_id,
+            "property_id": item.property_id,
+            "evidence_class": item.evidence_class,
+            "source_name": item.source_name,
+            "signal_types": item.signal_types,
+        }
+        for item in outcome.evidence
+    ]
+    if outcome.status != "valid" or specification is None:
+        return (
+            outcome.status,
+            None,
+            outcome.evidence_states,
+            outcome.reason,
+            outcome.source_health,
+            evidence_descriptors,
+        )
 
     def source_field_transition(
         source_name: str, field_name: str
@@ -732,7 +762,14 @@ def _evaluate_watch(
                     }
 
     if event_payload is None:
-        return status, None, evidence_states
+        return (
+            outcome.status,
+            None,
+            outcome.evidence_states,
+            outcome.reason,
+            outcome.source_health,
+            evidence_descriptors,
+        )
     fingerprint = hashlib.sha256(_json(event_payload).encode()).hexdigest()
     inserted = store.connection.execute(
         """
@@ -756,8 +793,22 @@ def _evaluate_watch(
             (row["disposition_id"],),
         )
         store.connection.commit()
-        return status, specification.expected_next_action, evidence_states
-    return status, None, evidence_states
+        return (
+            outcome.status,
+            specification.expected_next_action,
+            outcome.evidence_states,
+            outcome.reason,
+            outcome.source_health,
+            evidence_descriptors,
+        )
+    return (
+        outcome.status,
+        None,
+        outcome.evidence_states,
+        outcome.reason,
+        outcome.source_health,
+        evidence_descriptors,
+    )
 
 
 def _case_detail_is_substantive(original: CodeCase, enriched: CodeCase) -> bool:
@@ -824,6 +875,17 @@ def _save_signal(
             pilot_run_id,
             "confirmed",
             source_name,
+        ),
+    )
+    store.connection.executemany(
+        """
+        INSERT OR IGNORE INTO signal_evidence_links (
+            signal_id,evidence_id,property_id,signal_type
+        ) VALUES (?,?,?,?)
+        """,
+        (
+            (signal_id, evidence_id, property_id, signal_type)
+            for evidence_id in evidence_ids
         ),
     )
     if previous is None or previous["status"] == "resolved":
@@ -1770,11 +1832,17 @@ def _persist_underwriting_and_recommendations(
         watch_status: str | None = None
         watch_triggered_action: str | None = None
         watch_evidence_states: dict[str, str] = {}
+        watch_validation_reason: str | None = None
+        watch_source_health: dict[str, str] = {}
+        watch_evidence_descriptors: list[dict[str, Any]] = []
         if disposition_row and disposition_row["disposition"] == "watch":
             (
                 watch_status,
                 watch_triggered_action,
                 watch_evidence_states,
+                watch_validation_reason,
+                watch_source_health,
+                watch_evidence_descriptors,
             ) = _evaluate_watch(
                 store,
                 row=disposition_row,
@@ -1854,6 +1922,14 @@ def _persist_underwriting_and_recommendations(
             action_ids = (*by_field["matrix_listing"], *diligence_evidence_ids)
         elif action == "investigate_owner":
             action_ids = motivation_ids
+        elif (
+            action == "manual_triage"
+            and disposition_row
+            and disposition_row["disposition"] == "watch"
+        ):
+            action_ids = tuple(
+                json.loads(disposition_row["watch_evidence_ids_json"] or "[]")
+            )
         elif action in {"insufficient_data", "manual_triage"}:
             action_ids = diligence_evidence_ids
         elif action == "watch" and disposition_row:
@@ -1888,7 +1964,13 @@ def _persist_underwriting_and_recommendations(
                 "reject": "Supported economics are demonstrably bad.",
                 "reject_high_risk": "A current hard property-risk gate failed.",
                 "insufficient_data": "Required acquisition evidence is unavailable.",
-                "manual_triage": "No automated action is semantically supported.",
+                "manual_triage": (
+                    watch_validation_reason
+                    if disposition_row
+                    and disposition_row["disposition"] == "watch"
+                    and watch_validation_reason
+                    else "No automated action is semantically supported."
+                ),
                 "dismiss": "A hash-bound analyst dismissal remains effective.",
                 "contact_owner": "A hash-bound approval and all hard gates permit contact.",
                 "contact_broker": "A hash-bound approval and all hard gates permit contact.",
@@ -1905,7 +1987,13 @@ def _persist_underwriting_and_recommendations(
                 "reject": "Keep outside the acquisition queue unless supported economics materially change.",
                 "reject_high_risk": "Keep outside outreach until the hard risk gate is cleared.",
                 "insufficient_data": "Collect the named missing evidence.",
-                "manual_triage": "Leave unranked and select a supported task only after review.",
+                "manual_triage": (
+                    "Restore the named supporting source or correct the evidence "
+                    "relationship, then revalidate the original watch."
+                    if disposition_row
+                    and disposition_row["disposition"] == "watch"
+                    else "Leave unranked and select a supported task only after review."
+                ),
                 "dismiss": "Take no action while the reviewed content hash is unchanged.",
                 "contact_owner": "Human may initiate the approved contact.",
                 "contact_broker": "Human may initiate the approved contact.",
@@ -1923,7 +2011,13 @@ def _persist_underwriting_and_recommendations(
                     + disposition_row["watch_expected_next_action"]
                     + "."
                 )
-                if action == "watch" and disposition_row
+                if action in {"watch", "manual_triage"}
+                and disposition_row
+                and disposition_row["disposition"] == "watch"
+                and (
+                    disposition_row["watch_recheck_at"]
+                    or disposition_row["watch_recheck_condition_json"]
+                )
                 else (
                     "Complete when the named evidence is obtained; revisit on a material "
                     "source-evidence hash change or hard-gate change."
@@ -1987,11 +2081,14 @@ def _persist_underwriting_and_recommendations(
             "watch_semantics": (
                 {
                     "validation_status": watch_status,
+                    "validation_reason": watch_validation_reason,
                     "watch_reason": disposition_row["watch_reason"],
                     "evidence_ids": json.loads(
                         disposition_row["watch_evidence_ids_json"] or "[]"
                     ),
                     "evidence_states": watch_evidence_states,
+                    "source_health": watch_source_health,
+                    "supporting_evidence": watch_evidence_descriptors,
                     "trigger_type": disposition_row["watch_trigger_type"],
                     "recheck_condition": json.loads(
                         disposition_row["watch_recheck_condition_json"] or "{}"
@@ -2085,11 +2182,13 @@ def _database_counts(store: IntelligenceStore) -> dict[str, int]:
         "property_source_coverage",
         "evidence_items",
         "property_signals",
+        "signal_evidence_links",
         "underwriting_runs",
         "recommendations",
         "opportunity_alerts",
         "human_dispositions",
         "watch_trigger_events",
+        "watch_validation_events",
     )
     return {
         table: store.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
@@ -2447,11 +2546,23 @@ def _write_reports(
         "evidence_ids",
         "underwriting_status",
         "identity_verified",
+        "watch_validation_status",
+        "watch_validation_reason",
+        "watch_trigger_type",
+        "watch_source_health",
     )
     with recommendations_csv.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
         for record in recommendations:
+            watch = record.get("watch_semantics") or {}
+            record = {
+                **record,
+                "watch_validation_status": watch.get("validation_status"),
+                "watch_validation_reason": watch.get("validation_reason"),
+                "watch_trigger_type": watch.get("trigger_type"),
+                "watch_source_health": watch.get("source_health"),
+            }
             writer.writerow(
                 {
                     key: _json(record[key])
@@ -2473,6 +2584,7 @@ def _write_reports(
             "reject",
             "reject_high_risk",
             "dismiss",
+            "manual_triage",
         }
     ]
     queue = sorted(eligible, key=_acquisition_sort_key)[:10]
@@ -2586,6 +2698,77 @@ def _write_reports(
             )
             if municipal_queue
             else "No currently confirmed municipal matters.\n"
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    manual_triage = [
+        {
+            "property_id": item["property_id"],
+            "folio": item["folio"],
+            "address": item["address"],
+            "recommended_action": item["recommended_action"],
+            "watch_validation_status": (
+                (item.get("watch_semantics") or {}).get("validation_status")
+            ),
+            "watch_validation_reason": (
+                (item.get("watch_semantics") or {}).get("validation_reason")
+            ),
+            "watch_trigger_type": (
+                (item.get("watch_semantics") or {}).get("trigger_type")
+            ),
+            "watch_source_health": (
+                (item.get("watch_semantics") or {}).get("source_health") or {}
+            ),
+            "supporting_evidence": (
+                (item.get("watch_semantics") or {}).get("supporting_evidence") or []
+            ),
+            "next_step": item["action_support"].get("next_step"),
+        }
+        for item in recommendations
+        if item["recommended_action"] == "manual_triage"
+    ]
+    manual_triage_path = output_dir / "manual_triage_queue.json"
+    manual_triage_path.write_text(
+        json.dumps(manual_triage, indent=2) + "\n", encoding="utf-8"
+    )
+    manual_triage_fields = (
+        "property_id",
+        "folio",
+        "address",
+        "recommended_action",
+        "watch_validation_status",
+        "watch_validation_reason",
+        "watch_trigger_type",
+        "watch_source_health",
+        "next_step",
+    )
+    manual_triage_csv = output_dir / "manual_triage_queue.csv"
+    with manual_triage_csv.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=manual_triage_fields)
+        writer.writeheader()
+        writer.writerows(
+            {
+                field: (
+                    _json(item.get(field))
+                    if isinstance(item.get(field), (list, tuple, dict))
+                    else item.get(field)
+                )
+                for field in manual_triage_fields
+            }
+            for item in manual_triage
+        )
+    manual_triage_md = output_dir / "manual_triage_queue.md"
+    manual_triage_md.write_text(
+        "# Manual-triage queue (unranked)\n\n"
+        + (
+            "\n".join(
+                f"- {item['address']} — {item['watch_validation_status'] or 'manual_triage'}: "
+                f"{item['watch_validation_reason'] or item['next_step']}"
+                for item in manual_triage
+            )
+            if manual_triage
+            else "No properties require manual triage.\n"
         )
         + "\n",
         encoding="utf-8",
@@ -2784,7 +2967,7 @@ def _write_reports(
         if not matching:
             brief_lines.append("- None.")
         brief_lines.append("")
-    brief_lines.append("## Validated watch workflows")
+    brief_lines.append("## Watch workflows and validation")
     watched = [
         item for item in recommendations if item.get("watch_semantics")
     ]
@@ -2801,7 +2984,9 @@ def _write_reports(
         )
         brief_lines.append(
             f"- {item['address']}: {watch['validation_status']} — "
-            f"{watch['watch_reason']}; evidence {evidence_states}; "
+            f"{watch['validation_reason']} {watch['watch_reason']}; "
+            f"evidence {evidence_states}; source health "
+            f"{_json(watch.get('source_health') or {})}; "
             f"recheck {trigger}; then {watch['expected_next_action']}. "
             f"Unknowns: {', '.join(item['missing_data']) or 'none recorded'}."
         )
@@ -2865,6 +3050,16 @@ def _write_reports(
                         """
                     ).fetchall()
                 ],
+                "signal_evidence_links": [
+                    dict(row)
+                    for row in store.connection.execute(
+                        """
+                        SELECT signal_id,evidence_id,property_id,signal_type
+                        FROM signal_evidence_links
+                        ORDER BY property_id,signal_type,signal_id,evidence_id
+                        """
+                    ).fetchall()
+                ],
             },
             indent=2,
         )
@@ -2878,15 +3073,23 @@ def _write_reports(
                 dict(row)
                 for row in store.connection.execute(
                     """
-                    SELECT *,
+                    SELECT d.*,
+                      d.watch_validation_status AS creation_watch_validation_status,
                       CASE
-                        WHEN disposition='watch' AND watch_validation_status IS NULL
+                        WHEN d.disposition='watch' AND v.validation_status IS NOT NULL
+                          THEN v.validation_status
+                        WHEN d.disposition='watch'
+                          AND d.watch_validation_status IS NULL
                           THEN 'legacy_incomplete_watch'
-                        ELSE watch_validation_status
+                        ELSE d.watch_validation_status
                       END AS effective_watch_validation_status
-                    FROM human_dispositions
-                    ORDER BY property_id,decided_at,disposition_id
-                    """
+                    FROM human_dispositions d
+                    LEFT JOIN watch_validation_events v
+                      ON v.disposition_id=d.disposition_id
+                     AND v.pilot_run_id=?
+                    ORDER BY d.property_id,d.decided_at,d.disposition_id
+                    """,
+                    (run_id,),
                 ).fetchall()
             ],
             indent=2,
@@ -2903,6 +3106,23 @@ def _write_reports(
                     """
                     SELECT * FROM watch_trigger_events
                     ORDER BY triggered_at,trigger_event_id
+                    """
+                ).fetchall()
+            ],
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    watch_validations_path = output_dir / "watch_validation_events.json"
+    watch_validations_path.write_text(
+        json.dumps(
+            [
+                dict(row)
+                for row in store.connection.execute(
+                    """
+                    SELECT * FROM watch_validation_events
+                    ORDER BY validated_at,validation_event_id
                     """
                 ).fetchall()
             ],
@@ -3057,11 +3277,15 @@ def _write_reports(
         municipal_queue_path,
         municipal_queue_csv,
         municipal_queue_md,
+        manual_triage_path,
+        manual_triage_csv,
+        manual_triage_md,
         mls_example_path,
         source_warnings_path,
         evidence_state_path,
         dispositions_path,
         watch_triggers_path,
+        watch_validations_path,
         change_summary_path,
         opportunity_changes_path,
         trace_json,
