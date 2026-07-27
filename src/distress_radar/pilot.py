@@ -35,7 +35,6 @@ from distress_radar.municipal_severity import (
 )
 from distress_radar.recommendations.features import (
     RecommendationFeatures,
-    ScoreDimensions,
     acquisition_attractiveness,
     calculate_evidence_scores,
     municipal_review_urgency,
@@ -48,10 +47,10 @@ from distress_radar.underwriting.commercial_multifamily import (
     CommercialMultifamilyInputs,
     underwrite_commercial,
 )
-from distress_radar.underwriting.offer_range import OfferInputs, calculate_offer_range
 
 COUNTY_SOURCE = "miami_dade_property_point_view"
 CODE_SOURCE = "hialeah_tyler_energov"
+CODE_DETAIL_SOURCE = "hialeah_tyler_energov_case_detail"
 CLERK_SOURCE = "miami_dade_clerk_official_records"
 TAX_SOURCE = "authorized_tax_csv"
 MISSING_DILIGENCE = (
@@ -111,7 +110,8 @@ def _migrate_pilot(store: IntelligenceStore) -> None:
         CREATE TABLE IF NOT EXISTS pilot_runs (
             run_id TEXT PRIMARY KEY, input_filename TEXT NOT NULL,
             input_sha256 TEXT NOT NULL, municipality TEXT NOT NULL,
-            started_at TEXT NOT NULL, completed_at TEXT, status TEXT NOT NULL
+            started_at TEXT NOT NULL, completed_at TEXT, status TEXT NOT NULL,
+            source_commit_sha TEXT
         );
         CREATE TABLE IF NOT EXISTS import_ledger (
             run_id TEXT NOT NULL REFERENCES pilot_runs(run_id),
@@ -137,6 +137,13 @@ def _migrate_pilot(store: IntelligenceStore) -> None:
         );
         """
     )
+    pilot_run_columns = {
+        row["name"] for row in store.connection.execute("PRAGMA table_info(pilot_runs)")
+    }
+    if "source_commit_sha" not in pilot_run_columns:
+        store.connection.execute(
+            "ALTER TABLE pilot_runs ADD COLUMN source_commit_sha TEXT"
+        )
     recommendation_columns = {
         row["name"]
         for row in store.connection.execute("PRAGMA table_info(recommendations)")
@@ -187,9 +194,7 @@ def _migrate_pilot(store: IntelligenceStore) -> None:
         for row in store.connection.execute("PRAGMA table_info(source_runs)")
     }
     if "pilot_run_id" not in source_run_columns:
-        store.connection.execute(
-            "ALTER TABLE source_runs ADD COLUMN pilot_run_id TEXT"
-        )
+        store.connection.execute("ALTER TABLE source_runs ADD COLUMN pilot_run_id TEXT")
     store.connection.commit()
 
 
@@ -253,7 +258,12 @@ def _county_value(record: PropertyRecord, generated_at: str) -> dict[str, Any]:
     )
     return {
         "folio": normalize_folio(record.folio),
-        "address": record.address,
+        "address": format_address(
+            record.address or "",
+            record.city or "Miami-Dade",
+            "FL",
+            record.zip_code,
+        ),
         "owner": record.owner_name,
         "owner_2": record.owner_name_2,
         "mailing_address": mailing_address or None,
@@ -268,6 +278,9 @@ def _county_value(record: PropertyRecord, generated_at: str) -> dict[str, Any]:
         "verified_units": record.unit_count,
         "units": record.unit_count,
         "property_class": record.dor_description,
+        "pilot_segment_10_80": bool(
+            record.unit_count and 10 <= record.unit_count <= 80
+        ),
     }
 
 
@@ -322,7 +335,9 @@ def _save_raw_document(
     return payload_hash, previous is None
 
 
-def _save_owner(store: IntelligenceStore, prop: CanonicalProperty, record: PropertyRecord) -> None:
+def _save_owner(
+    store: IntelligenceStore, prop: CanonicalProperty, record: PropertyRecord
+) -> None:
     if not record.owner_name:
         return
     owners = _canonical_owners(store)
@@ -346,7 +361,13 @@ def _save_owner(store: IntelligenceStore, prop: CanonicalProperty, record: Prope
             owner_id,alias,normalized_alias,source_record_id,confidence
         ) VALUES (?,?,?,?,?)
         """,
-        (owner_id, record.owner_name, normalize_owner_name(record.owner_name), record.folio, 1.0),
+        (
+            owner_id,
+            record.owner_name,
+            normalize_owner_name(record.owner_name),
+            record.folio,
+            1.0,
+        ),
     )
     store.connection.execute(
         """
@@ -370,6 +391,11 @@ _CLOCK_ONLY_KEYS = {
     "severity_score",
     "severity_reasons",
     "repetition_score",
+    "coverage_state",
+    "confirmation_status",
+    "freshness_status",
+    "execution_metadata",
+    "enrichment_state",
 }
 
 
@@ -389,9 +415,7 @@ def _material_content_hash(payload: dict[str, Any]) -> str:
     return hashlib.sha256(_json(_material_value(payload)).encode()).hexdigest()
 
 
-def _has_verified_address_evidence(
-    store: IntelligenceStore, property_id: str
-) -> bool:
+def _has_verified_address_evidence(store: IntelligenceStore, property_id: str) -> bool:
     row = store.connection.execute(
         """
         SELECT value_json,value_type,metadata_json
@@ -414,7 +438,8 @@ def _is_serious_municipal_matter(item: MunicipalSeverity) -> bool:
     return bool(
         item.currently_active
         and (
-            item.score >= 50
+            (item.score is not None and item.score >= 50)
+            or item.score is None
             or item.enforcement_stage in {"itl", "lien", "special_master"}
             or item.category
             in {
@@ -455,6 +480,7 @@ def _apply_disposition_action(
     in_scope: bool,
     serious_municipal: bool,
     underwriting_complete: bool,
+    broker_contact_available: bool = False,
 ) -> str:
     if not disposition or baseline_content_hash != current_content_hash:
         return default_action
@@ -467,16 +493,36 @@ def _apply_disposition_action(
         return default_action
     return {
         "investigate": "investigate_owner",
-        "request_documents": (
-            "contact_broker_for_documents" if listing_present else "request_documents"
-        ),
+        "request_documents": "request_documents",
         "watch": "watch",
         "dismiss": "dismiss",
         "legal_municipal_review": "human_municipal_review",
         "approved_for_contact": (
-            "contact_broker" if listing_present else "contact_owner"
+            "contact_broker"
+            if listing_present and broker_contact_available
+            else "contact_owner"
         ),
     }.get(disposition, default_action)
+
+
+def _case_detail_is_substantive(original: CodeCase, enriched: CodeCase) -> bool:
+    """Require actual case-detail evidence, not merely a returned case identifier."""
+    if enriched.violation_count > 0 or any(enriched.violations):
+        return True
+    detail_fields = (
+        "case_type",
+        "status",
+        "opened_date",
+        "closed_date",
+        "description",
+        "project_name",
+        "assigned_to",
+    )
+    return any(
+        getattr(enriched, field) not in {None, ""}
+        and getattr(enriched, field) != getattr(original, field)
+        for field in detail_fields
+    )
 
 
 def _save_signal(
@@ -605,9 +651,7 @@ def _signal_evidence_ids(
     }
 
 
-def _coverage_is_unknown(
-    coverage: list[Any], source_name: str
-) -> bool:
+def _coverage_is_unknown(coverage: list[Any], source_name: str) -> bool:
     row = next((item for item in coverage if item["source_name"] == source_name), None)
     return bool(
         row
@@ -635,7 +679,9 @@ def _price_reduction_count(
         try:
             before = json.loads(row["before_json"])
             after = json.loads(row["after_json"])
-            before_price = before.get("list_price") if isinstance(before, dict) else before
+            before_price = (
+                before.get("list_price") if isinstance(before, dict) else before
+            )
             after_price = after.get("list_price") if isinstance(after, dict) else after
             reductions += int(float(after_price) < float(before_price))
         except (TypeError, ValueError, json.JSONDecodeError):
@@ -691,7 +737,9 @@ def _record_for_matrix(
     except Exception as exc:
         error = str(exc)
 
-    municipality = county_record.city if county_record and county_record.city else "Miami-Dade"
+    municipality = (
+        county_record.city if county_record and county_record.city else "Miami-Dade"
+    )
     folio = normalize_folio(county_record.folio) if county_record else None
     address = (
         format_address(
@@ -717,7 +765,9 @@ def _record_for_matrix(
         if prior_listing
         else MatchService().match(
             folio=folio,
-            address=county_record.address if county_record and county_record.address else address,
+            address=county_record.address
+            if county_record and county_record.address
+            else address,
             municipality=municipality,
             candidates=existing,
         )
@@ -729,14 +779,34 @@ def _record_for_matrix(
         if match and match.status == MatchStatus.CONFIRMED and match.property_id
         else _property_id(folio, address, municipality)
     )
+    existing_property = next(
+        (item for item in existing if item.property_id == property_id),
+        None,
+    )
+    if county_record is None and existing_property is not None:
+        folio = existing_property.folio
+        address = existing_property.address
+        municipality = existing_property.municipality
     prop = CanonicalProperty(
         property_id=property_id,
         folio=folio,
         address=address,
         municipality=municipality,
         jurisdiction="Miami-Dade",
-        latitude=county_record.latitude if county_record else None,
-        longitude=county_record.longitude if county_record else None,
+        latitude=(
+            county_record.latitude
+            if county_record
+            else existing_property.latitude
+            if existing_property
+            else None
+        ),
+        longitude=(
+            county_record.longitude
+            if county_record
+            else existing_property.longitude
+            if existing_property
+            else None
+        ),
     )
     store.upsert_property(prop)
     listing_changes = store.save_listing_snapshot(listing, property_id)
@@ -803,14 +873,7 @@ def _record_for_matrix(
             property_id,
             EvidenceItem(
                 field="public_property_record",
-                value={
-                    **_county_value(county_record, generated_at),
-                    "address": validation.address,
-                    "pilot_segment_10_80": bool(
-                        county_record.unit_count
-                        and 10 <= county_record.unit_count <= 80
-                    ),
-                },
+                value=_county_value(county_record, generated_at),
                 source=COUNTY_SOURCE,
                 source_record_id=county_record.folio,
                 source_url=county_record.source_url,
@@ -838,7 +901,9 @@ def _record_for_matrix(
         )
         _save_owner(store, prop, county_record)
     else:
-        state = CoverageState.UNKNOWN_FAILED if error else CoverageState.CONFIRMED_ABSENT
+        state = (
+            CoverageState.UNKNOWN_FAILED if error else CoverageState.CONFIRMED_ABSENT
+        )
         store.set_source_coverage(
             property_id=property_id,
             source_name=COUNTY_SOURCE,
@@ -875,6 +940,8 @@ def _persist_off_market(
     pilot_run_id: str,
     generated_at: str,
     source_healthy: bool,
+    detail_healthy: bool,
+    enriched_case_ids: set[str],
 ) -> int:
     count = 0
     seen_signal_ids: set[str] = set()
@@ -935,41 +1002,73 @@ def _persist_off_market(
         )
         case_evidence_ids: list[str] = []
         for case in cases:
-            severity = classify_municipal_case(case, as_of=generated_at)
-            case_evidence_id = store.add_evidence(
+            signal_identity = _json(
+                (
                     prop.property_id,
-                    EvidenceItem(
-                        field="municipal_code_case",
-                        value={
-                            "case_number": case.case_number,
-                            "case_type": case.case_type,
-                            "status": case.status,
-                            "opened_date": case.opened_date,
-                            "closed_date": case.closed_date,
-                            "description": case.description,
-                            "violation_count": case.violation_count,
-                            "violations": list(case.violations),
-                            "severity_category": severity.category,
-                            "severity_score": severity.score,
-                            "status_category": severity.status_category,
-                            "age_days": severity.age_days,
-                            "severity_reasons": severity.reasons,
-                            "enforcement_stage": severity.enforcement_stage,
-                            "substantive_hazard": severity.substantive_hazard,
-                            "cure_complexity": severity.cure_complexity,
-                            "likely_cost": severity.likely_cost,
-                            "repetition_score": severity.repetition_score,
-                            "currently_active": severity.currently_active,
-                        },
-                        source=CODE_SOURCE,
-                        source_record_id=case.source_record_id,
-                        source_url=case.source_url,
-                        fetched_at=case.fetched_at,
-                        freshness_status=FreshnessStatus.FRESH,
-                        confidence=1.0,
-                        value_type=ValueType.REPORTED,
-                    ),
+                    "off_market_live_code_case",
+                    {"case_source_record_id": case.source_record_id},
                 )
+            )
+            expected_signal_id = (
+                "signal-" + hashlib.sha256(signal_identity.encode()).hexdigest()[:24]
+            )
+            existing_signal = store.connection.execute(
+                "SELECT 1 FROM property_signals WHERE signal_id=?",
+                (expected_signal_id,),
+            ).fetchone()
+            if not detail_healthy and existing_signal:
+                # Preserve the prior enriched evidence and mark it last-known below.
+                seen_signal_ids.add(expected_signal_id)
+                store.connection.execute(
+                    """
+                    UPDATE property_signals SET confirmation_status='last_known'
+                    WHERE signal_id=? AND status='active'
+                    """,
+                    (expected_signal_id,),
+                )
+                store.connection.commit()
+                continue
+            severity = classify_municipal_case(
+                case,
+                as_of=generated_at,
+                enriched=case.source_record_id in enriched_case_ids,
+            )
+            case_evidence_id = store.add_evidence(
+                prop.property_id,
+                EvidenceItem(
+                    field="municipal_code_case",
+                    value={
+                        "case_number": case.case_number,
+                        "case_type": case.case_type,
+                        "status": case.status,
+                        "opened_date": case.opened_date,
+                        "closed_date": case.closed_date,
+                        "description": case.description,
+                        "violation_count": case.violation_count,
+                        "violations": list(case.violations),
+                        "severity_category": severity.category,
+                        "severity_score": severity.score,
+                        "status_category": severity.status_category,
+                        "age_days": severity.age_days,
+                        "severity_reasons": severity.reasons,
+                        "enforcement_stage": severity.enforcement_stage,
+                        "substantive_hazard": severity.substantive_hazard,
+                        "cure_complexity": severity.cure_complexity,
+                        "likely_cost": severity.likely_cost,
+                        "repetition_score": severity.repetition_score,
+                        "currently_active": severity.currently_active,
+                        "enrichment_state": severity.enrichment_state,
+                        "confirmation_status": "currently_confirmed",
+                    },
+                    source=CODE_SOURCE,
+                    source_record_id=case.source_record_id,
+                    source_url=case.source_url,
+                    fetched_at=case.fetched_at,
+                    freshness_status=FreshnessStatus.FRESH,
+                    confidence=1.0,
+                    value_type=ValueType.REPORTED,
+                ),
+            )
             case_evidence_ids.append(case_evidence_id)
             seen_signal_ids.add(
                 _save_signal(
@@ -1017,265 +1116,6 @@ def _persist_off_market(
     return count
 
 
-def _persist_underwriting_and_recommendations_legacy(
-    store: IntelligenceStore, *, generated_at: str
-) -> None:
-    for prop in _canonical_properties(store):
-        property_id = prop.property_id
-        listing = store.connection.execute(
-            "SELECT 1 FROM listing_snapshots WHERE property_id=? LIMIT 1",
-            (property_id,),
-        ).fetchone()
-        off_market = store.connection.execute(
-            """
-            SELECT 1 FROM property_signals
-            WHERE property_id=? AND signal_type='off_market_live_code_case' LIMIT 1
-            """,
-            (property_id,),
-        ).fetchone()
-        case_evidence = store.connection.execute(
-            """
-            SELECT 1 FROM evidence_items
-            WHERE property_id=? AND field_name='municipal_code_case' LIMIT 1
-            """,
-            (property_id,),
-        ).fetchone()
-        coverage = store.property_source_coverage(property_id)
-        county = next(
-            (row for row in coverage if row["source_name"] == COUNTY_SOURCE), None
-        )
-        identity_verified = bool(
-            prop.folio
-            and county
-            and county["state"] == CoverageState.CONFIRMED_PRESENT.value
-            and (not listing or _has_verified_address_evidence(store, property_id))
-        )
-        source_gaps = tuple(
-            f"{row['source_name']}:{row['state']}"
-            for row in coverage
-            if row["state"]
-            in {
-                CoverageState.UNKNOWN_FAILED.value,
-                CoverageState.UNKNOWN_NOT_RUN.value,
-                CoverageState.UNKNOWN_STALE.value,
-            }
-        )
-        source_gap_evidence_ids: list[str] = []
-        for row in coverage:
-            if row["state"] not in {
-                CoverageState.UNKNOWN_FAILED.value,
-                CoverageState.UNKNOWN_NOT_RUN.value,
-                CoverageState.UNKNOWN_STALE.value,
-            }:
-                continue
-            source_gap_evidence_ids.append(
-                store.add_evidence(
-                    property_id,
-                    EvidenceItem.unknown(
-                        field=f"source_coverage:{row['source_name']}",
-                        source=row["source_name"],
-                        source_record_id=row["run_id"] or property_id,
-                        fetched_at=row["checked_at"],
-                        reason=row["error_message"] or row["state"],
-                        source_url=row["source_url"],
-                    ),
-                )
-            )
-        diligence_evidence_ids = tuple(
-            store.add_evidence(
-                property_id,
-                EvidenceItem.unknown(
-                    field=f"diligence:{field}",
-                    source="acquisition_diligence",
-                    source_record_id=property_id,
-                    fetched_at=generated_at,
-                    reason="not_provided_or_not_supported",
-                ),
-            )
-            for field in MISSING_DILIGENCE
-        )
-        units_row = store.connection.execute(
-            """
-            SELECT value_json FROM evidence_items
-            WHERE property_id=? AND field_name='public_property_record'
-            ORDER BY fetched_at DESC LIMIT 1
-            """,
-            (property_id,),
-        ).fetchone()
-        units = None
-        if units_row:
-            units = json.loads(units_row["value_json"]).get("units")
-        in_scope = units is None or 10 <= units <= 80
-        inputs = CommercialMultifamilyInputs(
-            units=units,
-            current_noi=None,
-            gross_potential_rent=None,
-            market_vacancy_rate=None,
-            taxes_after_sale=None,
-            insurance=None,
-            management_rate=None,
-            utilities=None,
-            maintenance=None,
-            other_operating_expenses=None,
-            deferred_maintenance=None,
-            capital_expenditures=None,
-            market_cap_rate_low=None,
-            market_cap_rate_base=None,
-            market_cap_rate_high=None,
-            public_unit_count_verified=bool(units),
-        )
-        underwriting = underwrite_commercial(inputs)
-        underwriting_run_id = str(uuid4())
-        store.connection.execute(
-            """
-            INSERT INTO underwriting_runs (
-                run_id,property_id,model_name,as_of,inputs_json,outputs_json
-            ) VALUES (?,?,?,?,?,?)
-            """,
-            (
-                underwriting_run_id,
-                property_id,
-                "commercial_multifamily",
-                generated_at,
-                _json(asdict(inputs)),
-                _json(asdict(underwriting)),
-            ),
-        )
-        offer = calculate_offer_range(OfferInputs())
-        channels = tuple(
-            name
-            for name, present in (("mls", listing), ("off_market", off_market))
-            if present
-        )
-        missing = tuple(dict.fromkeys((*MISSING_DILIGENCE, *source_gaps)))
-        features = RecommendationFeatures(
-            property_id=property_id,
-            discovery_channels=channels,
-            scores=ScoreDimensions(
-                owner_motivation=0,
-                economics=0,
-                market_pressure=20 if listing else 0,
-                property_risk=70 if case_evidence else 10,
-                data_confidence=80 if identity_verified else 25,
-                data_completeness=25,
-                data_freshness=90,
-            ),
-            has_underwriting=underwriting.status == "complete",
-            critical_documents_missing=True,
-            violation_review_required=bool(case_evidence),
-            municipal_search_required=False,
-            why_now=(
-                ("Live municipal code case matched by exact folio.",)
-                if case_evidence
-                else ("Current authorized Matrix listing.",)
-            ),
-            key_risks=(
-                ("Municipal case requires human review.",)
-                if case_evidence
-                else ("Operating documents are unavailable.",)
-            ),
-            missing_data=missing,
-            evidence=(),
-            is_synthetic=False,
-            identity_verified=identity_verified,
-            specific_opportunity=bool(case_evidence),
-            in_scope=in_scope,
-        )
-        result = recommend(features)
-        evidence_ids = tuple(
-            row["evidence_id"]
-            for row in store.connection.execute(
-                """
-                SELECT evidence_id FROM evidence_items
-                WHERE property_id=? ORDER BY fetched_at,evidence_id
-                """,
-                (property_id,),
-            ).fetchall()
-        )
-        listing_evidence_ids = tuple(
-            row["evidence_id"]
-            for row in store.connection.execute(
-                """
-                SELECT evidence_id FROM evidence_items
-                WHERE property_id=? AND field_name='matrix_listing'
-                ORDER BY fetched_at,evidence_id
-                """,
-                (property_id,),
-            ).fetchall()
-        )
-        identity_evidence_ids = tuple(
-            row["evidence_id"]
-            for row in store.connection.execute(
-                """
-                SELECT evidence_id FROM evidence_items
-                WHERE property_id=? AND field_name IN (
-                    'validated_address','public_property_record'
-                ) ORDER BY fetched_at,evidence_id
-                """,
-                (property_id,),
-            ).fetchall()
-        )
-        municipal_evidence_ids = tuple(
-            row["evidence_id"]
-            for row in store.connection.execute(
-                """
-                SELECT evidence_id FROM evidence_items
-                WHERE property_id=? AND field_name='municipal_code_case'
-                ORDER BY fetched_at,evidence_id
-                """,
-                (property_id,),
-            ).fetchall()
-        )
-        explanation = {
-            **result.explanation,
-            "missing_data": missing,
-            "evidence_ids": evidence_ids,
-            "statement_evidence_ids": {
-                "why_this_property_surfaced": (
-                    municipal_evidence_ids or listing_evidence_ids
-                ),
-                "identity": identity_evidence_ids,
-                "property_risk": municipal_evidence_ids,
-                "missing_source_data": tuple(source_gap_evidence_ids),
-                "missing_diligence": diligence_evidence_ids,
-                "recommended_action": (
-                    municipal_evidence_ids
-                    if result.action == "human_violation_review"
-                    else identity_evidence_ids
-                    if result.action == "verify_identity"
-                    else diligence_evidence_ids
-                    if result.action in {"request_documents", "insufficient_data"}
-                    else evidence_ids
-                ),
-            },
-            "discovery_channels": channels,
-            "identity_verified": identity_verified,
-            "underwriting_status": underwriting.status,
-            "underwriting_run_id": underwriting_run_id,
-            "offer_gate": {
-                **offer.to_dict(),
-                "display": "OFFER GATE: FAIL — INSUFFICIENT DATA",
-            },
-        }
-        store.connection.execute(
-            """
-            INSERT INTO recommendations (
-                recommendation_id,property_id,generated_at,action,
-                scores_json,explanation_json
-            ) VALUES (?,?,?,?,?,?)
-            """,
-            (
-                str(uuid4()),
-                property_id,
-                generated_at,
-                result.action,
-                _json(asdict(result.scores)),
-                _json(explanation),
-            ),
-        )
-        store.connection.commit()
-
-
 def _persist_underwriting_and_recommendations(
     store: IntelligenceStore, *, generated_at: str, pilot_run_id: str
 ) -> None:
@@ -1313,12 +1153,8 @@ def _persist_underwriting_and_recommendations(
             (property_id,),
         ).fetchone()
         coverage = store.property_source_coverage(property_id)
-        confirmed_evidence_ids = _signal_evidence_ids(
-            store, property_id, "confirmed"
-        )
-        last_known_evidence_ids = _signal_evidence_ids(
-            store, property_id, "last_known"
-        )
+        confirmed_evidence_ids = _signal_evidence_ids(store, property_id, "confirmed")
+        last_known_evidence_ids = _signal_evidence_ids(store, property_id, "last_known")
         county_coverage = next(
             (row for row in coverage if row["source_name"] == COUNTY_SOURCE), None
         )
@@ -1374,7 +1210,7 @@ def _persist_underwriting_and_recommendations(
                 (
                     (row["evidence_id"], json.loads(row["value_json"]))
                     for row in store.connection.execute(
-                """
+                        """
                 SELECT e.evidence_id,e.value_json FROM evidence_items e
                 WHERE e.property_id=? AND e.field_name='official_record'
                   AND e.evidence_id=(
@@ -1386,7 +1222,7 @@ def _persist_underwriting_and_recommendations(
                   )
                 ORDER BY e.source_record_id
                 """,
-                (property_id,),
+                        (property_id,),
                     ).fetchall()
                 ),
                 key=lambda item: _json(item[1]),
@@ -1402,7 +1238,7 @@ def _persist_underwriting_and_recommendations(
                 (
                     (row["evidence_id"], json.loads(row["value_json"]))
                     for row in store.connection.execute(
-                """
+                        """
                 SELECT e.evidence_id,e.value_json FROM evidence_items e
                 WHERE e.property_id=? AND e.field_name='tax_delinquency'
                   AND e.evidence_id=(
@@ -1414,7 +1250,7 @@ def _persist_underwriting_and_recommendations(
                   )
                 ORDER BY e.source_record_id
                 """,
-                (property_id,),
+                        (property_id,),
                     ).fetchall()
                 ),
                 key=lambda item: _json(item[1]),
@@ -1544,7 +1380,13 @@ def _persist_underwriting_and_recommendations(
             municipal_search_required=False,
             why_now=tuple(
                 [
-                    f"{item.case_type}: {item.category} ({item.score:.0f}/100)."
+                    f"{item.case_type}: {item.category} ("
+                    + (
+                        f"{item.score:.0f}/100"
+                        if item.score is not None
+                        else "urgency unknown; enrichment required"
+                    )
+                    + ")."
                     for item in municipal
                 ]
                 or (
@@ -1561,7 +1403,9 @@ def _persist_underwriting_and_recommendations(
             evidence=(),
             is_synthetic=False,
             identity_verified=identity_verified,
-            specific_opportunity=bool(municipal or independent_motivation or listing_row),
+            specific_opportunity=bool(
+                municipal or independent_motivation or listing_row
+            ),
             in_scope=in_scope,
             listing_active=listing_active,
             serious_municipal_matter=serious_municipal,
@@ -1578,8 +1422,6 @@ def _persist_underwriting_and_recommendations(
             "economics": scores.economics,
             "market_pressure": scores.market_pressure,
             "owner_motivation": scores.owner_motivation,
-            "data_confidence": scores.data_confidence,
-            "data_completeness": scores.data_completeness,
             "maximum_municipal_severity": municipal_urgency_score,
             "oldest_unresolved_case_days": max(
                 (
@@ -1590,15 +1432,39 @@ def _persist_underwriting_and_recommendations(
                 ),
                 default=0,
             ),
-            "serious_case_count": sum(item.score >= 50 for item in municipal),
+            "serious_case_count": sum(
+                item.score is not None and item.score >= 50 for item in municipal
+            ),
         }
+        last_known_municipal = [
+            {
+                **value,
+                "confirmation_status": "last_known",
+                "coverage_state": next(
+                    (
+                        row["state"]
+                        for row in coverage
+                        if row["source_name"] in {CODE_DETAIL_SOURCE, CODE_SOURCE}
+                        and row["state"]
+                        in {
+                            CoverageState.UNKNOWN_FAILED.value,
+                            CoverageState.UNKNOWN_NOT_RUN.value,
+                            CoverageState.UNKNOWN_STALE.value,
+                        }
+                    ),
+                    "unknown_stale",
+                ),
+            }
+            for evidence_id, value in historical_municipal_records
+            if evidence_id in last_known_evidence_ids
+        ]
         material_municipal = (
-            [
-                value
-                for evidence_id, value in historical_municipal_records
-                if evidence_id in last_known_evidence_ids
-            ]
-            if _coverage_is_unknown(coverage, CODE_SOURCE)
+            last_known_municipal
+            if last_known_municipal
+            and (
+                _coverage_is_unknown(coverage, CODE_SOURCE)
+                or _coverage_is_unknown(coverage, CODE_DETAIL_SOURCE)
+            )
             else municipal_values
         )
         material_official = (
@@ -1645,6 +1511,7 @@ def _persist_underwriting_and_recommendations(
             in_scope=in_scope,
             serious_municipal=serious_municipal,
             underwriting_complete=underwriting.status == "complete",
+            broker_contact_available=False,
         )
 
         evidence_rows = store.connection.execute(
@@ -1697,9 +1564,62 @@ def _persist_underwriting_and_recommendations(
             action_ids = (*by_field["matrix_listing"], *diligence_evidence_ids)
         elif action == "investigate_owner":
             action_ids = motivation_ids
+        elif action in {"insufficient_data", "manual_triage"}:
+            action_ids = diligence_evidence_ids
+        elif action == "reject":
+            action_ids = by_field["matrix_listing"]
         else:
             action_ids = identity_ids or evidence_ids
-        offer = calculate_offer_range(OfferInputs())
+        municipal_coverage = next(
+            (row for row in coverage if row["source_name"] == CODE_SOURCE),
+            None,
+        )
+        detail_coverage = next(
+            (row for row in coverage if row["source_name"] == CODE_DETAIL_SOURCE),
+            None,
+        )
+        action_support = {
+            "trigger_evidence_ids": action_ids,
+            "why_supported": {
+                "excluded": "Verified unit scope or identity hard gate failed.",
+                "verify_identity": "Authoritative identity evidence is absent or unresolved.",
+                "human_municipal_review": (
+                    "A current serious, ambiguous, or unknown municipal matter needs judgment."
+                ),
+                "contact_broker_for_documents": (
+                    "An active listing has a validated broker path and named missing documents."
+                ),
+                "request_documents": "An active opportunity has specifically named missing documents.",
+                "investigate_owner": "Current unresolved Clerk or unpaid-tax evidence supports investigation.",
+                "reject": "Supported economics are demonstrably bad.",
+                "reject_high_risk": "A current hard property-risk gate failed.",
+                "insufficient_data": "Required acquisition evidence is unavailable.",
+                "manual_triage": "No automated action is semantically supported.",
+                "dismiss": "A hash-bound analyst dismissal remains effective.",
+                "contact_owner": "A hash-bound approval and all hard gates permit contact.",
+                "contact_broker": "A hash-bound approval and all hard gates permit contact.",
+            }.get(action, "No action-specific support is defined."),
+            "missing_information": missing,
+            "next_step": {
+                "excluded": "Do not advance; resolve the failed scope or identity gate.",
+                "verify_identity": "Validate the folio, address, and unit count against the county record.",
+                "human_municipal_review": "Review the cited case detail and violation text.",
+                "contact_broker_for_documents": "Use the validated broker path to request the named documents.",
+                "request_documents": "Obtain the named missing documents before underwriting.",
+                "investigate_owner": "Review the cited objective public record and confirm it remains unresolved.",
+                "reject": "Keep outside the acquisition queue unless supported economics materially change.",
+                "reject_high_risk": "Keep outside outreach until the hard risk gate is cleared.",
+                "insufficient_data": "Collect the named missing evidence.",
+                "manual_triage": "Leave unranked and select a supported task only after review.",
+                "dismiss": "Take no action while the reviewed content hash is unchanged.",
+                "contact_owner": "Human may initiate the approved contact.",
+                "contact_broker": "Human may initiate the approved contact.",
+            }.get(action, "Do not act."),
+            "completion_or_revisit_condition": (
+                "Complete when the named evidence is obtained; revisit on a material "
+                "source-evidence hash change or hard-gate change."
+            ),
+        }
         explanation = {
             **result.explanation,
             "What the next human action should be": (action,),
@@ -1726,13 +1646,38 @@ def _persist_underwriting_and_recommendations(
             "ranking_tiebreakers": ranking_tiebreakers,
             "discovery_channels": channels,
             "identity_verified": identity_verified,
+            "in_scope": in_scope,
+            "acquisition_qualified": bool(
+                in_scope
+                and identity_verified
+                and score_result.metrics.get("economics_status") != "demonstrably_bad"
+                and (
+                    (scores.economics is not None and scores.economics > 0)
+                    or scores.market_pressure > 0
+                    or scores.owner_motivation > 0
+                )
+            ),
             "underwriting_status": underwriting.status,
             "underwriting_run_id": underwriting_run_id,
             "pilot_run_id": pilot_run_id,
             "municipal_cases": municipal_values,
+            "municipal_cases_currently_confirmed": municipal_values,
+            "municipal_cases_last_known": last_known_municipal,
+            "municipal_evidence_state": {
+                "case_list": (
+                    municipal_coverage["state"]
+                    if municipal_coverage
+                    else "unknown_not_run"
+                ),
+                "case_detail": (
+                    detail_coverage["state"] if detail_coverage else "unknown_not_run"
+                ),
+            },
+            "action_support": action_support,
             "offer_gate": {
-                **offer.to_dict(),
-                "display": "OFFER GATE: FAIL — INSUFFICIENT DATA",
+                "status": "not_available",
+                "reason": "insufficient_property_specific_underwriting_data",
+                "display": "Not available — insufficient property-specific underwriting data",
             },
         }
         previous = store.connection.execute(
@@ -1815,8 +1760,6 @@ _ACQUISITION_WEIGHTS = {
     "economics": 0.35,
     "market_pressure": 0.25,
     "owner_motivation": 0.25,
-    "data_confidence": 0.10,
-    "data_completeness": 0.05,
 }
 _HAZARD_PRIORITY = {
     "unsafe_life_safety": 6,
@@ -1825,16 +1768,18 @@ _HAZARD_PRIORITY = {
     "permit": 3,
     "administrative": 2,
     "cosmetic": 1,
+    "unknown_hazard": 0,
 }
 
 
 def _acquisition_sort_key(item: dict[str, Any]) -> tuple[Any, ...]:
+    def component_value(component: str) -> float:
+        value = item["scores"].get(component)
+        return float(value) if value is not None else float("-inf")
+
     return (
         -float(item["acquisition_attractiveness_score"]),
-        *(
-            -float(item["scores"].get(component, 0))
-            for component in _ACQUISITION_WEIGHTS
-        ),
+        *(-component_value(component) for component in _ACQUISITION_WEIGHTS),
         str(item["property_id"]),
     )
 
@@ -1849,7 +1794,11 @@ def _municipal_sort_key(item: dict[str, Any]) -> tuple[Any, ...]:
         default=0,
     )
     return (
-        -float(item["municipal_review_urgency_score"]),
+        -(
+            float(item["municipal_review_urgency_score"])
+            if item["municipal_review_urgency_score"] is not None
+            else -1.0
+        ),
         -strongest_hazard,
         -max((int(case.get("age_days") or 0) for case in cases), default=0),
         str(item["property_id"]),
@@ -1860,15 +1809,25 @@ def _acquisition_rank_reason(
     item: dict[str, Any], next_item: dict[str, Any] | None
 ) -> str:
     if next_item is None:
-        return "Final item in the capped acquisition-attractiveness ranking."
+        contributions = {
+            component: _ACQUISITION_WEIGHTS[component]
+            * float(item["scores"].get(component) or 0)
+            for component in _ACQUISITION_WEIGHTS
+        }
+        component, contribution = max(contributions.items(), key=lambda pair: pair[1])
+        return (
+            "Final item in the acquisition-attractiveness ranking; "
+            f"{component} is its leading substantive weighted component "
+            f"at {contribution:.2f} points."
+        )
     contributions = {
         component: _ACQUISITION_WEIGHTS[component]
-        * float(item["scores"].get(component, 0))
+        * float(item["scores"].get(component) or 0)
         for component in _ACQUISITION_WEIGHTS
     }
     next_contributions = {
         component: _ACQUISITION_WEIGHTS[component]
-        * float(next_item["scores"].get(component, 0))
+        * float(next_item["scores"].get(component) or 0)
         for component in _ACQUISITION_WEIGHTS
     }
     deltas = {
@@ -1891,12 +1850,19 @@ def _municipal_rank_reason(
 ) -> str:
     if next_item is None:
         return "Final item in the capped municipal-review urgency ranking."
-    item_urgency = float(item["municipal_review_urgency_score"])
-    next_urgency = float(next_item["municipal_review_urgency_score"])
+    item_urgency = item["municipal_review_urgency_score"]
+    next_urgency = next_item["municipal_review_urgency_score"]
     if item_urgency != next_urgency:
+        if item_urgency is None:
+            return "Urgency is unranked because substantive hazard enrichment is unavailable."
+        if next_urgency is None:
+            return (
+                f"Confirmed numeric urgency {float(item_urgency):.2f} ranks above "
+                "an unranked unknown-hazard review."
+            )
         return (
-            f"Current municipal-review urgency is {item_urgency:.2f} versus "
-            f"{next_urgency:.2f}; that component caused the ordering."
+            f"Current municipal-review urgency is {float(item_urgency):.2f} versus "
+            f"{float(next_urgency):.2f}; that component caused the ordering."
         )
     item_hazard = max(
         (
@@ -1927,7 +1893,9 @@ def _municipal_rank_reason(
             f"Urgency and hazard tie; active-case age ({item_age} versus "
             f"{next_age} days) caused the ordering."
         )
-    return "Municipal components tie; stable canonical property identity sets the order."
+    return (
+        "Municipal components tie; stable canonical property identity sets the order."
+    )
 
 
 def _report_records(store: IntelligenceStore) -> list[dict[str, Any]]:
@@ -1966,6 +1934,7 @@ def _report_records(store: IntelligenceStore) -> list[dict[str, Any]]:
         ).fetchone()
         listing = json.loads(listing_row["normalized_json"]) if listing_row else {}
         municipal_cases = explanation.get("municipal_cases") or []
+        municipal_cases_last_known = explanation.get("municipal_cases_last_known") or []
         source_links = sorted(
             {
                 evidence_row["source_url"]
@@ -2010,6 +1979,8 @@ def _report_records(store: IntelligenceStore) -> list[dict[str, Any]]:
                 "underwriting_run_id": explanation["underwriting_run_id"],
                 "offer_gate": explanation["offer_gate"],
                 "identity_verified": explanation["identity_verified"],
+                "in_scope": bool(explanation.get("in_scope")),
+                "acquisition_qualified": bool(explanation.get("acquisition_qualified")),
                 "generated_at": row["generated_at"],
                 "pilot_run_id": row["pilot_run_id"],
                 "change_type": row["change_type"],
@@ -2032,13 +2003,20 @@ def _report_records(store: IntelligenceStore) -> list[dict[str, Any]]:
                 "building_area": county.get("building_area"),
                 "lot_size": county.get("lot_size"),
                 "municipal_cases": municipal_cases,
+                "municipal_cases_currently_confirmed": municipal_cases,
+                "municipal_cases_last_known": municipal_cases_last_known,
+                "municipal_evidence_state": explanation.get("municipal_evidence_state")
+                or {},
+                "action_support": explanation.get("action_support") or {},
                 "source_links": source_links,
             }
         )
     return sorted(records, key=_acquisition_sort_key)
 
 
-def _write_reports(store: IntelligenceStore, output_dir: Path, run_id: str) -> tuple[Path, ...]:
+def _write_reports(
+    store: IntelligenceStore, output_dir: Path, run_id: str
+) -> tuple[Path, ...]:
     output_dir.mkdir(parents=True, exist_ok=True)
     run = dict(
         store.connection.execute(
@@ -2059,7 +2037,13 @@ def _write_reports(store: IntelligenceStore, output_dir: Path, run_id: str) -> t
     with ledger_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(
             handle,
-            fieldnames=("line_number", "status", "source_record_id", "address", "reason"),
+            fieldnames=(
+                "line_number",
+                "status",
+                "source_record_id",
+                "address",
+                "reason",
+            ),
         )
         writer.writeheader()
         writer.writerows(dict(row) for row in ledger_rows)
@@ -2104,23 +2088,26 @@ def _write_reports(store: IntelligenceStore, output_dir: Path, run_id: str) -> t
         for record in recommendations:
             writer.writerow(
                 {
-                    key: _json(record[key]) if isinstance(record[key], (list, tuple, dict)) else record[key]
+                    key: _json(record[key])
+                    if isinstance(record[key], (list, tuple, dict))
+                    else record[key]
                     for key in fields
                 }
             )
 
-    qualified_actions = {
-        "contact_broker_for_documents",
-        "human_municipal_review",
-        "investigate_owner",
-        "verify_identity",
-        "request_documents",
-        "watch",
-    }
     eligible = [
         item
         for item in recommendations
-        if item["recommended_action"] in qualified_actions
+        if item["acquisition_qualified"]
+        and item["recommended_action"]
+        not in {
+            "excluded",
+            "verify_identity",
+            "human_municipal_review",
+            "reject",
+            "reject_high_risk",
+            "dismiss",
+        }
     ]
     queue = sorted(eligible, key=_acquisition_sort_key)[:10]
     for index, item in enumerate(queue, start=1):
@@ -2134,24 +2121,108 @@ def _write_reports(store: IntelligenceStore, output_dir: Path, run_id: str) -> t
     acquisition_queue_path.write_text(
         json.dumps(queue, indent=2) + "\n", encoding="utf-8"
     )
-    municipal_queue = sorted(
+    numeric_municipal = sorted(
         (
             dict(item)
             for item in recommendations
-            if float(item["municipal_review_urgency_score"]) > 0
-            and item["municipal_cases"]
+            if item["municipal_review_urgency_score"] is not None
+            and float(item["municipal_review_urgency_score"]) > 0
+            and item["municipal_cases_currently_confirmed"]
         ),
         key=_municipal_sort_key,
-    )[:10]
-    for index, item in enumerate(municipal_queue, start=1):
+    )
+    unknown_municipal = sorted(
+        (
+            dict(item)
+            for item in recommendations
+            if item["municipal_review_urgency_score"] is None
+            and item["municipal_cases_currently_confirmed"]
+        ),
+        key=lambda item: str(item["property_id"]),
+    )
+    municipal_queue = [*numeric_municipal, *unknown_municipal][:10]
+    for index, item in enumerate(numeric_municipal[:10], start=1):
         item["municipal_rank"] = index
+        item["queue_section"] = "ranked_confirmed_urgency"
         item["municipal_rank_reason"] = _municipal_rank_reason(
             item,
-            municipal_queue[index] if index < len(municipal_queue) else None,
+            numeric_municipal[index] if index < len(numeric_municipal) else None,
+        )
+    for item in unknown_municipal:
+        item["municipal_rank"] = None
+        item["queue_section"] = "unranked_manual_triage"
+        item["municipal_rank_reason"] = (
+            "Unranked: current case-list presence is known, but substantive "
+            "hazard enrichment is unavailable."
         )
     municipal_queue_path = output_dir / "municipal_review_queue.json"
     municipal_queue_path.write_text(
         json.dumps(municipal_queue, indent=2) + "\n", encoding="utf-8"
+    )
+    queue_fields = (
+        "rank",
+        "property_id",
+        "folio",
+        "address",
+        "acquisition_attractiveness_score",
+        "recommended_action",
+        "ranked_above_next_reason",
+    )
+    acquisition_queue_csv = output_dir / "acquisition_queue.csv"
+    with acquisition_queue_csv.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=queue_fields)
+        writer.writeheader()
+        writer.writerows(
+            {field: item.get(field) for field in queue_fields} for item in queue
+        )
+    acquisition_queue_md = output_dir / "acquisition_queue.md"
+    acquisition_queue_md.write_text(
+        "# Acquisition-attractiveness queue\n\n"
+        + (
+            "\n".join(
+                f"{item['rank']}. {item['address']} — "
+                f"{item['acquisition_attractiveness_score']:.2f}; "
+                f"{item['ranked_above_next_reason']}"
+                for item in queue
+            )
+            if queue
+            else "No property has defensible substantive acquisition evidence.\n"
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    municipal_fields = (
+        "municipal_rank",
+        "queue_section",
+        "property_id",
+        "folio",
+        "address",
+        "municipal_review_urgency_score",
+        "municipal_rank_reason",
+    )
+    municipal_queue_csv = output_dir / "municipal_review_queue.csv"
+    with municipal_queue_csv.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=municipal_fields)
+        writer.writeheader()
+        writer.writerows(
+            {field: item.get(field) for field in municipal_fields}
+            for item in municipal_queue
+        )
+    municipal_queue_md = output_dir / "municipal_review_queue.md"
+    municipal_queue_md.write_text(
+        "# Municipal-review queue\n\n"
+        + (
+            "\n".join(
+                f"{item.get('municipal_rank') or 'Unranked'}. {item['address']} — "
+                f"{item['municipal_review_urgency_score'] if item['municipal_review_urgency_score'] is not None else 'unknown'}; "
+                f"{item['municipal_rank_reason']}"
+                for item in municipal_queue
+            )
+            if municipal_queue
+            else "No currently confirmed municipal matters.\n"
+        )
+        + "\n",
+        encoding="utf-8",
     )
     mls_example = next(
         (dict(item) for item in recommendations if "mls" in item["discovery_channels"]),
@@ -2183,19 +2254,21 @@ def _write_reports(store: IntelligenceStore, output_dir: Path, run_id: str) -> t
     ]
     if queue:
         top = queue[0]
+        economics_display = (
+            f"{top['scores']['economics']:.2f}"
+            if top["scores"]["economics"] is not None
+            else "unknown; weight omitted"
+        )
         score_terms = [
-            f"0.35×economics({top['scores']['economics']:.2f})",
+            f"0.35×economics({economics_display})",
             f"0.25×market_pressure({top['scores']['market_pressure']:.2f})",
             f"0.25×owner_motivation({top['scores']['owner_motivation']:.2f})",
-            f"0.10×data_confidence({top['scores']['data_confidence']:.2f})",
-            f"0.05×data_completeness({top['scores']['data_completeness']:.2f})",
         ]
         brief_lines.extend(
             [
                 "## Exact scoring calculation for the top-ranked property",
                 "",
-                " + ".join(score_terms)
-                + f" = **{top['qualification_score']:.2f}**",
+                " + ".join(score_terms) + f" = **{top['qualification_score']:.2f}**",
                 "",
             ]
         )
@@ -2206,7 +2279,12 @@ def _write_reports(store: IntelligenceStore, output_dir: Path, run_id: str) -> t
             *(
                 [
                     f"- {item['municipal_rank']}. {item['address']}: "
-                    f"{item['municipal_review_urgency_score']:.2f}/100 — "
+                    + (
+                        f"{item['municipal_review_urgency_score']:.2f}/100"
+                        if item["municipal_review_urgency_score"] is not None
+                        else "unranked / enrichment unknown"
+                    )
+                    + " — "
                     f"{item['municipal_rank_reason']}"
                     for item in municipal_queue
                 ]
@@ -2246,8 +2324,12 @@ def _write_reports(store: IntelligenceStore, output_dir: Path, run_id: str) -> t
             )
         links = item["source_links"] or ["No human-readable source URL persisted"]
         component_lines = [
-            f"{dimension}: {score:.2f} — "
-            + "; ".join(item["score_components"].get(dimension) or ("No supported points.",))
+            f"{dimension}: "
+            + (f"{score:.2f}" if score is not None else "unknown")
+            + " — "
+            + "; ".join(
+                item["score_components"].get(dimension) or ("No supported points.",)
+            )
             for dimension, score in item["scores"].items()
         ]
         brief_lines.extend(
@@ -2276,9 +2358,15 @@ def _write_reports(store: IntelligenceStore, output_dir: Path, run_id: str) -> t
                 "- Municipal matters: "
                 + ("; ".join(municipal_lines) if municipal_lines else "None matched"),
                 "- Motivation evidence: "
-                + "; ".join(item["score_components"].get("owner_motivation") or ("None independently supported.",)),
+                + "; ".join(
+                    item["score_components"].get("owner_motivation")
+                    or ("None independently supported.",)
+                ),
                 "- Property-risk evidence: "
-                + "; ".join(item["score_components"].get("property_risk") or ("No active municipal risk supported.",)),
+                + "; ".join(
+                    item["score_components"].get("property_risk")
+                    or ("No active municipal risk supported.",)
+                ),
                 "- Exact missing diligence: " + ", ".join(item["missing_data"]),
                 "- Score components:",
                 *[f"  - {line}" for line in component_lines],
@@ -2355,6 +2443,11 @@ def _write_reports(store: IntelligenceStore, output_dir: Path, run_id: str) -> t
         (
             f"- {row['property_id']} / {row['source_name']}: {row['state']}"
             + (f" — {row['error_message']}" if row["error_message"] else "")
+            + (
+                f"; {len(next((item['municipal_cases_last_known'] for item in recommendations if item['property_id'] == row['property_id']), []))} municipal case(s) retained as last-known, not currently confirmed"
+                if row["source_name"] in {CODE_SOURCE, CODE_DETAIL_SOURCE}
+                else ""
+            )
         )
         for row in warnings
     )
@@ -2363,6 +2456,57 @@ def _write_reports(store: IntelligenceStore, output_dir: Path, run_id: str) -> t
     source_warnings_path = output_dir / "source_health_warnings.json"
     source_warnings_path.write_text(
         json.dumps(warnings, indent=2) + "\n", encoding="utf-8"
+    )
+    evidence_state_path = output_dir / "evidence_state.json"
+    evidence_state_path.write_text(
+        json.dumps(
+            {
+                "properties": [
+                    {
+                        "property_id": item["property_id"],
+                        "municipal": {
+                            "currently_confirmed": item[
+                                "municipal_cases_currently_confirmed"
+                            ],
+                            "last_known": item["municipal_cases_last_known"],
+                            "coverage": item["municipal_evidence_state"],
+                        },
+                    }
+                    for item in recommendations
+                ],
+                "signals": [
+                    dict(row)
+                    for row in store.connection.execute(
+                        """
+                        SELECT signal_id,property_id,signal_type,status,
+                               confirmation_status,source_name,pilot_run_id
+                        FROM property_signals
+                        ORDER BY property_id,signal_type,signal_id
+                        """
+                    ).fetchall()
+                ],
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    dispositions_path = output_dir / "human_dispositions.json"
+    dispositions_path.write_text(
+        json.dumps(
+            [
+                dict(row)
+                for row in store.connection.execute(
+                    """
+                    SELECT * FROM human_dispositions
+                    ORDER BY property_id,decided_at,disposition_id
+                    """
+                ).fetchall()
+            ],
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
     )
     change_summary = {
         change_type: store.connection.execute(
@@ -2405,6 +2549,26 @@ def _write_reports(store: IntelligenceStore, output_dir: Path, run_id: str) -> t
     change_summary_path = output_dir / "change_summary.json"
     change_summary_path.write_text(
         json.dumps(change_summary, indent=2) + "\n", encoding="utf-8"
+    )
+    opportunity_changes_path = output_dir / "opportunity_changes.json"
+    opportunity_changes_path.write_text(
+        json.dumps(
+            [
+                dict(row)
+                for row in store.connection.execute(
+                    """
+                    SELECT property_id,change_type,action,content_hash
+                    FROM recommendations
+                    WHERE pilot_run_id=?
+                    ORDER BY change_type,property_id
+                    """,
+                    (run_id,),
+                ).fetchall()
+            ],
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
     )
     brief_lines.extend(
         [
@@ -2485,10 +2649,17 @@ def _write_reports(store: IntelligenceStore, output_dir: Path, run_id: str) -> t
         brief_path,
         queue_path,
         acquisition_queue_path,
+        acquisition_queue_csv,
+        acquisition_queue_md,
         municipal_queue_path,
+        municipal_queue_csv,
+        municipal_queue_md,
         mls_example_path,
         source_warnings_path,
+        evidence_state_path,
+        dispositions_path,
         change_summary_path,
+        opportunity_changes_path,
         trace_json,
         trace_md,
     )
@@ -2503,6 +2674,9 @@ def run_pilot(
     generated_at: str | None = None,
     property_collector: Any | None = None,
     code_collector: Any | None = None,
+    clerk_collector: Any | None = None,
+    tax_collector: Any | None = None,
+    source_commit_sha: str | None = None,
     simulate_source_failure: bool = False,
 ) -> PilotRunResult:
     if not matrix_path.is_file():
@@ -2526,10 +2700,20 @@ def run_pilot(
         store.connection.execute(
             """
             INSERT INTO pilot_runs (
-                run_id,input_filename,input_sha256,municipality,started_at,status
-            ) VALUES (?,?,?,?,?,'running')
+                run_id,input_filename,input_sha256,municipality,started_at,status,
+                source_commit_sha
+            ) VALUES (?,?,?,?,?,'running',?)
             """,
-            (run_id, matrix_path.name, matrix_sha, municipality, generated_at),
+            (
+                run_id,
+                matrix_path.name,
+                matrix_sha,
+                municipality,
+                generated_at,
+                source_commit_sha
+                or os.environ.get("RADAR_SOURCE_COMMIT")
+                or "uncommitted",
+            ),
         )
         store.connection.executemany(
             """
@@ -2599,10 +2783,11 @@ def run_pilot(
         _link_source_run(store, code_run, run_id)
         cases: tuple[CodeCase, ...] = ()
         inventory: tuple[PropertyRecord, ...] = ()
-        code_error: str | None = None
+        code_list_error: str | None = None
+        enrichment_error: str | None = None
         inventory_error: str | None = None
         if simulate_source_failure:
-            code_error = "simulated source failure"
+            code_list_error = "simulated source failure"
         else:
             try:
                 code_result = code_collector.collect(
@@ -2614,7 +2799,7 @@ def run_pilot(
                 for document in code_result.raw_documents:
                     _save_raw_document(store, code_run, CODE_SOURCE, document)
             except Exception as exc:
-                code_error = str(exc)
+                code_list_error = str(exc)
             try:
                 inventory_result = property_collector.collect()
                 inventory = inventory_result.records
@@ -2625,6 +2810,7 @@ def run_pilot(
                 county_failures += 1
 
         enriched_case_count = 0
+        enriched_case_ids: set[str] = set()
         target_folios = {
             normalize_folio(record.folio)
             for record in inventory
@@ -2636,14 +2822,23 @@ def run_pilot(
             if normalize_folio(case.parcel_number) in target_folios
         )
         enrich_records = getattr(code_collector, "enrich_records", None)
-        if not code_error and intersecting_cases and callable(enrich_records):
+        if not code_list_error and intersecting_cases and callable(enrich_records):
             try:
                 enrichment_result = enrich_records(
                     intersecting_cases, include_violations=True
                 )
-                enriched_by_id = {
-                    case.source_record_id: case for case in enrichment_result.records
+                original_by_id = {
+                    case.source_record_id: case for case in intersecting_cases
                 }
+                enriched_by_id = {
+                    case.source_record_id: case
+                    for case in enrichment_result.records
+                    if case.source_record_id in original_by_id
+                    and _case_detail_is_substantive(
+                        original_by_id[case.source_record_id], case
+                    )
+                }
+                enriched_case_ids = set(enriched_by_id)
                 cases = tuple(
                     enriched_by_id.get(case.source_record_id, case) for case in cases
                 )
@@ -2651,7 +2846,7 @@ def run_pilot(
                 for document in enrichment_result.raw_documents:
                     _save_raw_document(store, code_run, CODE_SOURCE, document)
             except Exception as exc:
-                code_error = f"targeted case enrichment failed: {exc}"
+                enrichment_error = f"targeted case enrichment failed: {exc}"
 
         cases_by_folio: dict[str, list[CodeCase]] = {}
         for case in cases:
@@ -2666,7 +2861,17 @@ def run_pilot(
             code_run_id=code_run,
             pilot_run_id=run_id,
             generated_at=generated_at,
-            source_healthy=code_error is None and inventory_error is None,
+            source_healthy=(code_list_error is None and inventory_error is None),
+            detail_healthy=(
+                code_list_error is None
+                and enrichment_error is None
+                and inventory_error is None
+                and (
+                    not intersecting_cases
+                    or len(enriched_case_ids) == len(intersecting_cases)
+                )
+            ),
+            enriched_case_ids=enriched_case_ids,
         )
 
         store.finish_source_run(
@@ -2687,25 +2892,31 @@ def run_pilot(
         )
         store.finish_source_run(
             run_id=code_run,
-            state=SourceHealthState.DEGRADED if code_error else SourceHealthState.HEALTHY,
+            state=(
+                SourceHealthState.DEGRADED
+                if code_list_error or enrichment_error
+                else SourceHealthState.HEALTHY
+            ),
             records_examined=len(cases),
             records_changed=enriched_case_count,
-            error_message=code_error,
+            error_message=code_list_error or enrichment_error,
         )
 
         clerk_run = store.start_source_run(CLERK_SOURCE)
         _link_source_run(store, clerk_run, run_id)
         clerk_by_folio: dict[str, list[Any]] = {}
         clerk_error: str | None = None
-        clerk_configured = bool(os.environ.get("MIAMI_DADE_CLERK_AUTH_KEY"))
+        clerk_configured = bool(
+            clerk_collector or os.environ.get("MIAMI_DADE_CLERK_AUTH_KEY")
+        )
         if clerk_configured:
             try:
                 folios = [
-                    prop.folio
-                    for prop in _canonical_properties(store)
-                    if prop.folio
+                    prop.folio for prop in _canonical_properties(store) if prop.folio
                 ]
-                clerk_result = MiamiDadeClerkCollector(config).collect(folios)
+                clerk_result = (
+                    clerk_collector or MiamiDadeClerkCollector(config)
+                ).collect(folios)
                 for document in clerk_result.raw_documents:
                     _save_raw_document(store, clerk_run, CLERK_SOURCE, document)
                 for record in clerk_result.records:
@@ -2739,11 +2950,18 @@ def run_pilot(
         tax_run = store.start_source_run(TAX_SOURCE)
         _link_source_run(store, tax_run, run_id)
         tax_path_value = os.environ.get("RADAR_TAX_CSV")
+        tax_configured = bool(tax_collector or tax_path_value)
         tax_by_folio: dict[str, list[Any]] = {}
         tax_error: str | None = None
-        if tax_path_value:
+        if tax_configured:
             try:
-                tax_records = import_tax_csv(config.slug, Path(tax_path_value))
+                if tax_collector:
+                    collected_tax = tax_collector.collect()
+                    tax_records = tuple(
+                        getattr(collected_tax, "records", collected_tax)
+                    )
+                else:
+                    tax_records = import_tax_csv(config.slug, Path(tax_path_value))
                 for record in tax_records:
                     tax_by_folio.setdefault(
                         normalize_folio(record.folio) or "", []
@@ -2781,7 +2999,7 @@ def run_pilot(
                 CoverageState.NOT_APPLICABLE
                 if not is_hialeah
                 else CoverageState.UNKNOWN_FAILED
-                if code_error
+                if code_list_error
                 else CoverageState.CONFIRMED_PRESENT
                 if matched
                 else CoverageState.CONFIRMED_ABSENT
@@ -2794,12 +3012,44 @@ def run_pilot(
                 records_examined=len(cases),
                 records_matched=len(matched),
                 run_id=code_run,
-                error_message=code_error if state == CoverageState.UNKNOWN_FAILED else None,
+                error_message=(
+                    code_list_error if state == CoverageState.UNKNOWN_FAILED else None
+                ),
                 checked_at=generated_at,
             )
-            official_records = clerk_by_folio.get(
-                normalize_folio(prop.folio) or "", []
+            matched_enriched = sum(
+                item.source_record_id in enriched_case_ids for item in matched
             )
+            detail_state = (
+                CoverageState.NOT_APPLICABLE
+                if not is_hialeah
+                else CoverageState.UNKNOWN_FAILED
+                if code_list_error
+                or (matched and (enrichment_error or inventory_error))
+                else CoverageState.CONFIRMED_PRESENT
+                if matched and matched_enriched == len(matched)
+                else CoverageState.UNKNOWN_NOT_RUN
+                if matched
+                else CoverageState.CONFIRMED_ABSENT
+            )
+            store.set_source_coverage(
+                property_id=prop.property_id,
+                source_name=CODE_DETAIL_SOURCE,
+                state=detail_state,
+                query_scope=f"case-detail-and-violations:folio:{prop.folio or 'unverified'}",
+                records_examined=len(intersecting_cases),
+                records_matched=matched_enriched,
+                run_id=code_run,
+                error_message=(
+                    code_list_error or enrichment_error or inventory_error
+                    if detail_state == CoverageState.UNKNOWN_FAILED
+                    else "case detail enrichment was not run or incomplete"
+                    if detail_state == CoverageState.UNKNOWN_NOT_RUN
+                    else None
+                ),
+                checked_at=generated_at,
+            )
+            official_records = clerk_by_folio.get(normalize_folio(prop.folio) or "", [])
             clerk_state = (
                 CoverageState.UNKNOWN_NOT_RUN
                 if not clerk_configured
@@ -2874,7 +3124,7 @@ def run_pilot(
             )
             tax_state = (
                 CoverageState.UNKNOWN_NOT_RUN
-                if not tax_path_value
+                if not tax_configured
                 else CoverageState.UNKNOWN_FAILED
                 if tax_error
                 else CoverageState.NOT_APPLICABLE
@@ -2927,11 +3177,7 @@ def run_pilot(
                 records_matched=len(tax_records_for_property),
                 run_id=tax_run,
                 error_message=tax_error
-                or (
-                    "RADAR_TAX_CSV not configured"
-                    if not tax_path_value
-                    else None
-                ),
+                or ("RADAR_TAX_CSV not configured" if not tax_configured else None),
                 checked_at=generated_at,
             )
         _reconcile_source_signals(
@@ -2946,7 +3192,7 @@ def run_pilot(
             store,
             source_name=TAX_SOURCE,
             seen_signal_ids=seen_tax_signal_ids,
-            healthy=bool(tax_path_value) and tax_error is None,
+            healthy=tax_configured and tax_error is None,
             pilot_run_id=run_id,
             observed_at=generated_at,
         )

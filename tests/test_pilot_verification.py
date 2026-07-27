@@ -11,6 +11,7 @@ from distress_radar.pilot_verification import (
     _active_intersection_count,
     _controlled_change_is_isolated,
     _controlled_copy,
+    _disposition_supports_action,
     _evidence_value_supports_action,
     _run_tests,
     verify_real_pilot,
@@ -39,7 +40,9 @@ class PilotVerificationTests(unittest.TestCase):
         self.assertIn("OK", output)
         self.assertEqual(run.call_count, 2)
 
-    def test_verification_harness_refuses_to_overwrite_acceptance_database(self) -> None:
+    def test_verification_harness_refuses_to_overwrite_acceptance_database(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             database = root / "existing.sqlite"
@@ -68,9 +71,7 @@ class PilotVerificationTests(unittest.TestCase):
 
             self.assertEqual(mls_number, "A12057467")
             self.assertIn("A12057467", description)
-            self.assertIn(
-                "A12057467,W,1440 SW 4th St", destination.read_text()
-            )
+            self.assertIn("A12057467,W,1440 SW 4th St", destination.read_text())
 
     def test_g5_counts_distinct_confirmed_current_run_intersections(self) -> None:
         connection = sqlite3.connect(":memory:")
@@ -85,10 +86,38 @@ class PilotVerificationTests(unittest.TestCase):
         connection.executemany(
             "INSERT INTO property_signals VALUES (?,?,?,?,?,?)",
             [
-                ("s1", "p1", "off_market_live_code_case", "active", "confirmed", "run-2"),
-                ("s2", "p1", "off_market_live_code_case", "active", "confirmed", "run-2"),
-                ("s3", "p2", "off_market_live_code_case", "active", "last_known", "run-1"),
-                ("s4", "p3", "off_market_live_code_case", "resolved", "resolved", "run-2"),
+                (
+                    "s1",
+                    "p1",
+                    "off_market_live_code_case",
+                    "active",
+                    "confirmed",
+                    "run-2",
+                ),
+                (
+                    "s2",
+                    "p1",
+                    "off_market_live_code_case",
+                    "active",
+                    "confirmed",
+                    "run-2",
+                ),
+                (
+                    "s3",
+                    "p2",
+                    "off_market_live_code_case",
+                    "active",
+                    "last_known",
+                    "run-1",
+                ),
+                (
+                    "s4",
+                    "p3",
+                    "off_market_live_code_case",
+                    "resolved",
+                    "resolved",
+                    "run-2",
+                ),
             ],
         )
         self.assertEqual(_active_intersection_count(connection, "run-2"), 1)
@@ -129,6 +158,44 @@ class PilotVerificationTests(unittest.TestCase):
                 None,
                 value_type="unknown",
                 metadata={},
+            )
+        )
+
+    def test_g7_validates_hash_bound_active_dispositions(self) -> None:
+        connection = sqlite3.connect(":memory:")
+        connection.execute(
+            """
+            CREATE TABLE human_dispositions (
+                disposition_id TEXT PRIMARY KEY,
+                property_id TEXT NOT NULL,
+                disposition TEXT NOT NULL,
+                decided_at TEXT NOT NULL,
+                notes TEXT,
+                baseline_content_hash TEXT NOT NULL,
+                active INTEGER NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO human_dispositions VALUES
+            ('d1','p1','dismiss','2026-07-24T12:00:00Z',NULL,'hash-1',1)
+            """
+        )
+        self.assertTrue(
+            _disposition_supports_action(
+                connection,
+                property_id="p1",
+                content_hash="hash-1",
+                action="dismiss",
+            )
+        )
+        self.assertFalse(
+            _disposition_supports_action(
+                connection,
+                property_id="p1",
+                content_hash="changed-hash",
+                action="dismiss",
             )
         )
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -11,7 +12,7 @@ from distress_radar.models import CodeCase
 @dataclass(frozen=True)
 class MunicipalSeverity:
     category: str
-    score: float
+    score: float | None
     status_category: str
     age_days: int | None
     case_type: str
@@ -22,16 +23,17 @@ class MunicipalSeverity:
     likely_cost: str
     repetition_score: float
     currently_active: bool
+    enrichment_state: str
 
 
 def _date(value: str | None) -> datetime | None:
     if not value:
         return None
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value)
     except ValueError:
         try:
-            parsed = datetime.strptime(value[:10], "%Y-%m-%d")
+            parsed = datetime.strptime(value[:10], "%Y-%m-%d").replace(tzinfo=UTC)
         except ValueError:
             return None
     return parsed.replace(tzinfo=parsed.tzinfo or UTC)
@@ -99,8 +101,7 @@ def _enforcement_stage(case: CodeCase) -> str:
     status = str(case.status or "").casefold()
     case_type = str(case.case_type or "").casefold()
     if case.closed_date or any(
-        marker in status
-        for marker in ("closed", "resolved", "complied", "dismissed")
+        marker in status for marker in ("closed", "resolved", "complied", "dismissed")
     ):
         return "closed"
     if (
@@ -135,59 +136,74 @@ def _enforcement_stage(case: CodeCase) -> str:
     return "open"
 
 
-def _substantive_hazard(text: str) -> str:
-    if any(
-        term in text
-        for term in (
-            "minimum housing",
-            "mold",
-            "sewage",
-            "no hot water",
-            "no electricity",
-            "infestation",
-        )
-    ):
-        return "minimum_housing"
-    if any(
-        term in text
-        for term in (
-            "unsafe structure",
-            "life safety",
-            "imminent danger",
-            "fire hazard",
-            "structural failure",
-        )
+def _matches(text: str, *patterns: str) -> bool:
+    return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in patterns)
+
+
+def _substantive_hazard(text: str, *, enriched: bool) -> str:
+    if not enriched:
+        return "unknown_hazard"
+    # Life-safety conditions take precedence when multiple hazards are described.
+    if _matches(
+        text,
+        r"\bunsafe\s+structures?\b",
+        r"\blife[-\s]?safety\b",
+        r"\bimminent\s+danger\b",
+        r"\bfire\s+hazards?\b",
+        r"\bstructural(?:ly)?\s+(?:failure|instability|unstable)\b",
+        r"\b(?:roof|balcon(?:y|ies))\s+(?:collapse|collapsed|failing|failure)\b",
+        r"\belectrical\s+(?:hazard|danger|failure|violation)\b",
+        r"\b(?:inoperable|missing|failed?)\s+(?:fire\s+alarms?|smoke\s+detectors?|sprinklers?)\b",
+        r"\b(?:blocked|inadequate|missing)\s+(?:egress|exits?)\b",
+        r"\bno\s+(?:electricity|power)\b",
+        r"\bgas\s+leaks?\b",
     ):
         return "unsafe_life_safety"
-    if "recertification" in text or "40 year" in text or "50 year" in text:
+    if _matches(
+        text,
+        r"\bminimum\s+housing\b",
+        r"\bmold\b",
+        r"\bsewage\b",
+        r"\bno\s+hot\s+water\b",
+        r"\binfestation\b",
+    ):
+        return "minimum_housing"
+    if _matches(text, r"\brecertification\b", r"\b(?:40|50)[-\s]?year\b"):
         return "recertification"
-    if any(
-        term in text
-        for term in (
-            "building without a permit",
-            "without a permit",
-            "work without permit",
-            "unpermitted",
-        )
+    if _matches(
+        text,
+        r"\bbuilding\s+without\s+(?:a\s+)?permit\b",
+        r"\bwithout\s+(?:a\s+)?permit\b",
+        r"\bwork\s+without\s+(?:a\s+)?permit\b",
+        r"\bunpermitted\b",
     ):
         return "permit"
-    if any(
-        term in text
-        for term in (
-            "graffiti",
-            "sign",
-            "dumpster",
-            "trash",
-            "grass",
-            "landscape",
-            "address number",
-        )
+    if _matches(
+        text,
+        r"\bgraffiti\b",
+        r"\bsigns?\b",
+        r"\bdumpsters?\b",
+        r"\btrash\b",
+        r"\bgrass\b",
+        r"\blandscap(?:e|ing)\b",
+        r"\baddress\s+numbers?\b",
     ):
         return "cosmetic"
-    return "administrative"
+    if _matches(
+        text,
+        r"\badministrative\b",
+        r"\bfees?\b",
+        r"\bregistration\b",
+        r"\bpaperwork\b",
+        r"\brecords?\s+request\b",
+    ):
+        return "administrative"
+    return "unknown_hazard"
 
 
 def _cure_profile(hazard: str) -> tuple[str, str]:
+    if hazard == "unknown_hazard":
+        return "unknown", "unknown"
     if hazard in {"unsafe_life_safety", "recertification"}:
         return "complex", "high_or_unknown"
     if hazard in {"minimum_housing", "permit"}:
@@ -196,7 +212,10 @@ def _cure_profile(hazard: str) -> tuple[str, str]:
 
 
 def classify_municipal_case(
-    case: CodeCase, *, as_of: str | datetime
+    case: CodeCase,
+    *,
+    as_of: str | datetime,
+    enriched: bool | None = None,
 ) -> MunicipalSeverity:
     as_of_date = _date(as_of) if isinstance(as_of, str) else as_of
     opened = _date(case.opened_date)
@@ -209,7 +228,9 @@ def classify_municipal_case(
     enforcement_stage = _enforcement_stage(case)
     currently_active = enforcement_stage != "closed"
     text = _text(case, violations)
-    hazard = _substantive_hazard(text)
+    if enriched is None:
+        enriched = bool(case.description or case.project_name or violations)
+    hazard = _substantive_hazard(text, enriched=enriched)
     cure_complexity, likely_cost = _cure_profile(hazard)
 
     stage_points = {
@@ -229,11 +250,13 @@ def classify_municipal_case(
         "recertification": 40,
         "minimum_housing": 50,
         "unsafe_life_safety": 65,
+        "unknown_hazard": 0,
     }[hazard]
     cure_points = {
         "simple_to_moderate": 3,
         "moderate_to_complex": 12,
         "complex": 20,
+        "unknown": 0,
     }[cure_complexity]
     repetition_score = 0.0
     if currently_active:
@@ -244,28 +267,24 @@ def classify_municipal_case(
         if "repeat" in text:
             repetition_score += 5
     repetition_score = min(20.0, repetition_score)
-    score = (
+    score: float | None = (
         min(
             100.0,
             stage_points + hazard_points + cure_points + repetition_score,
         )
-        if currently_active
+        if currently_active and enriched
         else 0.0
     )
-    if (
-        currently_active
-        and enforcement_stage == "nov"
-        and hazard in {"cosmetic", "administrative"}
-        and repetition_score == 0
-    ):
-        score = 10.0
-
+    if currently_active and not enriched:
+        score = None
     if hazard == "unsafe_life_safety":
         category = "unsafe_or_life_safety"
     elif enforcement_stage == "special_master":
         category = "special_master_escalation"
     elif enforcement_stage in {"itl", "lien"}:
         category = "intent_to_lien_or_lien"
+    elif hazard == "unknown_hazard":
+        category = "unknown_hazard"
     else:
         category = "minor_warning"
 
@@ -297,13 +316,18 @@ def classify_municipal_case(
         likely_cost=likely_cost,
         repetition_score=repetition_score,
         currently_active=currently_active,
+        enrichment_state="confirmed_enriched" if enriched else "never_enriched",
     )
 
 
 def severity_from_mapping(value: dict[str, Any]) -> MunicipalSeverity:
     return MunicipalSeverity(
         category=str(value.get("severity_category") or "minor_warning"),
-        score=float(value.get("severity_score") or 0),
+        score=(
+            float(value["severity_score"])
+            if value.get("severity_score") is not None
+            else None
+        ),
         status_category=str(value.get("status_category") or "open_or_unknown"),
         age_days=(
             int(value["age_days"]) if value.get("age_days") is not None else None
@@ -311,13 +335,17 @@ def severity_from_mapping(value: dict[str, Any]) -> MunicipalSeverity:
         case_type=str(value.get("case_type") or "Unknown case type"),
         reasons=tuple(value.get("severity_reasons") or ()),
         enforcement_stage=str(value.get("enforcement_stage") or "open"),
-        substantive_hazard=str(
-            value.get("substantive_hazard") or "administrative"
-        ),
-        cure_complexity=str(
-            value.get("cure_complexity") or "simple_to_moderate"
-        ),
+        substantive_hazard=str(value.get("substantive_hazard") or "unknown_hazard"),
+        cure_complexity=str(value.get("cure_complexity") or "simple_to_moderate"),
         likely_cost=str(value.get("likely_cost") or "unknown"),
         repetition_score=float(value.get("repetition_score") or 0),
         currently_active=bool(value.get("currently_active", True)),
+        enrichment_state=str(
+            value.get("enrichment_state")
+            or (
+                "confirmed_enriched"
+                if value.get("severity_score") is not None
+                else "never_enriched"
+            )
+        ),
     )

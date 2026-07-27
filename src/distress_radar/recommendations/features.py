@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, replace
 from typing import Any
 
 from distress_radar.domain.evidence import EvidenceItem
-from distress_radar.domain.signals import PropertySignal
 from distress_radar.municipal_severity import MunicipalSeverity
 from distress_radar.tax_import import is_unpaid_status
 
@@ -12,7 +12,7 @@ from distress_radar.tax_import import is_unpaid_status
 @dataclass(frozen=True)
 class ScoreDimensions:
     owner_motivation: float
-    economics: float
+    economics: float | None
     market_pressure: float
     property_risk: float
     data_confidence: float
@@ -20,8 +20,15 @@ class ScoreDimensions:
     data_freshness: float
 
     def __post_init__(self) -> None:
-        if any(not 0 <= value <= 100 for value in self.__dict__.values()):
-            raise ValueError("score dimensions must be between 0 and 100")
+        for name, value in self.__dict__.items():
+            if value is None and name == "economics":
+                continue
+            lower_bound = -100 if name == "economics" else 0
+            if value is None or not lower_bound <= value <= 100:
+                raise ValueError(
+                    "score dimensions must be between 0 and 100, except "
+                    "demonstrably bad economics may be negative"
+                )
 
 
 @dataclass(frozen=True)
@@ -46,6 +53,7 @@ class RecommendationFeatures:
     municipal_case_present: bool = False
     independent_motivation: bool = False
     human_contact_approved: bool = True
+    broker_contact_available: bool = False
 
     @classmethod
     def actionable(
@@ -72,27 +80,6 @@ class RecommendationFeatures:
         return replace(self, **changes)
 
 
-def score_owner_motivation(signals: tuple[PropertySignal, ...]) -> float:
-    weights = {
-        "tax_delinquency": 30,
-        "lis_pendens": 35,
-        "recorded_liens": 15,
-        "long_ownership": 10,
-        "absentee_owner": 10,
-        "inactive_entity": 15,
-    }
-    return min(100, sum(weights.get(signal.signal_type, 0) for signal in signals))
-
-
-def score_property_risk(signals: tuple[PropertySignal, ...]) -> float:
-    weights = {
-        "recorded_liens": 15,
-        "code_enforcement_escalation": 30,
-        "unsafe_structure": 60,
-    }
-    return min(100, sum(weights.get(signal.signal_type, 0) for signal in signals))
-
-
 def score_data_quality(
     evidence: tuple[EvidenceItem, ...],
 ) -> tuple[float, float, float]:
@@ -112,7 +99,7 @@ def score_data_quality(
 class EvidenceScoreResult:
     dimensions: ScoreDimensions
     components: dict[str, tuple[str, ...]]
-    metrics: dict[str, float]
+    metrics: dict[str, Any]
 
 
 def _number(value: Any) -> float | None:
@@ -121,26 +108,29 @@ def _number(value: Any) -> float | None:
 
 def acquisition_attractiveness(scores: ScoreDimensions) -> float:
     """Evidence-backed acquisition potential; municipal risk is never a benefit."""
-    return round(
-        0.35 * scores.economics
-        + 0.25 * scores.market_pressure
-        + 0.25 * scores.owner_motivation
-        + 0.10 * scores.data_confidence
-        + 0.05 * scores.data_completeness,
-        2,
+    components = (
+        (scores.economics, 0.35),
+        (scores.market_pressure, 0.25),
+        (scores.owner_motivation, 0.25),
     )
+    available = tuple(
+        (value, weight) for value, weight in components if value is not None
+    )
+    if not available or not any(value != 0 for value, _ in available):
+        return 0.0
+    # A missing component makes no contribution. Do not renormalize the remaining
+    # components: doing so can make unknown economics outrank supported economics.
+    return round(sum(value * weight for value, weight in available), 2)
 
 
 def municipal_review_urgency(
     municipal: tuple[MunicipalSeverity, ...],
-) -> float:
-    return round(
-        max(
-            (item.score for item in municipal if item.currently_active),
-            default=0.0,
-        ),
-        2,
-    )
+) -> float | None:
+    active = tuple(item for item in municipal if item.currently_active)
+    numeric = tuple(item.score for item in active if item.score is not None)
+    if numeric:
+        return round(max(numeric), 2)
+    return None if active else 0.0
 
 
 def calculate_evidence_scores(
@@ -195,31 +185,28 @@ def calculate_evidence_scores(
             f"{len(unpaid_taxes)} supported unpaid-tax record(s): +30"
         )
 
-    metrics: dict[str, float] = {}
-    economics = 0.0
+    metrics: dict[str, Any] = {}
+    economics: float | None = None
     price = _number(listing.get("list_price"))
     units = _number(county.get("verified_units"))
     price_per_unit: float | None = None
     if price is not None and units not in (None, 0):
         price_per_unit = round(price / units, 2)
         metrics["price_per_unit"] = price_per_unit
-        points = (
-            20
-            if price_per_unit <= 100_000
-            else 10
-            if price_per_unit <= 150_000
-            else 5
-            if price_per_unit <= 200_000
-            else 0
-        )
-        economics += points
         components["economics"].append(
-            f"Asking price per verified unit ${price_per_unit:,.0f}: +{points}"
+            f"Asking price per verified unit ${price_per_unit:,.0f}; "
+            "screening metric only until NOI and expenses support economics."
         )
     noi = _number(listing.get("noi"))
     expenses = _number(listing.get("expenses"))
     cap_rate_supported = False
-    if (
+    if noi is not None and noi <= 0:
+        economics = -50.0
+        metrics["economics_status"] = "demonstrably_bad"
+        components["economics"].append(
+            f"Reported NOI ${noi:,.0f} is non-positive: -50 and qualification fails."
+        )
+    elif (
         price not in (None, 0)
         and noi is not None
         and noi > 0
@@ -229,20 +216,29 @@ def calculate_evidence_scores(
         cap_rate_supported = True
         cap_rate = round(noi / price, 4)
         metrics["reported_noi_cap_rate"] = cap_rate
-        points = 30 if cap_rate >= 0.06 else 20 if cap_rate >= 0.045 else 0
-        economics += points
-        components["economics"].append(
-            f"Reported NOI/asking-price rate {cap_rate:.2%}: +{points}"
+        cap_points = 30 if cap_rate >= 0.06 else 15 if cap_rate >= 0.045 else 0
+        ppu_points = (
+            20
+            if price_per_unit is not None and price_per_unit <= 100_000
+            else 10
+            if price_per_unit is not None and price_per_unit <= 150_000
+            else 5
+            if price_per_unit is not None and price_per_unit <= 200_000
+            else 0
         )
-    if price_per_unit is None:
+        economics = float(cap_points + ppu_points)
+        metrics["economics_status"] = (
+            "supported_good" if economics > 0 else "supported_neutral"
+        )
+        components["economics"].append(
+            f"Supported NOI/asking-price rate {cap_rate:.2%}: +{cap_points}; "
+            f"supported price-per-unit contribution: +{ppu_points}."
+        )
+    else:
         metrics["economics_status"] = "unknown"
         components["economics"].append(
-            "Economics unknown: asking price and verified unit count are not both supported."
+            "Economics unknown: positive NOI, asking price, and expenses are not all supported."
         )
-    elif economics == 0:
-        metrics["economics_status"] = "demonstrably_bad"
-    else:
-        metrics["economics_status"] = "supported"
     if not cap_rate_supported:
         metrics["cap_rate_status"] = "unknown"
 
@@ -262,14 +258,20 @@ def calculate_evidence_scores(
         components["market_pressure"].append(
             f"{price_reductions} supported price reduction(s): +{points}"
         )
-    remarks = str(listing.get("remarks") or "").casefold()
-    if any(
-        phrase in remarks
-        for phrase in ("motivated", "price reduced", "bring all offers", "must sell")
+    remarks = str(listing.get("remarks") or "")
+    negated_motivation = re.search(
+        r"\b(?:unmotivated|not\s+(?:a\s+)?motivated|not\s+motivated)\b",
+        remarks,
+        flags=re.IGNORECASE,
+    )
+    if not negated_motivation and re.search(
+        r"\b(?:motivated|bring\s+all\s+offers|must\s+sell)\b",
+        remarks,
+        flags=re.IGNORECASE,
     ):
-        pressure += 15
+        metrics["unverified_broker_language_flag"] = True
         components["market_pressure"].append(
-            "Supported urgency language in Matrix remarks: +15"
+            "Broker urgency language retained as an unverified analyst flag: +0"
         )
     status = str(listing.get("status") or "").casefold()
     if status in {"w", "withdrawn", "expired", "x"}:
@@ -278,13 +280,19 @@ def calculate_evidence_scores(
             f"Non-active listing status {listing.get('status')}: +10"
         )
 
-    risk = municipal_review_urgency(municipal)
-    for item in sorted(municipal, key=lambda value: value.score, reverse=True):
+    municipal_urgency = municipal_review_urgency(municipal)
+    risk = municipal_urgency if municipal_urgency is not None else 0.0
+    for item in sorted(
+        municipal,
+        key=lambda value: value.score if value.score is not None else -1,
+        reverse=True,
+    ):
         if not item.currently_active:
             continue
         components["property_risk"].append(
             f"{item.case_type}: {item.substantive_hazard}; "
-            f"stage={item.enforcement_stage}; urgency={item.score:.0f}/100"
+            f"stage={item.enforcement_stage}; urgency="
+            + (f"{item.score:.0f}/100" if item.score is not None else "unknown")
         )
 
     known_county = sum(
@@ -336,7 +344,7 @@ def calculate_evidence_scores(
     return EvidenceScoreResult(
         dimensions=ScoreDimensions(
             owner_motivation=min(100, motivation),
-            economics=max(0, min(100, economics)),
+            economics=(None if economics is None else max(-100, min(100, economics))),
             market_pressure=min(100, pressure),
             property_risk=min(100, risk),
             data_confidence=confidence,

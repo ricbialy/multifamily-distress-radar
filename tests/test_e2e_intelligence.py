@@ -30,9 +30,7 @@ class EndToEndIntelligenceTests(unittest.TestCase):
         self.assertEqual(len(both), 1)
         self.assertEqual(both[0]["folio"], "0431010010010")
         self.assertEqual(both[0]["address"], "101 Palm Ave, Hialeah, FL 33010")
-        self.assertEqual(
-            both[0]["address_validation_status"], "corroborated"
-        )
+        self.assertEqual(both[0]["address_validation_status"], "corroborated")
         self.assertEqual(
             both[0]["address_validation_source"],
             "authorized_off_market_csv + matrix_csv",
@@ -40,28 +38,22 @@ class EndToEndIntelligenceTests(unittest.TestCase):
         self.assertIsNone(both[0]["public_record_units"])
         self.assertLess(both[0]["data_completeness_score"], 100)
         validation_evidence = [
-            item
-            for item in both[0]["evidence"]
-            if item["field"] == "validated_address"
+            item for item in both[0]["evidence"] if item["field"] == "validated_address"
         ]
         self.assertEqual(len(validation_evidence), 1)
         self.assertEqual(validation_evidence[0]["value_type"], "unknown")
         self.assertTrue(both[0]["evidence"])
-        self.assertEqual(
-            both[0]["preliminary_offer_range"]["status"], "complete"
-        )
+        self.assertEqual(both[0]["preliminary_offer_range"]["status"], "not_available")
         incomplete = next(
             item
             for item in records
             if item["address"] == "905 West 20 Street, Hialeah, FL 33010"
         )
         self.assertEqual(
-            incomplete["preliminary_offer_range"]["status"], "insufficient_data"
+            incomplete["preliminary_offer_range"]["status"], "not_available"
         )
         self.assertIn("Top 10 actionable opportunities", brief)
-        self.assertIn(
-            "101 Palm Ave, Hialeah, FL 33010 [address: corroborated]", brief
-        )
+        self.assertIn("101 Palm Ave, Hialeah, FL 33010 [address: corroborated]", brief)
         self.assertIn("[address: unverified]", brief)
         self.assertIn("recommended_action", csv_text.splitlines()[0])
 
@@ -148,7 +140,7 @@ class EndToEndIntelligenceTests(unittest.TestCase):
         candidate = next(item for item in records if item["folio"] == "0431010010010")
         self.assertEqual(
             candidate["preliminary_offer_range"]["status"],
-            "insufficient_data",
+            "not_available",
         )
         self.assertIn("repairs", candidate["missing_data"])
         self.assertIn("capex", candidate["missing_data"])

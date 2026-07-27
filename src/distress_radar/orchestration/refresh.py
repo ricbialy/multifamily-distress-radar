@@ -22,20 +22,16 @@ from distress_radar.identity.folio_resolver import normalize_folio
 from distress_radar.models import PropertyRecord
 from distress_radar.recommendations.features import (
     RecommendationFeatures,
-    ScoreDimensions,
-    score_data_quality,
-    score_owner_motivation,
-    score_property_risk,
+    acquisition_attractiveness,
+    calculate_evidence_scores,
 )
 from distress_radar.recommendations.rule_engine import recommend
 from distress_radar.reports.daily_brief import render_daily_brief
 from distress_radar.reports.exports import export_csv, export_json, normalize_record
 from distress_radar.sources.mls.matrix_csv import MatrixCsvImporter
 from distress_radar.sources.public.off_market_csv import (
-    OffMarketCandidate,
     OffMarketCsvImporter,
 )
-from distress_radar.underwriting.offer_range import OfferInputs, calculate_offer_range
 
 
 @dataclass(frozen=True)
@@ -112,28 +108,6 @@ def _address_evidence(result: AddressValidationResult) -> EvidenceItem:
     )
 
 
-def _economics_score(
-    listing: ListingSnapshot | None, off_market: OffMarketCandidate | None
-) -> float:
-    if off_market and off_market.stabilized_noi and off_market.estimated_value:
-        return min(100, round(off_market.stabilized_noi / off_market.estimated_value * 1000, 2))
-    if listing and listing.noi and listing.list_price:
-        return min(100, round(listing.noi / listing.list_price * 1000, 2))
-    return 0
-
-
-def _market_pressure_score(listing: ListingSnapshot | None) -> float:
-    if listing is None:
-        return 0
-    score = min(40, listing.cdom or listing.dom or 0)
-    remarks = (listing.remarks or "").casefold()
-    if any(term in remarks for term in ("motivated", "price reduced", "bring all offers", "estate sale")):
-        score += 25
-    if (listing.status or "").casefold() in {"expired", "withdrawn"}:
-        score += 35
-    return min(100, score)
-
-
 def run_fixture_demo(
     *,
     matrix_path: Path,
@@ -170,13 +144,7 @@ def run_fixture_demo(
     for key, entry in properties.items():
         listing = entry["listings"][0] if entry["listings"] else None
         off_market = entry["off_market"]
-        folio = (
-            off_market.folio
-            if off_market
-            else listing.folio
-            if listing
-            else None
-        )
+        folio = off_market.folio if off_market else listing.folio if listing else None
         address_candidates = tuple(
             candidate
             for candidate in (
@@ -213,16 +181,30 @@ def run_fixture_demo(
             + (_address_evidence(address_validation),)
         )
         signals = off_market.signals if off_market else ()
-        confidence, completeness, freshness = score_data_quality(evidence)
-        motivation = score_owner_motivation(signals)
-        if listing and any(
-            term in (listing.remarks or "").casefold()
-            for term in ("motivated", "bring all offers", "estate sale", "price reduced")
-        ):
-            motivation = min(100, motivation + 20)
-        risk = score_property_risk(signals)
-        economics = _economics_score(listing, off_market)
-        market_pressure = _market_pressure_score(listing)
+        listing_values = listing.stable_dict() if listing else {}
+        if not listing and off_market:
+            listing_values = {
+                "list_price": off_market.estimated_value,
+                "noi": off_market.stabilized_noi,
+                "expenses": None,
+                "status": None,
+            }
+        county_values = {
+            "verified_units": county_record.unit_count if county_record else None,
+            "owner": county_record.owner_name if county_record else None,
+            "assessed_value": (county_record.assessed_value if county_record else None),
+        }
+        official_records = tuple(
+            {"signal_type": signal.signal_type}
+            for signal in signals
+            if signal.signal_type in {"recorded_liens", "lis_pendens", "foreclosure"}
+        )
+        tax_records = tuple(
+            signal.value
+            for signal in signals
+            if signal.signal_type == "tax_delinquency"
+            and isinstance(signal.value, dict)
+        )
         channels = tuple(
             channel
             for channel, present in (
@@ -237,31 +219,20 @@ def run_fixture_demo(
         missing_data = tuple(
             item.field for item in evidence if item.value_type == ValueType.UNKNOWN
         )
-        has_offer_inputs = bool(
-            off_market
-            and all(
-                value is not None
-                for value in (
-                    off_market.estimated_value,
-                    off_market.stabilized_noi,
-                    off_market.repairs,
-                    off_market.capex,
-                )
-            )
+        score_result = calculate_evidence_scores(
+            county=county_values,
+            listing=listing_values,
+            municipal=(),
+            official_records=official_records,
+            tax_records=tax_records,
+            missing_fields=missing_data,
         )
+        scores = score_result.dimensions
         features = RecommendationFeatures(
             property_id="property-" + hashlib.sha256(key.encode()).hexdigest()[:16],
             discovery_channels=channels,
-            scores=ScoreDimensions(
-                owner_motivation=motivation,
-                economics=economics,
-                market_pressure=market_pressure,
-                property_risk=risk,
-                data_confidence=confidence,
-                data_completeness=completeness,
-                data_freshness=freshness,
-            ),
-            has_underwriting=has_offer_inputs,
+            scores=scores,
+            has_underwriting=False,
             critical_documents_missing=False,
             violation_review_required=any(
                 signal.signal_type == "unsafe_structure" for signal in signals
@@ -277,53 +248,15 @@ def run_fixture_demo(
             evidence=evidence,
         )
         recommendation = recommend(features)
-        offer = calculate_offer_range(
-            OfferInputs(
-                stabilized_value_low=(
-                    off_market.estimated_value
-                    if off_market and has_offer_inputs
-                    else None
-                ),
-                stabilized_value_base=(
-                    off_market.estimated_value
-                    if off_market and has_offer_inputs
-                    else None
-                ),
-                stabilized_value_high=(
-                    off_market.estimated_value
-                    if off_market and has_offer_inputs
-                    else None
-                ),
-                asking_price=(
-                    off_market.estimated_value * 0.60
-                    if off_market and has_offer_inputs and off_market.estimated_value
-                    else None
-                ),
-                required_margin_rate=0.10,
-                repairs=off_market.repairs if off_market else None,
-                capital_expenditures=off_market.capex if off_market else None,
-                violation_permit_contingency=25_000 if risk else 0,
-                closing_cost_rate=0.03,
-                financing_cost_rate=0.02,
-                insurance_flood_contingency=25_000,
-                data_uncertainty_rate=max(0, (100 - completeness) / 1000),
-            )
+        recommendation_score = acquisition_attractiveness(scores)
+        municipality = listing.municipality if listing else off_market.municipality
+        units = (
+            off_market.units
+            if off_market and off_market.units
+            else listing.units
+            if listing
+            else None
         )
-        recommendation_score = round(
-            max(
-                0,
-                motivation * 0.30
-                + economics * 0.35
-                + market_pressure * 0.15
-                + confidence * 0.20
-                - risk * 0.25,
-            ),
-            2,
-        )
-        municipality = (
-            listing.municipality if listing else off_market.municipality
-        )
-        units = off_market.units if off_market and off_market.units else listing.units if listing else None
         records.append(
             normalize_record(
                 {
@@ -344,7 +277,9 @@ def run_fixture_demo(
                     "longitude": address_validation.longitude,
                     "jurisdiction": f"Miami-Dade / {municipality}",
                     "discovery_channels": list(channels),
-                    "mls_numbers": [item.source_record_id for item in entry["listings"]],
+                    "mls_numbers": [
+                        item.source_record_id for item in entry["listings"]
+                    ],
                     "asset_segment": (
                         "two_to_four_units"
                         if units and units <= 4
@@ -358,21 +293,32 @@ def run_fixture_demo(
                     ),
                     "recommended_action": recommendation.action,
                     "recommendation_score": recommendation_score,
-                    "owner_motivation_score": motivation,
-                    "economics_score": economics,
-                    "market_pressure_score": market_pressure,
-                    "property_risk_score": risk,
-                    "data_confidence_score": confidence,
-                    "data_completeness_score": completeness,
-                    "data_freshness_score": freshness,
-                    "current_noi": off_market.current_noi if off_market else listing.noi if listing else None,
+                    "owner_motivation_score": scores.owner_motivation,
+                    "economics_score": scores.economics,
+                    "market_pressure_score": scores.market_pressure,
+                    "property_risk_score": scores.property_risk,
+                    "data_confidence_score": scores.data_confidence,
+                    "data_completeness_score": scores.data_completeness,
+                    "data_freshness_score": scores.data_freshness,
+                    "current_noi": off_market.current_noi
+                    if off_market
+                    else listing.noi
+                    if listing
+                    else None,
                     "stabilized_noi": off_market.stabilized_noi if off_market else None,
                     "estimated_value_range": {
-                        "low": off_market.estimated_value * 0.9 if off_market and off_market.estimated_value else None,
+                        "low": off_market.estimated_value * 0.9
+                        if off_market and off_market.estimated_value
+                        else None,
                         "base": off_market.estimated_value if off_market else None,
-                        "high": off_market.estimated_value * 1.1 if off_market and off_market.estimated_value else None,
+                        "high": off_market.estimated_value * 1.1
+                        if off_market and off_market.estimated_value
+                        else None,
                     },
-                    "preliminary_offer_range": offer.to_dict(),
+                    "preliminary_offer_range": {
+                        "status": "not_available",
+                        "reason": "insufficient_property_specific_underwriting_data",
+                    },
                     "why_now": list(why_now),
                     "key_risks": list(features.key_risks),
                     "missing_data": list(missing_data),

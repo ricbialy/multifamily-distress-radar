@@ -172,13 +172,12 @@ class PilotTests(unittest.TestCase):
             for item in recommendations
             if "off_market" in item["discovery_channels"]
         )
-        self.assertLess(
-            off_market["municipal_cases"][0]["severity_score"],
-            50,
-        )
+        self.assertIsNone(off_market["municipal_cases"][0]["severity_score"])
         self.assertEqual(
-            off_market["recommended_action"], "human_municipal_review"
+            off_market["municipal_cases"][0]["substantive_hazard"],
+            "unknown_hazard",
         )
+        self.assertEqual(off_market["recommended_action"], "human_municipal_review")
 
     def test_one_run_persists_workflow_and_generates_database_reports(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -197,9 +196,7 @@ class PilotTests(unittest.TestCase):
                 code_collector=FakeCodeCollector(),
             )
 
-            recommendations = json.loads(
-                (output / "recommendations.json").read_text()
-            )
+            recommendations = json.loads((output / "recommendations.json").read_text())
             summary = json.loads((output / "database_summary.json").read_text())
 
         required = {
@@ -215,24 +212,31 @@ class PilotTests(unittest.TestCase):
             "acquisition_brief.md",
             "qualified_queue.json",
             "acquisition_queue.json",
+            "acquisition_queue.csv",
+            "acquisition_queue.md",
             "municipal_review_queue.json",
+            "municipal_review_queue.csv",
+            "municipal_review_queue.md",
             "mls_example.json",
             "source_health_warnings.json",
+            "evidence_state.json",
+            "human_dispositions.json",
             "change_summary.json",
+            "opportunity_changes.json",
         }
         self.assertEqual({path.name for path in result.output_files}, required)
         self.assertGreaterEqual(summary["canonical_properties"], 2)
         self.assertGreaterEqual(summary["recommendations"], 2)
-        listed = next(item for item in recommendations if "mls" in item["discovery_channels"])
+        listed = next(
+            item for item in recommendations if "mls" in item["discovery_channels"]
+        )
         off_market = next(
-            item for item in recommendations if "off_market" in item["discovery_channels"]
+            item
+            for item in recommendations
+            if "off_market" in item["discovery_channels"]
         )
-        self.assertEqual(
-            listed["recommended_action"], "contact_broker_for_documents"
-        )
-        self.assertEqual(
-            off_market["recommended_action"], "human_municipal_review"
-        )
+        self.assertEqual(listed["recommended_action"], "request_documents")
+        self.assertEqual(off_market["recommended_action"], "human_municipal_review")
         self.assertTrue(listed["evidence_ids"])
 
     def test_repeat_change_and_failure_are_auditable(self) -> None:

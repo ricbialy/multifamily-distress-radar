@@ -49,7 +49,9 @@ class VerificationResult:
     output_path: Path
 
 
-def _count(connection: sqlite3.Connection, sql: str, parameters: tuple[Any, ...] = ()) -> int:
+def _count(
+    connection: sqlite3.Connection, sql: str, parameters: tuple[Any, ...] = ()
+) -> int:
     return int(connection.execute(sql, parameters).fetchone()[0])
 
 
@@ -84,7 +86,14 @@ def _evidence_value_supports_action(
             and bool(value.get("currently_active"))
             and bool(value.get("case_number"))
             and bool(value.get("enforcement_stage"))
-            and bool(value.get("substantive_hazard"))
+            and value.get("substantive_hazard")
+            in {
+                "unknown_hazard",
+                "permit",
+                "recertification",
+                "minimum_housing",
+                "unsafe_life_safety",
+            }
         )
     if action == "investigate_owner":
         if not isinstance(value, dict):
@@ -98,9 +107,8 @@ def _evidence_value_supports_action(
         if field_name == "tax_delinquency":
             from distress_radar.tax_import import is_unpaid_status
 
-            return (
-                float(value.get("amount_due") or 0) > 0
-                and is_unpaid_status(value.get("status"))
+            return float(value.get("amount_due") or 0) > 0 and is_unpaid_status(
+                value.get("status")
             )
     if action == "verify_identity":
         return field_name in {
@@ -108,14 +116,77 @@ def _evidence_value_supports_action(
             "public_property_record",
         } and (
             bool(value)
-            or (
-                value_type == "unknown"
-                and bool((metadata or {}).get("reason"))
-            )
+            or (value_type == "unknown" and bool((metadata or {}).get("reason")))
         )
-    if action in {"contact_broker_for_documents", "request_documents"}:
-        return field_name == "matrix_listing" or field_name.startswith("diligence:")
-    return bool(value)
+    if action == "contact_broker_for_documents":
+        return (
+            field_name == "matrix_listing"
+            and isinstance(value, dict)
+            and str(value.get("status") or "").casefold() in {"a", "active", "act"}
+            and bool(value.get("broker_contact_path"))
+            and bool(value.get("missing_documents"))
+        )
+    if action == "request_documents":
+        return (
+            field_name.startswith("diligence:")
+            and value_type == "unknown"
+            and bool((metadata or {}).get("reason"))
+        )
+    if action == "reject":
+        return (
+            field_name == "matrix_listing"
+            and isinstance(value, dict)
+            and isinstance(value.get("noi"), (int, float))
+            and float(value["noi"]) <= 0
+        )
+    if action in {"insufficient_data", "manual_triage"}:
+        return value_type == "unknown" and bool((metadata or {}).get("reason"))
+    if action == "excluded":
+        return field_name in {"public_property_record", "validated_address"}
+    if action in {"contact_owner", "contact_broker", "dismiss"}:
+        # These require hash-bound disposition validation, not evidence truthiness.
+        return False
+    if action == "reject_high_risk":
+        return (
+            field_name == "municipal_code_case"
+            and isinstance(value, dict)
+            and value.get("substantive_hazard") == "unsafe_life_safety"
+            and value.get("confirmation_status") == "currently_confirmed"
+        )
+    if action == "watch":
+        return (
+            isinstance(value, dict)
+            and bool(value.get("watch_trigger"))
+            and bool(value.get("recheck_condition"))
+        )
+    return False
+
+
+def _disposition_supports_action(
+    connection: sqlite3.Connection,
+    *,
+    property_id: str,
+    content_hash: str,
+    action: str,
+) -> bool:
+    return bool(
+        connection.execute(
+            """
+            SELECT 1 FROM human_dispositions
+            WHERE property_id=?
+              AND baseline_content_hash=?
+              AND active=1
+              AND (
+                (disposition='dismiss' AND ?='dismiss')
+                OR
+                (disposition='approved_for_contact'
+                 AND ? IN ('contact_owner','contact_broker'))
+              )
+            LIMIT 1
+            """,
+            (property_id, content_hash, action, action),
+        ).fetchone()
+    )
 
 
 def _controlled_change_is_isolated(
@@ -137,12 +208,7 @@ def _controlled_copy(source: Path, destination: Path) -> tuple[str, str]:
     destination.parent.mkdir(parents=True, exist_ok=True)
     with source.open(encoding="utf-8-sig", newline="") as handle:
         rows = list(csv.reader(handle))
-    if (
-        not rows
-        or "St" not in rows[0]
-        or "MLS # Link" not in rows[0]
-        or len(rows) < 2
-    ):
+    if not rows or "St" not in rows[0] or "MLS # Link" not in rows[0] or len(rows) < 2:
         raise ValueError(
             "Controlled change requires real Matrix St and MLS # Link columns"
         )
@@ -350,10 +416,17 @@ def verify_real_pilot(
         "acquisition_brief.md",
         "qualified_queue.json",
         "acquisition_queue.json",
+        "acquisition_queue.csv",
+        "acquisition_queue.md",
         "municipal_review_queue.json",
+        "municipal_review_queue.csv",
+        "municipal_review_queue.md",
         "mls_example.json",
         "source_health_warnings.json",
+        "evidence_state.json",
+        "human_dispositions.json",
         "change_summary.json",
+        "opportunity_changes.json",
         "top_candidate_trace.json",
         "top_candidate_trace.md",
     }
@@ -486,7 +559,7 @@ def verify_real_pilot(
         }
         latest_recommendations = connection.execute(
             """
-            SELECT r.property_id,r.action,r.explanation_json
+            SELECT r.property_id,r.action,r.explanation_json,r.content_hash
             FROM recommendations r
             WHERE r.recommendation_id=(
                 SELECT r2.recommendation_id FROM recommendations r2
@@ -510,6 +583,12 @@ def verify_real_pilot(
                 "official_record",
                 "tax_delinquency",
             },
+            "request_documents": {"diligence:rent_roll", "diligence:T12"},
+            "insufficient_data": {"diligence:rent_roll", "diligence:T12"},
+            "manual_triage": {"diligence:rent_roll", "diligence:T12"},
+            "reject": {"matrix_listing"},
+            "excluded": {"validated_address", "public_property_record"},
+            "reject_high_risk": {"municipal_code_case"},
         }
         for recommendation in latest_recommendations:
             explanation = json.loads(recommendation["explanation_json"])
@@ -518,11 +597,7 @@ def verify_real_pilot(
                 "why_this_property_surfaced",
                 "recommended_action",
             )
-            ids = {
-                evidence_id
-                for group in mappings.values()
-                for evidence_id in group
-            }
+            ids = {evidence_id for group in mappings.values() for evidence_id in group}
             existing_ids = {
                 row[0]
                 for row in connection.execute(
@@ -571,8 +646,15 @@ def verify_real_pilot(
                     )
                     for row in action_evidence
                 )
-                if expected is None or (
-                    {row["field_name"] for row in action_evidence} & expected
+                disposition_supported = _disposition_supports_action(
+                    connection,
+                    property_id=recommendation["property_id"],
+                    content_hash=recommendation["content_hash"],
+                    action=recommendation["action"],
+                )
+                if disposition_supported or (
+                    expected is not None
+                    and {row["field_name"] for row in action_evidence} & expected
                     and value_supported
                 ):
                     semantic_evidence += 1
@@ -632,8 +714,16 @@ def verify_real_pilot(
             else "FAIL",
             json.dumps(matrix_batch.header_mapping, sort_keys=True),
         ),
-        GateResult("G2", "PASS" if verified_matrix > 0 else "FAIL", f"{verified_matrix} Matrix properties with county presence"),
-        GateResult("G3", "PASS" if persisted_core else "FAIL", json.dumps(first.database_counts, sort_keys=True)),
+        GateResult(
+            "G2",
+            "PASS" if verified_matrix > 0 else "FAIL",
+            f"{verified_matrix} Matrix properties with county presence",
+        ),
+        GateResult(
+            "G3",
+            "PASS" if persisted_core else "FAIL",
+            json.dumps(first.database_counts, sort_keys=True),
+        ),
         GateResult(
             "G4",
             "PASS"
@@ -650,10 +740,7 @@ def verify_real_pilot(
         ),
         GateResult(
             "G5",
-            "PASS"
-            if off_market_count > 0
-            and 0 < len(queue) <= 10
-            else "FAIL",
+            "PASS" if off_market_count > 0 and 0 < len(queue) <= 10 else "FAIL",
             (
                 f"{off_market_count} distinct active, confirmed, current-run "
                 f"off-market intersections; {len(queue)} ranked tasks; "

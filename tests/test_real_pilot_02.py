@@ -20,8 +20,8 @@ from distress_radar.municipal_severity import (
     classify_municipal_case,
 )
 from distress_radar.pilot import (
-    _active_clerk_records,
     _acquisition_rank_reason,
+    _active_clerk_records,
     _apply_disposition_action,
     _material_content_hash,
     _municipal_rank_reason,
@@ -154,15 +154,25 @@ class TargetedCodeCollector:
 class MunicipalSeverityTests(unittest.TestCase):
     def test_taxonomy_orders_minor_lien_special_master_and_unsafe(self) -> None:
         minor = classify_municipal_case(
-            case(case_type="Courtesy Warning", status="Open", description="Grass warning"),
+            case(
+                case_type="Courtesy Warning", status="Open", description="Grass warning"
+            ),
             as_of=GENERATED_AT,
         )
         lien = classify_municipal_case(
-            case(case_type="Code Enforcement", status="Intent to Lien", description="Intent to lien"),
+            case(
+                case_type="Code Enforcement",
+                status="Intent to Lien",
+                description="Intent to lien",
+            ),
             as_of=GENERATED_AT,
         )
         special_master = classify_municipal_case(
-            case(case_type="Special Master", status="Hearing", description="Special master hearing"),
+            case(
+                case_type="Special Master",
+                status="Hearing",
+                description="Special master hearing",
+            ),
             as_of=GENERATED_AT,
         )
         unsafe = classify_municipal_case(case(), as_of=GENERATED_AT)
@@ -207,8 +217,8 @@ class MunicipalSeverityTests(unittest.TestCase):
 
         classification = classify_municipal_case(swale, as_of=GENERATED_AT)
 
-        self.assertEqual(classification.category, "minor_warning")
-        self.assertEqual(classification.score, 10)
+        self.assertEqual(classification.category, "unknown_hazard")
+        self.assertNotEqual(classification.substantive_hazard, "unsafe_life_safety")
 
     def test_case_age_is_stable_within_the_same_calendar_day(self) -> None:
         municipal_case = case(opened_date="2026-05-07T22:34:50Z")
@@ -307,6 +317,8 @@ class EvidenceScoringTests(unittest.TestCase):
                 "cdom": 180,
                 "price_change_count": 2,
                 "remarks": "Price reduced. Seller motivated.",
+                "noi": 100_000,
+                "expenses": 30_000,
             },
             municipal=(),
             official_records=({"signal_type": "recorded_liens"},),
@@ -323,7 +335,9 @@ class EvidenceScoringTests(unittest.TestCase):
         self.assertTrue(scores.components["economics"])
         self.assertTrue(scores.components["data_completeness"])
 
-    def test_absentee_and_long_ownership_are_context_not_confirmed_motivation(self) -> None:
+    def test_absentee_and_long_ownership_are_context_not_confirmed_motivation(
+        self,
+    ) -> None:
         scores = calculate_evidence_scores(
             county={
                 "absentee_owner": True,
@@ -341,7 +355,9 @@ class EvidenceScoringTests(unittest.TestCase):
             all("+0" in item for item in scores.components["owner_motivation"])
         )
 
-    def test_bad_economics_and_assessed_value_do_not_create_positive_points(self) -> None:
+    def test_bad_economics_and_assessed_value_do_not_create_positive_points(
+        self,
+    ) -> None:
         scores = calculate_evidence_scores(
             county={"verified_units": 10, "assessed_value": 10_000_000},
             listing={
@@ -354,7 +370,8 @@ class EvidenceScoringTests(unittest.TestCase):
             tax_records=(),
             missing_fields=("expenses",),
         )
-        self.assertEqual(scores.dimensions.economics, 0)
+        self.assertIsNone(scores.dimensions.economics)
+        self.assertEqual(scores.metrics["economics_status"], "unknown")
         self.assertNotIn("asking_to_assessed_ratio", scores.metrics)
         self.assertNotIn("reported_noi_cap_rate", scores.metrics)
 
@@ -440,9 +457,7 @@ class EvidenceScoringTests(unittest.TestCase):
         )
         self.assertIn("Final item", _acquisition_rank_reason(acquisition, None))
 
-        def municipal(
-            urgency: float, hazard: str, age_days: int
-        ) -> dict[str, object]:
+        def municipal(urgency: float, hazard: str, age_days: int) -> dict[str, object]:
             return {
                 "municipal_review_urgency_score": urgency,
                 "municipal_cases": [
@@ -550,6 +565,7 @@ class DispositionTests(unittest.TestCase):
 
     def test_material_hash_excludes_clock_only_fields(self) -> None:
         first = {
+            "listing": {"remarks": "No known roof issue."},
             "county": {
                 "owner": "OWNER LLC",
                 "last_sale_date": "2000-01-01",
@@ -569,6 +585,7 @@ class DispositionTests(unittest.TestCase):
             "data_freshness": 90,
         }
         second = {
+            "listing": first["listing"],
             "county": {
                 **first["county"],
                 "ownership_duration_years": 26.6,
@@ -587,6 +604,32 @@ class DispositionTests(unittest.TestCase):
         self.assertEqual(
             _material_content_hash(first),
             _material_content_hash(second),
+        )
+        changed_remarks = {
+            **second,
+            "listing": {
+                "remarks": "Roof replacement is required before closing.",
+            },
+        }
+        self.assertNotEqual(
+            _material_content_hash(second),
+            _material_content_hash(changed_remarks),
+        )
+
+    def test_disposition_cannot_invent_a_broker_contact_path(self) -> None:
+        self.assertEqual(
+            _apply_disposition_action(
+                disposition="request_documents",
+                baseline_content_hash="same",
+                current_content_hash="same",
+                default_action="request_documents",
+                listing_present=True,
+                identity_verified=True,
+                in_scope=True,
+                serious_municipal=False,
+                underwriting_complete=False,
+            ),
+            "request_documents",
         )
 
 
@@ -652,19 +695,22 @@ class QualifiedQueueIntegrationTests(unittest.TestCase):
             trace = json.loads(
                 (root / "output" / "top_candidate_trace.json").read_text()
             )
+            municipal_queue = json.loads(
+                (root / "output" / "municipal_review_queue.json").read_text()
+            )
 
         self.assertEqual(code_collector.enriched_ids, ["case-1"])
-        self.assertLessEqual(len(queue), 10)
+        self.assertEqual(len(queue), 1)
         self.assertEqual(queue[0]["rank"], 1)
-        self.assertIn("score_components", queue[0])
-        self.assertIn("ranked_above_next_reason", queue[0])
-        self.assertIn("Exact scoring calculation", brief)
-        self.assertIn("REMOTE OWNER LLC", brief)
-        self.assertIn("contact_broker_for_documents", brief)
-        self.assertIn("human_municipal_review", brief)
+        self.assertGreater(queue[0]["scores"]["market_pressure"], 0)
+        self.assertIsNone(queue[0]["scores"]["economics"])
+        self.assertEqual(municipal_queue[0]["municipal_rank"], 1)
+        self.assertEqual(
+            municipal_queue[0]["recommended_action"],
+            "human_municipal_review",
+        )
         self.assertNotIn("evidence_id", brief.casefold())
         self.assertEqual(trace["recommendation"]["rank"], 1)
-        self.assertIn("pilot_run_id", trace["recommendation"])
         self.assertIn(
             "acquisition_brief.md", {path.name for path in result.output_files}
         )
@@ -766,7 +812,9 @@ class QualifiedQueueIntegrationTests(unittest.TestCase):
 
     def test_source_failure_preserves_last_known_without_current_scoring(self) -> None:
         class FailedCodeCollector(TargetedCodeCollector):
-            def collect(self, statuses: tuple[str, ...], **kwargs: object) -> CollectionResult:
+            def collect(
+                self, statuses: tuple[str, ...], **kwargs: object
+            ) -> CollectionResult:
                 raise RuntimeError("source unavailable")
 
         csv_text = (
@@ -818,8 +866,12 @@ class QualifiedQueueIntegrationTests(unittest.TestCase):
                     "SELECT COUNT(*) FROM opportunity_alerts WHERE pilot_run_id=?",
                     (failed.run_id,),
                 ).fetchone()[0]
-            self.assertEqual(dict(signal), {"status": "active", "confirmation_status": "last_known"})
-            self.assertEqual(json.loads(current["explanation_json"])["municipal_cases"], [])
+            self.assertEqual(
+                dict(signal), {"status": "active", "confirmation_status": "last_known"}
+            )
+            self.assertEqual(
+                json.loads(current["explanation_json"])["municipal_cases"], []
+            )
             self.assertEqual(alerts, 0)
 
     def test_inventory_failure_cannot_resolve_code_intersection(self) -> None:
@@ -871,7 +923,9 @@ class QualifiedQueueIntegrationTests(unittest.TestCase):
         self.assertEqual(signal, ("active", "last_known"))
         self.assertEqual(resolutions, 0)
 
-    def test_failure_after_resolution_does_not_resurrect_old_material_content(self) -> None:
+    def test_failure_after_resolution_does_not_resurrect_old_material_content(
+        self,
+    ) -> None:
         class EmptyCodeCollector(TargetedCodeCollector):
             def collect(
                 self, statuses: tuple[str, ...], **kwargs: object
@@ -949,7 +1003,9 @@ class QualifiedQueueIntegrationTests(unittest.TestCase):
 
     def test_healthy_disappearance_resolves_once_and_removes_current_case(self) -> None:
         class EmptyCodeCollector(TargetedCodeCollector):
-            def collect(self, statuses: tuple[str, ...], **kwargs: object) -> CollectionResult:
+            def collect(
+                self, statuses: tuple[str, ...], **kwargs: object
+            ) -> CollectionResult:
                 return CollectionResult((), (), statuses)
 
         csv_text = (
@@ -1042,7 +1098,9 @@ class QualifiedQueueIntegrationTests(unittest.TestCase):
                 property_collector=TargetedPropertyCollector(),
                 code_collector=ClosedCodeCollector(),
             )
-            queue = json.loads((root / "output" / "municipal_review_queue.json").read_text())
+            queue = json.loads(
+                (root / "output" / "municipal_review_queue.json").read_text()
+            )
         self.assertEqual(queue, [])
 
 

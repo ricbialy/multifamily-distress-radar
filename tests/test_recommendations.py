@@ -45,6 +45,7 @@ class RecommendationTests(unittest.TestCase):
                 "reject",
                 "reject_high_risk",
                 "insufficient_data",
+                "manual_triage",
             },
         )
 
@@ -137,7 +138,18 @@ class RecommendationTests(unittest.TestCase):
     def test_contact_requires_specific_evidence_backed_opportunity(self) -> None:
         base = RecommendationFeatures.actionable(property_id="property-1")
         result = recommend(base.with_flags(specific_opportunity=False))
-        self.assertEqual(result.action, "watch")
+        self.assertEqual(result.action, "manual_triage")
+
+    def test_confirmed_minor_municipal_case_does_not_force_human_review(self) -> None:
+        base = RecommendationFeatures.actionable(property_id="property-1")
+        result = recommend(
+            base.with_flags(
+                municipal_case_present=True,
+                serious_municipal_matter=False,
+                independent_motivation=False,
+            )
+        )
+        self.assertEqual(result.action, "manual_triage")
 
     def test_verified_property_outside_pilot_segment_is_excluded(self) -> None:
         base = RecommendationFeatures.actionable(property_id="property-1")
