@@ -5,6 +5,7 @@ from tempfile import TemporaryDirectory
 
 from test_storage import sample_property
 
+from distress_radar.recommendations.features import calculate_evidence_scores
 from distress_radar.storage import RadarStore
 from distress_radar.tax_import import import_tax_csv, is_unpaid_status
 
@@ -17,6 +18,9 @@ class TaxImportTests(unittest.TestCase):
             "paid - formerly delinquent",
             "released / outstanding record",
             "satisfied lien",
+            "no unpaid balance",
+            "not unpaid",
+            "not currently unpaid",
         ):
             with self.subTest(status=status):
                 self.assertFalse(is_unpaid_status(status))
@@ -94,6 +98,26 @@ class TaxImportTests(unittest.TestCase):
             self.assertEqual(row["delinquent_tax_year_count"], "1")
             self.assertEqual(row["delinquent_tax_amount"], "1200.0")
             self.assertEqual(row["financial_distress_score"], "35")
+
+    def test_statusless_tax_credit_does_not_create_motivation(self) -> None:
+        shared = {
+            "county": {},
+            "listing": {},
+            "municipal": (),
+            "official_records": (),
+            "missing_fields": (),
+        }
+        positive = calculate_evidence_scores(
+            **shared,
+            tax_records=({"amount_due": 125, "status": None},),
+        )
+        credit = calculate_evidence_scores(
+            **shared,
+            tax_records=({"amount_due": -125, "status": None},),
+        )
+
+        self.assertEqual(positive.dimensions.owner_motivation, 30)
+        self.assertEqual(credit.dimensions.owner_motivation, 0)
 
 
 if __name__ == "__main__":

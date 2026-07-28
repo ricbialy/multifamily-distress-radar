@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import tempfile
 import unittest
@@ -167,17 +168,46 @@ class PilotTests(unittest.TestCase):
             acquisition_queue = json.loads(
                 (root / "output/acquisition_queue.json").read_text()
             )
+            manual_triage = json.loads(
+                (root / "output/manual_triage_queue.json").read_text()
+            )
+            with (root / "output/manual_triage_queue.csv").open(
+                encoding="utf-8"
+            ) as handle:
+                manual_triage_csv = tuple(csv.DictReader(handle))
+            manual_triage_md = (
+                root / "output/manual_triage_queue.md"
+            ).read_text()
+            with (root / "output/acquisition_queue.csv").open(
+                encoding="utf-8"
+            ) as handle:
+                acquisition_csv = tuple(csv.DictReader(handle))
+            acquisition_md = (root / "output/acquisition_queue.md").read_text()
 
         listed = next(
             item for item in recommendations if "mls" in item["discovery_channels"]
         )
         self.assertFalse(listed["in_scope"])
         self.assertFalse(listed["acquisition_qualified"])
-        self.assertEqual(listed["recommended_action"], "excluded")
+        self.assertEqual(listed["recommended_action"], "manual_triage")
         self.assertIn("verified_unit_count", listed["missing_data"])
         self.assertFalse(
             any(item["property_id"] == listed["property_id"] for item in acquisition_queue)
         )
+        self.assertFalse(
+            any(row["property_id"] == listed["property_id"] for row in acquisition_csv)
+        )
+        self.assertNotIn(listed["property_id"], acquisition_md)
+        self.assertTrue(
+            any(item["property_id"] == listed["property_id"] for item in manual_triage)
+        )
+        self.assertTrue(
+            any(
+                row["property_id"] == listed["property_id"]
+                for row in manual_triage_csv
+            )
+        )
+        self.assertIn(listed["property_id"], manual_triage_md)
 
     def test_run_pilot_rejects_unsupported_municipality_for_direct_callers(
         self,
@@ -227,6 +257,38 @@ class PilotTests(unittest.TestCase):
         self.assertEqual(collector.exact_folios, ["0400000000001"])
         self.assertEqual(listed["folio"], "0400000000001")
         self.assertTrue(listed["identity_verified"])
+
+    def test_submitted_folio_does_not_override_conflicting_municipality(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            matrix = root / "Agent Single Line - COM.csv"
+            matrix.write_text(
+                "MLS # Link,St,Address,City,State,Zip Code,Folio Number,"
+                "Current Price,Type of Property\n"
+                "A123,A,100 Test Ave,MIAMI,FL,33010,04-0000-000-0001,"
+                "2500000,Income/MultiFamily\n",
+                encoding="utf-8",
+            )
+            collector = FolioFallbackPropertyCollector()
+            run_pilot(
+                matrix_path=matrix,
+                database_path=root / "pilot.sqlite",
+                output_dir=root / "output",
+                municipality="hialeah",
+                generated_at="2026-07-24T12:00:00+00:00",
+                property_collector=collector,
+                code_collector=FakeCodeCollector(),
+            )
+            recommendations = json.loads(
+                (root / "output/recommendations.json").read_text()
+            )
+
+        listed = next(
+            item for item in recommendations if "mls" in item["discovery_channels"]
+        )
+        self.assertEqual(collector.exact_folios, ["0400000000001"])
+        self.assertFalse(listed["identity_verified"])
+        self.assertEqual(listed["recommended_action"], "verify_identity")
 
     def test_ambiguous_owner_creates_no_owner_relationship_or_alias(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
