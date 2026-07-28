@@ -21,6 +21,10 @@ class TaxImportTests(unittest.TestCase):
             "no unpaid balance",
             "not unpaid",
             "not currently unpaid",
+            "paid - not released",
+            "released - not paid",
+            "satisfied but not closed",
+            "paid, lien not satisfied",
         ):
             with self.subTest(status=status):
                 self.assertFalse(is_unpaid_status(status))

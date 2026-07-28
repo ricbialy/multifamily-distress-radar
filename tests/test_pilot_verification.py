@@ -290,10 +290,11 @@ class PilotVerificationTests(unittest.TestCase):
                     "currently_active": True,
                     "enforcement_stage": "warning",
                     "substantive_hazard": "unknown_hazard",
+                    "enrichment_state": "confirmed_enriched",
                 },
             )
         )
-        self.assertTrue(
+        self.assertFalse(
             _evidence_value_supports_action(
                 "order_municipal_search",
                 "municipal_code_case",
@@ -309,6 +310,32 @@ class PilotVerificationTests(unittest.TestCase):
                 {
                     "case_number": "C-5",
                     "currently_active": True,
+                    "enforcement_stage": "warning",
+                    "enrichment_state": "never_enriched",
+                },
+            )
+        )
+        self.assertFalse(
+            _evidence_value_supports_action(
+                "human_violation_review",
+                "municipal_code_case",
+                {
+                    "case_number": "C-6",
+                    "currently_active": True,
+                    "enforcement_stage": "warning",
+                    "substantive_hazard": "cosmetic",
+                    "enrichment_state": "confirmed_enriched",
+                },
+            )
+        )
+        self.assertFalse(
+            _evidence_value_supports_action(
+                "order_municipal_search",
+                "municipal_code_case",
+                {
+                    "case_number": "C-7",
+                    "currently_active": True,
+                    "enforcement_stage": "itl",
                     "enrichment_state": "never_enriched",
                 },
             )
