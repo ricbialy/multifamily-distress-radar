@@ -434,7 +434,6 @@ def _is_serious_municipal_matter(item: MunicipalSeverity) -> bool:
         item.currently_active
         and (
             (item.score is not None and item.score >= 50)
-            or item.score is None
             or item.enforcement_stage in {"itl", "lien", "special_master"}
             or item.category
             in {

@@ -45,10 +45,10 @@ def _action(features: RecommendationFeatures) -> str:
         return "verify_identity"
     if not features.in_scope:
         return "excluded"
-    if features.municipal_search_required:
-        return "order_municipal_search"
     if features.serious_municipal_matter:
         return "human_municipal_review"
+    if features.municipal_search_required:
+        return "order_municipal_search"
     if features.violation_review_required:
         return "human_violation_review"
     if scores.economics is not None and scores.economics < 0:

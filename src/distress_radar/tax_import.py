@@ -43,17 +43,18 @@ def is_unpaid_status(value: object) -> bool:
         status,
     ):
         return False
-    if re.search(
+    negated_cleared = re.compile(
         r"\b(?:not|no)\s+(?:currently\s+)?"
-        r"(?:paid|satisfied|released|redeemed|cancelled|canceled|closed)\b",
-        status,
-    ):
-        return True
+        r"(?:paid|satisfied|released|redeemed|cancelled|canceled|closed)\b"
+    )
+    status_without_negated_cleared = negated_cleared.sub("", status)
     if re.search(
         r"\b(?:paid|satisfied|released|redeemed|cancelled|canceled|closed)\b",
-        status,
+        status_without_negated_cleared,
     ):
         return False
+    if negated_cleared.search(status):
+        return True
     return any(
         marker in status
         for marker in ("unpaid", "delinquent", "outstanding", "past due", "open")

@@ -124,22 +124,19 @@ def _evidence_value_supports_action(
             and bool(value.get("currently_active"))
             and bool(value.get("case_number"))
             and bool(value.get("enforcement_stage"))
-            and bool(value.get("substantive_hazard"))
+            and value.get("enrichment_state") == "confirmed_enriched"
+            and value.get("substantive_hazard") == "unknown_hazard"
         )
     if action == "order_municipal_search":
         return (
-            field_name == "municipal_code_case"
-            and (
-                (
-                    value_type == "unknown"
-                    and bool((metadata or {}).get("reason"))
-                )
-                or (
-                    isinstance(value, dict)
-                    and bool(value.get("currently_active"))
-                    and value.get("enrichment_state") != "confirmed_enriched"
-                )
-            )
+            isinstance(value, dict)
+            and field_name == "municipal_code_case"
+            and bool(value.get("currently_active"))
+            and bool(value.get("case_number"))
+            and bool(value.get("enforcement_stage"))
+            and value.get("enrichment_state") != "confirmed_enriched"
+            and value.get("enforcement_stage")
+            not in {"hearing", "special_master", "itl", "lien"}
         )
     if action == "investigate_owner":
         if not isinstance(value, dict):
