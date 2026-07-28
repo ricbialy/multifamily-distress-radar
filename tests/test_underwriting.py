@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 
 from distress_radar.underwriting.commercial_multifamily import (
     CommercialMultifamilyInputs,
@@ -136,6 +137,77 @@ class UnderwritingTests(unittest.TestCase):
         self.assertIn("verified_public_unit_count", result.missing_data)
         self.assertIn("positive_current_noi", result.missing_data)
         self.assertIn("plausible_operating_expenses", result.missing_data)
+
+    def test_underwriting_rejects_invalid_decimal_rates(self) -> None:
+        small = SmallMultifamilyInputs(
+            units=4,
+            current_monthly_rent=8_000,
+            market_monthly_rent=9_000,
+            taxes_after_sale=12_000,
+            insurance=10_000,
+            maintenance=8_000,
+            utilities=6_000,
+            management_rate=0.08,
+            vacancy_rate=0.05,
+            repairs=50_000,
+            sale_comparable_value=900_000,
+            rent_comparable_value=950_000,
+            legal_units_verified=True,
+        )
+        for field, value, expected in (
+            ("vacancy_rate", -0.01, "valid_vacancy_rate"),
+            ("vacancy_rate", float("nan"), "valid_vacancy_rate"),
+            ("management_rate", 1.01, "valid_management_rate"),
+            ("management_rate", float("inf"), "valid_management_rate"),
+        ):
+            with self.subTest(model="small", field=field, value=value):
+                result = underwrite_small_multifamily(
+                    replace(small, **{field: value})
+                )
+                self.assertEqual(result.status, "insufficient_data")
+                self.assertIn(expected, result.missing_data)
+
+        commercial = CommercialMultifamilyInputs(
+            units=12,
+            current_noi=150_000,
+            gross_potential_rent=300_000,
+            market_vacancy_rate=0.05,
+            taxes_after_sale=35_000,
+            insurance=28_000,
+            management_rate=0.06,
+            utilities=18_000,
+            maintenance=20_000,
+            other_operating_expenses=12_000,
+            deferred_maintenance=100_000,
+            capital_expenditures=50_000,
+            market_cap_rate_low=0.055,
+            market_cap_rate_base=0.06,
+            market_cap_rate_high=0.065,
+            public_unit_count_verified=True,
+        )
+        for field, value, expected in (
+            ("market_vacancy_rate", -0.01, "valid_vacancy_rate"),
+            ("management_rate", 1.01, "valid_management_rate"),
+            ("market_cap_rate_low", float("nan"), "valid_cap_rate_support"),
+            ("market_cap_rate_high", 1.01, "valid_cap_rate_support"),
+        ):
+            with self.subTest(model="commercial", field=field, value=value):
+                result = underwrite_commercial(
+                    replace(commercial, **{field: value})
+                )
+                self.assertEqual(result.status, "insufficient_data")
+                self.assertIn(expected, result.missing_data)
+
+        unordered = underwrite_commercial(
+            replace(
+                commercial,
+                market_cap_rate_low=0.07,
+                market_cap_rate_base=0.06,
+                market_cap_rate_high=0.05,
+            )
+        )
+        self.assertEqual(unordered.status, "insufficient_data")
+        self.assertIn("ordered_cap_rate_support", unordered.missing_data)
 
     def test_offer_requires_all_material_costs(self) -> None:
         result = calculate_offer_range(

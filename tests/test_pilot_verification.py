@@ -232,6 +232,18 @@ class PilotVerificationTests(unittest.TestCase):
                 },
             )
         )
+        self.assertTrue(
+            _evidence_value_supports_action(
+                "human_municipal_review",
+                "municipal_code_case",
+                {
+                    "case_number": "C-2-HEARING",
+                    "currently_active": True,
+                    "enforcement_stage": "hearing",
+                    "substantive_hazard": "cosmetic",
+                },
+            )
+        )
         self.assertFalse(
             _evidence_value_supports_action(
                 "human_municipal_review",
@@ -276,6 +288,74 @@ class PilotVerificationTests(unittest.TestCase):
             _evidence_value_supports_action(
                 "verify_identity",
                 "validated_address",
+                None,
+                value_type="unknown",
+                metadata={},
+            )
+        )
+        self.assertTrue(
+            _evidence_value_supports_action(
+                "human_violation_review",
+                "municipal_code_case",
+                {
+                    "case_number": "C-4",
+                    "currently_active": True,
+                    "enforcement_stage": "warning",
+                    "substantive_hazard": "unknown_hazard",
+                    "enrichment_state": "confirmed_enriched",
+                },
+            )
+        )
+        self.assertFalse(
+            _evidence_value_supports_action(
+                "order_municipal_search",
+                "municipal_code_case",
+                None,
+                value_type="unknown",
+                metadata={"reason": "municipal_source_not_run"},
+            )
+        )
+        self.assertTrue(
+            _evidence_value_supports_action(
+                "order_municipal_search",
+                "municipal_code_case",
+                {
+                    "case_number": "C-5",
+                    "currently_active": True,
+                    "enforcement_stage": "warning",
+                    "enrichment_state": "never_enriched",
+                },
+            )
+        )
+        self.assertFalse(
+            _evidence_value_supports_action(
+                "human_violation_review",
+                "municipal_code_case",
+                {
+                    "case_number": "C-6",
+                    "currently_active": True,
+                    "enforcement_stage": "warning",
+                    "substantive_hazard": "cosmetic",
+                    "enrichment_state": "confirmed_enriched",
+                },
+            )
+        )
+        self.assertFalse(
+            _evidence_value_supports_action(
+                "order_municipal_search",
+                "municipal_code_case",
+                {
+                    "case_number": "C-7",
+                    "currently_active": True,
+                    "enforcement_stage": "itl",
+                    "enrichment_state": "never_enriched",
+                },
+            )
+        )
+        self.assertFalse(
+            _evidence_value_supports_action(
+                "order_municipal_search",
+                "municipal_code_case",
                 None,
                 value_type="unknown",
                 metadata={},

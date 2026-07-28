@@ -114,8 +114,29 @@ def _evidence_value_supports_action(
                     "unsafe_life_safety",
                 }
                 or value.get("enforcement_stage")
-                in {"special_master", "itl", "lien"}
+                in {"hearing", "special_master", "itl", "lien"}
             )
+        )
+    if action == "human_violation_review":
+        return (
+            isinstance(value, dict)
+            and field_name == "municipal_code_case"
+            and bool(value.get("currently_active"))
+            and bool(value.get("case_number"))
+            and bool(value.get("enforcement_stage"))
+            and value.get("enrichment_state") == "confirmed_enriched"
+            and value.get("substantive_hazard") == "unknown_hazard"
+        )
+    if action == "order_municipal_search":
+        return (
+            isinstance(value, dict)
+            and field_name == "municipal_code_case"
+            and bool(value.get("currently_active"))
+            and bool(value.get("case_number"))
+            and bool(value.get("enforcement_stage"))
+            and value.get("enrichment_state") != "confirmed_enriched"
+            and value.get("enforcement_stage")
+            not in {"hearing", "special_master", "itl", "lien"}
         )
     if action == "investigate_owner":
         if not isinstance(value, dict):
@@ -701,6 +722,8 @@ def verify_real_pilot(
         expected_action_fields = {
             "verify_identity": {"validated_address", "public_property_record"},
             "human_municipal_review": {"municipal_code_case"},
+            "human_violation_review": {"municipal_code_case"},
+            "order_municipal_search": {"municipal_code_case"},
             "contact_broker_for_documents": {
                 "matrix_listing",
                 "diligence:rent_roll",

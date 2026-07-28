@@ -41,12 +41,16 @@ def _action(features: RecommendationFeatures) -> str:
     scores = features.scores
     if features.is_synthetic:
         return "excluded"
-    if not features.in_scope:
-        return "excluded"
     if not features.identity_verified:
         return "verify_identity"
+    if not features.in_scope:
+        return "excluded"
     if features.serious_municipal_matter:
         return "human_municipal_review"
+    if features.municipal_search_required:
+        return "order_municipal_search"
+    if features.violation_review_required:
+        return "human_violation_review"
     if scores.economics is not None and scores.economics < 0:
         return "reject"
     if (
@@ -66,8 +70,6 @@ def _action(features: RecommendationFeatures) -> str:
         return "investigate_owner"
     if features.municipal_case_present and not features.independent_motivation:
         return "manual_triage"
-    if features.violation_review_required:
-        return "human_violation_review"
     if features.critical_documents_missing:
         return "request_documents"
     if (
@@ -76,8 +78,6 @@ def _action(features: RecommendationFeatures) -> str:
         or scores.data_freshness < 35
     ):
         return "insufficient_data"
-    if features.municipal_search_required:
-        return "order_municipal_search"
     if not features.has_underwriting:
         return "insufficient_data"
     if scores.property_risk >= 85:

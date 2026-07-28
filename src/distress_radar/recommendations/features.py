@@ -262,12 +262,15 @@ def calculate_evidence_scores(
         components["owner_motivation"].append(
             f"{lien_count} qualifying Clerk record(s): +{points}"
         )
-    unpaid_taxes = [
-        item
-        for item in tax_records
-        if _number(item.get("amount_due")) not in (None, 0)
-        and is_unpaid_status(item.get("status"))
-    ]
+    unpaid_taxes = []
+    for item in tax_records:
+        amount_due = _number(item.get("amount_due"))
+        if (
+            amount_due is not None
+            and amount_due > 0
+            and is_unpaid_status(item.get("status"))
+        ):
+            unpaid_taxes.append(item)
     if unpaid_taxes:
         motivation += 30
         components["owner_motivation"].append(

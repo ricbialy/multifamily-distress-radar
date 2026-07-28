@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import math
 import os
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -145,13 +146,6 @@ def _migrate_pilot(store: IntelligenceStore) -> None:
             created_at TEXT NOT NULL,
             UNIQUE(pilot_run_id,property_id,alert_type)
         );
-        CREATE TABLE IF NOT EXISTS signal_observations (
-            observation_id TEXT PRIMARY KEY,
-            pilot_run_id TEXT NOT NULL REFERENCES pilot_runs(run_id),
-            signal_id TEXT NOT NULL REFERENCES property_signals(signal_id),
-            status TEXT NOT NULL,
-            observed_at TEXT NOT NULL
-        );
         """
     )
     pilot_run_columns = {
@@ -169,57 +163,6 @@ def _migrate_pilot(store: IntelligenceStore) -> None:
         store.connection.execute(
             "ALTER TABLE pilot_runs ADD COLUMN effective_at TEXT"
         )
-    recommendation_columns = {
-        row["name"]
-        for row in store.connection.execute("PRAGMA table_info(recommendations)")
-    }
-    for column, definition in (
-        ("pilot_run_id", "TEXT"),
-        ("content_hash", "TEXT"),
-        ("change_type", "TEXT"),
-    ):
-        if column not in recommendation_columns:
-            store.connection.execute(
-                f"ALTER TABLE recommendations ADD COLUMN {column} {definition}"
-            )
-    signal_columns = {
-        row["name"]
-        for row in store.connection.execute("PRAGMA table_info(property_signals)")
-    }
-    if "pilot_run_id" not in signal_columns:
-        store.connection.execute(
-            "ALTER TABLE property_signals ADD COLUMN pilot_run_id TEXT"
-        )
-    if "confirmation_status" not in signal_columns:
-        store.connection.execute(
-            """
-            ALTER TABLE property_signals
-            ADD COLUMN confirmation_status TEXT NOT NULL DEFAULT 'confirmed'
-            """
-        )
-    if "source_name" not in signal_columns:
-        store.connection.execute(
-            "ALTER TABLE property_signals ADD COLUMN source_name TEXT"
-        )
-    store.connection.execute(
-        """
-        UPDATE property_signals
-        SET source_name=CASE
-            WHEN signal_type='off_market_live_code_case' THEN ?
-            WHEN signal_type IN ('lien','recorded_liens','lis_pendens') THEN ?
-            WHEN signal_type='tax_delinquency' THEN ?
-            ELSE source_name
-        END
-        WHERE source_name IS NULL
-        """,
-        (CODE_SOURCE, CLERK_SOURCE, TAX_SOURCE),
-    )
-    source_run_columns = {
-        row["name"]
-        for row in store.connection.execute("PRAGMA table_info(source_runs)")
-    }
-    if "pilot_run_id" not in source_run_columns:
-        store.connection.execute("ALTER TABLE source_runs ADD COLUMN pilot_run_id TEXT")
     store.connection.commit()
 
 
@@ -491,8 +434,7 @@ def _is_serious_municipal_matter(item: MunicipalSeverity) -> bool:
         item.currently_active
         and (
             (item.score is not None and item.score >= 50)
-            or item.score is None
-            or item.enforcement_stage in {"itl", "lien", "special_master"}
+            or item.enforcement_stage in {"hearing", "itl", "lien", "special_master"}
             or item.category
             in {
                 "intent_to_lien_or_lien",
@@ -730,16 +672,28 @@ def _evaluate_watch(
                 """,
                 (property_id, generated_at),
             ).fetchone()
+            before = (
+                json.loads(price_change["before_json"])
+                if price_change
+                else None
+            )
+            after = (
+                json.loads(price_change["after_json"])
+                if price_change
+                else None
+            )
+            before_price = _listing_change_price(before)
+            after_price = _listing_change_price(after)
             if (
-                price_change
-                and json.loads(price_change["before_json"])
-                > json.loads(price_change["after_json"])
+                before_price is not None
+                and after_price is not None
+                and before_price > after_price
             ):
                 event_payload = {
                     "trigger_type": specification.trigger_type,
                     "source_name": source_name,
-                    "before": json.loads(price_change["before_json"]),
-                    "after": json.loads(price_change["after_json"]),
+                    "before": before,
+                    "after": after,
                 }
         elif specification.trigger_type == "new_record":
             watched_signal_type = event.get("signal_type")
@@ -1061,14 +1015,26 @@ def _price_reduction_count(
         try:
             before = json.loads(row["before_json"])
             after = json.loads(row["after_json"])
-            before_price = (
-                before.get("list_price") if isinstance(before, dict) else before
+            before_price = _listing_change_price(before)
+            after_price = _listing_change_price(after)
+            reductions += int(
+                before_price is not None
+                and after_price is not None
+                and after_price < before_price
             )
-            after_price = after.get("list_price") if isinstance(after, dict) else after
-            reductions += int(float(after_price) < float(before_price))
-        except (TypeError, ValueError, json.JSONDecodeError):
+        except json.JSONDecodeError:
             continue
     return reductions
+
+
+def _listing_change_price(value: Any) -> float | None:
+    if isinstance(value, dict):
+        value = value.get("list_price")
+    try:
+        price = float(value)
+    except (TypeError, ValueError):
+        return None
+    return price if math.isfinite(price) else None
 
 
 def _record_for_matrix(
@@ -1099,11 +1065,16 @@ def _record_for_matrix(
             for record in address_result.records
             if normalize_address(record.address) == normalize_address(listing.address)
         )
+        folio: str | None = None
         if candidates:
             resolution = FolioResolver().resolve(
                 listing.folio, tuple(record.folio for record in candidates)
             )
             folio = resolution.folio
+        elif listing.folio:
+            folio = normalize_folio(listing.folio)
+        if folio:
+            query_scope = f"folio:{folio}"
             exact_result = collector.lookup_exact_folio(folio or "")
             exact_documents = exact_result.raw_documents
             for document in exact_documents:
@@ -1226,7 +1197,11 @@ def _record_for_matrix(
                 AddressCandidate(
                     source="matrix_csv",
                     street=listing.address,
-                    municipality=county_record.city or municipality,
+                    municipality=(
+                        listing.municipality
+                        or county_record.city
+                        or municipality
+                    ),
                     state=listing.state,
                     postal_code=listing.postal_code,
                 ),
@@ -1802,6 +1777,9 @@ def _persist_underwriting_and_recommendations(
         )
         owner_identity_conflicting = bool(owner_conflict_evidence_ids)
         missing_fields = list(MISSING_DILIGENCE)
+        verified_unit_count = isinstance(units, int) and not isinstance(units, bool)
+        if not verified_unit_count:
+            missing_fields.append("verified_unit_count")
         if listing.get("noi") is not None:
             missing_fields.remove("NOI")
         if listing.get("expenses") is not None:
@@ -1868,7 +1846,7 @@ def _persist_underwriting_and_recommendations(
             market_cap_rate_base=None,
             market_cap_rate_high=None,
             building_area=county.get("building_area"),
-            public_unit_count_verified=isinstance(units, int) and units > 0,
+            public_unit_count_verified=verified_unit_count and units > 0,
             advertised_units=listing.get("units"),
         )
         underwriting = underwrite_commercial(inputs)
@@ -1911,16 +1889,29 @@ def _persist_underwriting_and_recommendations(
         serious_municipal = any(
             _is_serious_municipal_matter(item) for item in municipal
         )
+        municipal_search_required = any(
+            item.currently_active
+            and item.enrichment_state != "confirmed_enriched"
+            and item.enforcement_stage
+            not in {"hearing", "special_master", "itl", "lien"}
+            for item in municipal
+        )
+        violation_review_required = any(
+            item.currently_active
+            and item.enrichment_state == "confirmed_enriched"
+            and item.substantive_hazard == "unknown_hazard"
+            for item in municipal
+        )
         independent_motivation = scores.owner_motivation > 0
-        in_scope = units is None or 10 <= units <= 80
+        in_scope = verified_unit_count and 10 <= units <= 80
         features = RecommendationFeatures(
             property_id=property_id,
             discovery_channels=channels,
             scores=scores,
             has_underwriting=underwriting.status == "complete",
             critical_documents_missing=bool(missing_fields),
-            violation_review_required=False,
-            municipal_search_required=False,
+            violation_review_required=violation_review_required,
+            municipal_search_required=municipal_search_required,
             why_now=tuple(
                 [
                     f"{item.case_type}: {item.category} ("
@@ -2074,6 +2065,19 @@ def _persist_underwriting_and_recommendations(
                 generated_at=generated_at,
                 pilot_run_id=pilot_run_id,
             )
+        default_action = result.action
+        if (identity_verified and not verified_unit_count) or (
+            owner_identity_conflicting
+            and default_action
+            not in {
+                "excluded",
+                "verify_identity",
+                "human_municipal_review",
+                "reject",
+                "reject_high_risk",
+            }
+        ):
+            default_action = "manual_triage"
         action = _apply_disposition_action(
             disposition=(
                 str(disposition_row["disposition"]) if disposition_row else None
@@ -2084,19 +2088,7 @@ def _persist_underwriting_and_recommendations(
                 else None
             ),
             current_content_hash=content_hash,
-            default_action=(
-                result.action
-                if not owner_identity_conflicting
-                or result.action
-                in {
-                    "excluded",
-                    "verify_identity",
-                    "human_municipal_review",
-                    "reject",
-                    "reject_high_risk",
-                }
-                else "manual_triage"
-            ),
+            default_action=default_action,
             listing_present=listing_row is not None,
             identity_verified=identity_verified,
             in_scope=in_scope,
@@ -2150,7 +2142,11 @@ def _persist_underwriting_and_recommendations(
             *by_field["public_property_record"],
         )
         motivation_ids = (*by_field["official_record"], *by_field["tax_delinquency"])
-        if action == "human_municipal_review":
+        if action in {
+            "human_municipal_review",
+            "human_violation_review",
+            "order_municipal_search",
+        }:
             action_ids = by_field["municipal_code_case"]
         elif action == "verify_identity":
             action_ids = identity_ids
@@ -2194,6 +2190,12 @@ def _persist_underwriting_and_recommendations(
                 "human_municipal_review": (
                     "A current serious, ambiguous, or unknown municipal matter needs judgment."
                 ),
+                "human_violation_review": (
+                    "A current municipal violation requires human classification."
+                ),
+                "order_municipal_search": (
+                    "Municipal evidence is unavailable and requires a bounded search."
+                ),
                 "contact_broker_for_documents": (
                     "An active listing has a validated broker path and named missing documents."
                 ),
@@ -2219,6 +2221,8 @@ def _persist_underwriting_and_recommendations(
                 "excluded": "Do not advance; resolve the failed scope or identity gate.",
                 "verify_identity": "Validate the folio, address, and unit count against the county record.",
                 "human_municipal_review": "Review the cited case detail and violation text.",
+                "human_violation_review": "Review and classify the cited violation text.",
+                "order_municipal_search": "Run the named municipal-record search and retain its result.",
                 "contact_broker_for_documents": "Use the validated broker path to request the named documents.",
                 "request_documents": "Obtain the named missing documents before underwriting.",
                 "investigate_owner": "Review the cited objective public record and confirm it remains unresolved.",
@@ -2293,6 +2297,13 @@ def _persist_underwriting_and_recommendations(
             "county_identity_coverage_state": county_coverage_state,
             "county_identity_material_state": material_county_state,
             "in_scope": in_scope,
+            "unit_scope_status": (
+                "verified_in_scope"
+                if in_scope
+                else "verified_out_of_scope"
+                if verified_unit_count
+                else "unknown"
+            ),
             "acquisition_qualified": bool(
                 is_acquisition_qualified(
                     scores,
@@ -3602,6 +3613,9 @@ def run_pilot(
 ) -> PilotRunResult:
     if not matrix_path.is_file():
         raise FileNotFoundError(matrix_path)
+    municipality = municipality.casefold().strip()
+    if municipality != "hialeah":
+        raise ValueError("REAL-PILOT-02 currently supports only Hialeah")
     generated_at = generated_at or utc_now()
     execution_started_at = utc_now()
     matrix_sha = _sha256(matrix_path)

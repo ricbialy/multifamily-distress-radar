@@ -1800,6 +1800,7 @@ class RealPilot02cAcceptanceTests(unittest.TestCase):
                 record["watch_semantics"]["validation_status"], "valid"
             )
 
+    def test_r12_degraded_and_legacy_watch_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             database = root / "degraded-recovery.sqlite"
@@ -2069,6 +2070,7 @@ class RealPilot02cAcceptanceTests(unittest.TestCase):
                 legacy_rec["recommended_action"], {"contact_owner", "contact_broker"}
             )
 
+    def test_r12_source_recovery_trigger(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             database = root / "source-recovery.sqlite"
@@ -2215,6 +2217,7 @@ class RealPilot02cAcceptanceTests(unittest.TestCase):
                     [("valid",), ("valid",), ("valid",)],
                 )
 
+    def test_r12_same_source_cross_class_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             database = root / "same-source-cross-class.sqlite"
@@ -2467,6 +2470,7 @@ class RealPilot02cAcceptanceTests(unittest.TestCase):
                     "invalid_evidence_compatibility",
                 )
 
+    def test_r12_municipal_status_change_trigger(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             database = root / "municipal-status.sqlite"
@@ -2541,6 +2545,7 @@ class RealPilot02cAcceptanceTests(unittest.TestCase):
                 changed["watch_semantics"]["triggered_action"],
                 "human_municipal_review",
             )
+    def test_r12_material_evidence_change_trigger(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             database = root / "material-event.sqlite"
@@ -2622,6 +2627,7 @@ class RealPilot02cAcceptanceTests(unittest.TestCase):
                 changed["watch_semantics"]["triggered_action"], "manual_triage"
             )
 
+    def test_r12_new_record_trigger(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             database = root / "new-record.sqlite"
@@ -2722,6 +2728,7 @@ class RealPilot02cAcceptanceTests(unittest.TestCase):
             self.assertEqual(
                 new_record["recommended_action"], "human_municipal_review"
             )
+    def test_r12_listing_price_reduction_trigger(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             database = root / "event.sqlite"

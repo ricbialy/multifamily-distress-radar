@@ -31,6 +31,15 @@ def _collector(config: CityConfig) -> TylerEnerGovCollector:
     return TylerEnerGovCollector(config)
 
 
+def _hialeah_pilot_municipality(value: str) -> str:
+    municipality = value.casefold().strip()
+    if municipality != "hialeah":
+        raise argparse.ArgumentTypeError(
+            "REAL-PILOT-02 commands currently support only Hialeah"
+        )
+    return municipality
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="distress-radar")
     parser.add_argument("--verbose", action="store_true")
@@ -160,7 +169,11 @@ def build_parser() -> argparse.ArgumentParser:
     pilot_run.add_argument("--matrix", type=Path, required=True)
     pilot_run.add_argument("--db", type=Path, required=True)
     pilot_run.add_argument("--output-dir", type=Path, required=True)
-    pilot_run.add_argument("--municipality", default="hialeah")
+    pilot_run.add_argument(
+        "--municipality",
+        default="hialeah",
+        type=_hialeah_pilot_municipality,
+    )
     pilot_run.add_argument("--simulate-source-failure", action="store_true")
     pilot_run.add_argument("--minimum-acceptable-cap-rate", type=float)
     pilot_run.add_argument("--target-cap-rate", type=float)
@@ -171,7 +184,11 @@ def build_parser() -> argparse.ArgumentParser:
     pilot_verify.add_argument("--matrix", type=Path, required=True)
     pilot_verify.add_argument("--db", type=Path, required=True)
     pilot_verify.add_argument("--output-dir", type=Path, required=True)
-    pilot_verify.add_argument("--municipality", default="hialeah")
+    pilot_verify.add_argument(
+        "--municipality",
+        default="hialeah",
+        type=_hialeah_pilot_municipality,
+    )
     pilot_disposition = subparsers.add_parser(
         "pilot-disposition",
         help="Record an analyst disposition against the latest reviewed content hash",

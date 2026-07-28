@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import isfinite
 
 
 @dataclass(frozen=True)
@@ -37,6 +38,13 @@ class CommercialMultifamilyResult:
     estimated_value_high: float | None = None
     price_per_unit_at_base_value: float | None = None
     price_per_square_foot_at_base_value: float | None = None
+
+
+def _valid_decimal_rate(value: float | None, *, positive: bool = False) -> bool:
+    if value is None or not isfinite(value):
+        return False
+    lower_bound = value > 0 if positive else value >= 0
+    return lower_bound and value <= 1
 
 
 def underwrite_commercial(
@@ -80,12 +88,40 @@ def underwrite_commercial(
         inputs.market_cap_rate_base,
         inputs.market_cap_rate_high,
     )
-    if any(rate is not None and rate <= 0 for rate in cap_rates):
+    vacancy_valid = (
+        inputs.market_vacancy_rate is None
+        or _valid_decimal_rate(inputs.market_vacancy_rate)
+    )
+    management_valid = (
+        inputs.management_rate is None
+        or _valid_decimal_rate(inputs.management_rate)
+    )
+    cap_rates_valid = all(
+        rate is None or _valid_decimal_rate(rate, positive=True)
+        for rate in cap_rates
+    )
+    if not vacancy_valid:
+        missing.append("valid_vacancy_rate")
+    if not management_valid:
+        missing.append("valid_management_rate")
+    if not cap_rates_valid:
         missing.append("valid_cap_rate_support")
+    if (
+        all(rate is not None for rate in cap_rates)
+        and cap_rates_valid
+        and not (
+            inputs.market_cap_rate_low
+            <= inputs.market_cap_rate_base
+            <= inputs.market_cap_rate_high
+        )
+    ):
+        missing.append("ordered_cap_rate_support")
     if (
         inputs.gross_potential_rent is not None
         and inputs.market_vacancy_rate is not None
         and inputs.management_rate is not None
+        and vacancy_valid
+        and management_valid
     ):
         effective_income = inputs.gross_potential_rent * (
             1 - inputs.market_vacancy_rate

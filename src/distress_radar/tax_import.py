@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
 from distress_radar.models import TaxDelinquency
 from distress_radar.normalize import normalize_parcel
-
 
 ALIASES = {
     "folio": ("folio", "folio number", "folio_number", "parcel", "parcel number", "account"),
@@ -35,9 +35,26 @@ def _money(value: object) -> float:
 def is_unpaid_status(value: object) -> bool:
     status = str(value or "").casefold().strip()
     if not status:
+        return True
+    if re.search(
+        r"\b(?:not|no)\s+(?:currently\s+)?"
+        r"(?:delinquent|unpaid(?:\s+balance)?|"
+        r"outstanding(?:\s+balance)?|past\s+due|open)\b",
+        status,
+    ):
         return False
-    if status in {"paid", "satisfied", "released", "redeemed", "cancelled", "canceled"}:
+    negated_cleared = re.compile(
+        r"\b(?:not|no)\s+(?:currently\s+)?"
+        r"(?:paid|satisfied|released|redeemed|cancelled|canceled|closed)\b"
+    )
+    status_without_negated_cleared = negated_cleared.sub("", status)
+    if re.search(
+        r"\b(?:paid|satisfied|released|redeemed|cancelled|canceled|closed)\b",
+        status_without_negated_cleared,
+    ):
         return False
+    if negated_cleared.search(status):
+        return True
     return any(
         marker in status
         for marker in ("unpaid", "delinquent", "outstanding", "past due", "open")

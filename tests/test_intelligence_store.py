@@ -2,12 +2,18 @@ import dataclasses
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from distress_radar.domain.evidence import EvidenceItem
 from distress_radar.domain.property import CanonicalProperty
 from distress_radar.intelligence_store import IntelligenceStore
+from distress_radar.pilot import _migrate_pilot
 from distress_radar.sources.base import CoverageState, SourceHealthState
 from distress_radar.sources.mls.matrix_csv import MatrixCsvImporter
+from distress_radar.watch_semantics import (
+    WatchSpecification,
+    WatchValidationOutcome,
+)
 
 
 class IntelligenceStoreTests(unittest.TestCase):
@@ -36,6 +42,46 @@ class IntelligenceStoreTests(unittest.TestCase):
                     "SELECT name FROM sqlite_master WHERE type='table'"
                 ).fetchall()
         self.assertTrue(required.issubset({row[0] for row in rows}))
+
+    def test_store_watch_queries_do_not_require_pilot_migration(self) -> None:
+        prop = CanonicalProperty(
+            property_id="property-standalone",
+            folio="0123456789010",
+            address="123 Main St",
+            municipality="Hialeah",
+            jurisdiction="Miami-Dade",
+        )
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            IntelligenceStore(Path(temporary) / "radar.sqlite3") as store,
+        ):
+            store.upsert_property(prop)
+            outcome = store.validate_watch_specification(
+                prop.property_id,
+                None,
+                created_at="2026-07-24T12:00:00+00:00",
+                reviewed_content_hash="a" * 64,
+            )
+            signal_columns = {
+                row["name"]
+                for row in store.connection.execute(
+                    "PRAGMA table_info(property_signals)"
+                )
+            }
+            observation_table = store.connection.execute(
+                """
+                SELECT 1 FROM sqlite_master
+                WHERE type='table' AND name='signal_observations'
+                """
+            ).fetchone()
+
+        self.assertEqual(outcome.status, "legacy_incomplete_watch")
+        self.assertTrue(
+            {"pilot_run_id", "confirmation_status", "source_name"}.issubset(
+                signal_columns
+            )
+        )
+        self.assertIsNotNone(observation_table)
 
     def test_property_and_unknown_evidence_round_trip(self) -> None:
         prop = CanonicalProperty(
@@ -158,6 +204,97 @@ class IntelligenceStoreTests(unittest.TestCase):
         self.assertEqual(changes, ())
         self.assertEqual(snapshot_count, 1)
         self.assertEqual(change_count, 1)
+
+    def test_delivery_source_url_does_not_create_material_snapshot(self) -> None:
+        fixture = Path(__file__).parent / "fixtures" / "matrix_20.csv"
+        importer = MatrixCsvImporter()
+        first = importer.import_file(
+            fixture, fetched_at="2026-07-23T12:00:00+00:00"
+        )[0]
+        repeated = dataclasses.replace(
+            first,
+            fetched_at="2026-07-24T12:00:00+00:00",
+            source_url="email-attachment://renamed-export.csv",
+        )
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            IntelligenceStore(Path(temporary) / "radar.sqlite3") as store,
+        ):
+            store.save_listing_snapshot(first)
+            changes = store.save_listing_snapshot(repeated)
+            snapshot_count = store.connection.execute(
+                "SELECT COUNT(*) FROM listing_snapshots"
+            ).fetchone()[0]
+
+        self.assertEqual(changes, ())
+        self.assertEqual(snapshot_count, 1)
+
+    def test_failed_watch_creation_rolls_back_all_disposition_writes(self) -> None:
+        prop = CanonicalProperty(
+            property_id="property-watch-rollback",
+            folio="0123456789010",
+            address="123 Main St",
+            municipality="Hialeah",
+            jurisdiction="Miami-Dade",
+        )
+        specification = WatchSpecification(
+            watch_reason="Recheck after the scheduled analyst deadline",
+            evidence_ids=("evidence-1",),
+            trigger_type="scheduled_recheck",
+            recheck_condition={
+                "field": "current_time",
+                "operator": "at_or_after",
+                "value": "2026-07-25T12:00:00+00:00",
+            },
+            expected_next_action="manual_triage",
+            creator="analyst:test-suite",
+            recheck_at="2026-07-25T12:00:00+00:00",
+        )
+        validation = WatchValidationOutcome(
+            status="valid",
+            reason="test validation",
+            evidence_states={"evidence-1": "current"},
+            source_health={"matrix_csv": "healthy"},
+            evidence=(),
+        )
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            IntelligenceStore(Path(temporary) / "radar.sqlite3") as store,
+        ):
+            _migrate_pilot(store)
+            store.upsert_property(prop)
+            prior_id = store.record_disposition(
+                prop.property_id,
+                "dismiss",
+                "2026-07-24T12:00:00+00:00",
+                baseline_content_hash="a" * 64,
+            )
+            with patch.object(
+                store,
+                "validate_watch_specification",
+                return_value=validation,
+            ), self.assertRaisesRegex(
+                ValueError, "reviewed recommendation run"
+            ):
+                store.record_disposition(
+                    prop.property_id,
+                    "watch",
+                    "2026-07-24T13:00:00+00:00",
+                    baseline_content_hash="b" * 64,
+                    watch_specification=specification,
+                )
+            store.connection.commit()
+            rows = store.connection.execute(
+                """
+                SELECT disposition_id,disposition,active
+                FROM human_dispositions ORDER BY decided_at
+                """
+            ).fetchall()
+
+        self.assertEqual(
+            [tuple(row) for row in rows],
+            [(prior_id, "dismiss", 1)],
+        )
 
     def test_human_decisions_and_outcomes_are_persisted_for_labels(self) -> None:
         prop = CanonicalProperty(
