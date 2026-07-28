@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from distress_radar.models import CodeCase, OfficialRecord, PropertyContact, PropertyRecord, RawDocument, TaxDelinquency
+from distress_radar.tax_import import is_unpaid_status
 
 
 def utc_now() -> str:
@@ -400,7 +401,7 @@ class RadarStore:
                 counts["changed"] += 1; first_seen = current["first_seen_at"]
             else:
                 counts["unchanged"] += 1; first_seen = current["first_seen_at"]
-            if (current is None or current["payload_hash"] != digest) and record.amount_due > 0 and "paid" not in str(record.status or "").casefold():
+            if (current is None or current["payload_hash"] != digest) and record.amount_due > 0 and is_unpaid_status(record.status):
                 self._enqueue_alert(
                     record.city_slug, "tax_delinquency", "high", record.folio,
                     record.source_record_id,
@@ -863,7 +864,7 @@ class RadarStore:
             "SELECT folio,tax_year,amount_due,status FROM tax_delinquencies WHERE city_slug=? AND amount_due>0",
             (city_slug,),
         ):
-            if "paid" not in str(row["status"] or "").casefold():
+            if is_unpaid_status(row["status"]):
                 tax_by_folio.setdefault(row["folio"], []).append(row)
         for folio, rows in tax_by_folio.items():
             profile = profiles.setdefault(folio, {

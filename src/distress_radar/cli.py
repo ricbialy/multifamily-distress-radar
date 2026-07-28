@@ -5,15 +5,21 @@ import json
 import logging
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
-from distress_radar.collectors import ArcGisPropertyCollector, MiamiDadeClerkCollector, TylerEnerGovCollector
-from distress_radar.config import CityConfig, load_city_config
-from distress_radar.storage import RadarStore
-from distress_radar.pipeline import run_refresh
-from distress_radar.tax_import import import_tax_csv
 from distress_radar.alerts import deliver_webhook
+from distress_radar.collectors import (
+    ArcGisPropertyCollector,
+    MiamiDadeClerkCollector,
+    TylerEnerGovCollector,
+)
+from distress_radar.config import CityConfig, load_city_config
 from distress_radar.contact_import import import_contacts_csv
+from distress_radar.orchestration.refresh import run_fixture_demo
+from distress_radar.pipeline import run_refresh
+from distress_radar.storage import RadarStore
+from distress_radar.tax_import import import_tax_csv
 
 
 def _collector(config: CityConfig) -> TylerEnerGovCollector:
@@ -127,6 +133,82 @@ def build_parser() -> argparse.ArgumentParser:
     contacts.add_argument("--city", required=True)
     contacts.add_argument("--database", type=Path, default=Path("data/radar.sqlite3"))
     contacts.add_argument("--input", type=Path, required=True)
+    fixture_demo = subparsers.add_parser(
+        "fixture-demo",
+        help="Run the combined acquisition-intelligence flow against authorized fixtures",
+    )
+    fixture_demo.add_argument("--matrix", type=Path, required=True)
+    fixture_demo.add_argument("--off-market", type=Path, required=True)
+    fixture_demo.add_argument(
+        "--county-properties",
+        type=Path,
+        help=(
+            "Optional export-properties CSV from Miami-Dade Property Point View; "
+            "required for authoritative address verification"
+        ),
+    )
+    fixture_demo.add_argument("--output-dir", type=Path, required=True)
+    fixture_demo.add_argument(
+        "--generated-at",
+        default=None,
+        help="ISO-8601 timestamp for deterministic fixture output",
+    )
+    pilot_run = subparsers.add_parser(
+        "pilot-run",
+        help="Run the persisted REAL-PILOT-02 qualified acquisition workflow",
+    )
+    pilot_run.add_argument("--matrix", type=Path, required=True)
+    pilot_run.add_argument("--db", type=Path, required=True)
+    pilot_run.add_argument("--output-dir", type=Path, required=True)
+    pilot_run.add_argument("--municipality", default="hialeah")
+    pilot_run.add_argument("--simulate-source-failure", action="store_true")
+    pilot_run.add_argument("--minimum-acceptable-cap-rate", type=float)
+    pilot_run.add_argument("--target-cap-rate", type=float)
+    pilot_verify = subparsers.add_parser(
+        "pilot-verify",
+        help="Run the repeat, controlled-change, failure, and G0-G11 acceptance harness",
+    )
+    pilot_verify.add_argument("--matrix", type=Path, required=True)
+    pilot_verify.add_argument("--db", type=Path, required=True)
+    pilot_verify.add_argument("--output-dir", type=Path, required=True)
+    pilot_verify.add_argument("--municipality", default="hialeah")
+    pilot_disposition = subparsers.add_parser(
+        "pilot-disposition",
+        help="Record an analyst disposition against the latest reviewed content hash",
+    )
+    pilot_disposition.add_argument("--db", type=Path, required=True)
+    pilot_disposition.add_argument("--property-id", required=True)
+    pilot_disposition.add_argument(
+        "--disposition",
+        required=True,
+        choices=(
+            "investigate",
+            "request_documents",
+            "watch",
+            "dismiss",
+            "legal_municipal_review",
+            "approved_for_contact",
+        ),
+    )
+    pilot_disposition.add_argument("--notes")
+    pilot_disposition.add_argument("--watch-reason")
+    pilot_disposition.add_argument("--watch-evidence-id", action="append")
+    pilot_disposition.add_argument(
+        "--watch-trigger-type",
+        choices=(
+            "scheduled_recheck",
+            "new_record",
+            "material_evidence_change",
+            "source_recovery",
+            "listing_price_reduction",
+            "municipal_status_change",
+        ),
+    )
+    pilot_disposition.add_argument("--watch-condition-json")
+    pilot_disposition.add_argument("--watch-recheck-at")
+    pilot_disposition.add_argument("--watch-event-json")
+    pilot_disposition.add_argument("--watch-next-action")
+    pilot_disposition.add_argument("--creator")
     return parser
 
 
@@ -137,6 +219,177 @@ def main(argv: list[str] | None = None) -> None:
         format="%(levelname)s %(name)s: %(message)s",
     )
     try:
+        if args.command == "pilot-disposition":
+            from distress_radar.intelligence_store import IntelligenceStore
+            from distress_radar.pilot import _migrate_pilot
+            from distress_radar.watch_semantics import WatchSpecification
+
+            with IntelligenceStore(args.db) as store:
+                _migrate_pilot(store)
+                row = store.connection.execute(
+                    """
+                    SELECT content_hash FROM recommendations
+                    WHERE property_id=? AND content_hash IS NOT NULL
+                    ORDER BY generated_at DESC,recommendation_id DESC LIMIT 1
+                    """,
+                    (args.property_id,),
+                ).fetchone()
+                if row is None:
+                    raise ValueError(
+                        f"No recommendation exists for property {args.property_id}"
+                    )
+                baseline_content_hash = str(row["content_hash"])
+                watch_specification = None
+                if args.disposition == "watch":
+                    if not args.watch_condition_json:
+                        raise ValueError(
+                            "watch requires --watch-condition-json and complete semantics"
+                        )
+                    watch_specification = WatchSpecification(
+                        watch_reason=args.watch_reason or "",
+                        evidence_ids=tuple(args.watch_evidence_id or ()),
+                        trigger_type=args.watch_trigger_type or "",
+                        recheck_condition=json.loads(args.watch_condition_json),
+                        recheck_at=args.watch_recheck_at,
+                        evidence_event_trigger=(
+                            json.loads(args.watch_event_json)
+                            if args.watch_event_json
+                            else None
+                        ),
+                        expected_next_action=args.watch_next_action or "",
+                        creator=args.creator or "",
+                    )
+                disposition_id = store.record_disposition(
+                    args.property_id,
+                    args.disposition,
+                    datetime.now(timezone.utc).isoformat(),
+                    notes=args.notes,
+                    baseline_content_hash=baseline_content_hash,
+                    watch_specification=watch_specification,
+                )
+            print(
+                json.dumps(
+                    {
+                        "disposition_id": disposition_id,
+                        "property_id": args.property_id,
+                        "disposition": args.disposition,
+                        "baseline_content_hash": baseline_content_hash,
+                    },
+                    indent=2,
+                )
+            )
+            return
+
+        if args.command == "pilot-verify":
+            from distress_radar.pilot_verification import verify_real_pilot
+
+            result = verify_real_pilot(
+                matrix_path=args.matrix,
+                database_path=args.db,
+                output_dir=args.output_dir,
+                municipality=args.municipality,
+            )
+            print(
+                json.dumps(
+                    {
+                        "status": result.status,
+                        "gates": [
+                            {
+                                "gate": gate.gate,
+                                "status": gate.status,
+                                "evidence": gate.evidence,
+                            }
+                            for gate in result.gates
+                        ],
+                        "first_run_counts": result.first_run_counts,
+                        "second_run_counts": result.second_run_counts,
+                        "next_day_run_counts": result.next_day_run_counts,
+                        "controlled_change": result.controlled_change,
+                        "source_statuses": result.source_statuses,
+                        "output_path": str(result.output_path),
+                    },
+                    indent=2,
+                )
+            )
+            return
+
+        if args.command == "pilot-run":
+            from distress_radar.pilot import run_pilot
+            from distress_radar.recommendations.features import InvestmentCriteria
+
+            criteria_values = (
+                args.minimum_acceptable_cap_rate,
+                args.target_cap_rate,
+            )
+            if any(value is not None for value in criteria_values) and not all(
+                value is not None for value in criteria_values
+            ):
+                raise ValueError(
+                    "both minimum and target cap rates are required when configuring criteria"
+                )
+            investment_criteria = (
+                InvestmentCriteria(
+                    minimum_acceptable_cap_rate=args.minimum_acceptable_cap_rate,
+                    target_cap_rate=args.target_cap_rate,
+                )
+                if all(value is not None for value in criteria_values)
+                else None
+            )
+
+            result = run_pilot(
+                matrix_path=args.matrix,
+                database_path=args.db,
+                output_dir=args.output_dir,
+                municipality=args.municipality,
+                simulate_source_failure=args.simulate_source_failure,
+                investment_criteria=investment_criteria,
+            )
+            print(
+                json.dumps(
+                    {
+                        "run_id": result.run_id,
+                        "matrix_sha256": result.matrix_sha256,
+                        "accepted_rows": result.accepted_rows,
+                        "rejected_rows": result.rejected_rows,
+                        "database_counts": result.database_counts,
+                        "output_files": [str(path) for path in result.output_files],
+                    },
+                    indent=2,
+                )
+            )
+            return
+
+        if args.command == "fixture-demo":
+            from distress_radar.sources.public.property_csv import (
+                PropertyRecordCsvImporter,
+            )
+
+            property_records = (
+                PropertyRecordCsvImporter().import_file(args.county_properties)
+                if args.county_properties
+                else ()
+            )
+            result = run_fixture_demo(
+                matrix_path=args.matrix,
+                off_market_path=args.off_market,
+                output_dir=args.output_dir,
+                generated_at=args.generated_at
+                or datetime.now(timezone.utc).isoformat(),
+                property_records=property_records,
+            )
+            print(
+                json.dumps(
+                    {
+                        "canonical_property_count": result.canonical_property_count,
+                        "json_path": str(result.json_path),
+                        "csv_path": str(result.csv_path),
+                        "brief_path": str(result.brief_path),
+                    },
+                    indent=2,
+                )
+            )
+            return
+
         config = load_city_config(args.city)
         if args.command == "statuses":
             for status in _collector(config).list_statuses():

@@ -1,4 +1,143 @@
-# Multifamily Distress Radar — collector starter
+# Multifamily Distress Radar — acquisition intelligence
+
+Version 0.15 adds a tested acquisition-intelligence foundation on top of the
+existing public-record collectors. It has two fixture-capable discovery paths:
+authorized Matrix CSV/email exports and authorized off-market CSV exports.
+Both paths feed canonical identity, evidence, underwriting, recommendation,
+outcome-capture, and reporting modules.
+
+This is not an autonomous acquisition system and it does not have an active ML
+model. Live Tyler EnerGov and Miami-Dade property collection remain available
+through the legacy refresh flow. Matrix is an authorized export workflow;
+off-market fixture data is a manual import; paid vendor adapters are disabled
+unless credentials exist and their live API implementations are still pending.
+
+The checkout used to build this branch started from GitHub `main` at version
+0.14. The previously described uncommitted version 0.15 was not present on
+GitHub and could not be recovered, so its functionality was rebuilt from the
+published v0.14 baseline.
+
+## Acquisition-intelligence fixture demo
+
+## REAL-PILOT-02 corrective acquisition-review workflow
+
+Run the genuine Matrix export through row validation, county identity
+verification, live Hialeah public-record enrichment, persisted hard gates, and
+database-derived reports:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m distress_radar pilot-run \
+  --matrix /absolute/path/to/Agent\ Single\ Line\ -\ COM.csv \
+  --db /absolute/path/to/pilot.sqlite \
+  --output-dir /absolute/path/to/pilot-output \
+  --municipality hialeah \
+  --minimum-acceptable-cap-rate 0.04 \
+  --target-cap-rate 0.06
+```
+
+Cap-rate criteria use decimal units and must be supplied together. If omitted,
+the run records `criteria_not_configured`; supported NOI may be displayed, but
+cap rate earns no credit and economics alone cannot qualify a property.
+
+The genuine export headers map as follows: `MLS # Link` → MLS number, `St` →
+listing status, `Address` → submitted street address, `Current Price` → list
+price, and `Type of Property` → property class. Missing optional city, folio,
+unit, rent, NOI, and expense columns remain unknown; they are not filled from
+assumptions. Per-row acceptance or rejection is written to `import_ledger.csv`.
+
+For a fresh database, the repeatable G0–G11 acceptance command is:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m distress_radar pilot-verify \
+  --matrix /absolute/path/to/Agent\ Single\ Line\ -\ COM.csv \
+  --db /absolute/path/to/fresh-verification.sqlite \
+  --output-dir /absolute/path/to/verification-output \
+  --municipality hialeah
+```
+
+Neither command modifies the supplied Matrix file. The verification command
+creates a separate controlled-change copy under its output directory.
+
+The reports keep acquisition attractiveness and municipal-review urgency as
+separate rankings. `qualified_queue.json` remains as a compatibility alias for
+`acquisition_queue.json`; MLS examples are written separately and are never
+forced into either numerical top ten. Source-health warnings and opportunity
+changes are also emitted separately.
+
+Record an analyst disposition against the latest reviewed material-content
+hash with:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m distress_radar pilot-disposition \
+  --db /absolute/path/to/pilot.sqlite \
+  --property-id property-identifier \
+  --disposition dismiss \
+  --notes "Reviewed by analyst"
+```
+
+Dismissals reopen when material source evidence changes. Contact approval is
+also hash-bound and cannot bypass identity, scope, municipal-risk, or
+underwriting hard gates.
+
+A new `watch` additionally requires a specific reason, property-matched
+evidence IDs, a bounded trigger with a structured condition, an explicit next
+action, and a creator. Scheduled watches require a future recheck timestamp;
+event watches require an exact source and evidence or signal class. Incomplete
+legacy rows remain visible as `legacy_incomplete_watch` and do not run
+automatically.
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -e .
+
+PYTHONPATH=src .venv/bin/python -m distress_radar fixture-demo \
+  --matrix tests/fixtures/matrix_20.csv \
+  --off-market tests/fixtures/off_market.csv \
+  --output-dir exports/fixture-demo \
+  --generated-at 2026-07-24T12:00:00+00:00
+```
+
+The demo creates:
+
+- `recommendations.json` with evidence-backed fields and separate scores.
+- `recommendations.csv` for analysis.
+- `daily_brief.md` with actionable opportunities, diligence gaps, and source
+  warnings.
+
+Addresses are not labeled `verified` from an MLS or spreadsheet alone. To
+validate them against Miami-Dade Property Point View by exact folio, collect
+and export the public county records, then pass that export into the combined
+flow:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m distress_radar scrape-properties \
+  --city hialeah_fl --database data/radar.sqlite3
+PYTHONPATH=src .venv/bin/python -m distress_radar export-properties \
+  --city hialeah_fl --database data/radar.sqlite3 \
+  --output exports/county-properties.csv
+PYTHONPATH=src .venv/bin/python -m distress_radar fixture-demo \
+  --matrix tests/fixtures/matrix_20.csv \
+  --off-market tests/fixtures/off_market.csv \
+  --county-properties exports/county-properties.csv \
+  --output-dir exports/fixture-demo
+```
+
+The brief distinguishes `verified`, `mismatch`, `corroborated`, and
+`unverified`. A mismatch displays the county site address and retains the
+submitted address in the validation details for review.
+
+No credential is used by the fixture demo. See
+[`docs/AUTOMATION_RUNBOOK.md`](docs/AUTOMATION_RUNBOOK.md) for live and
+fixture workflows.
+
+## Evidence boundary
+
+Every new intelligence field is modeled as reported, calculated, inferred, or
+unknown, with source, source record, timestamp, confidence, and freshness.
+Missing data and source failures remain explicit. They are never converted to
+claims such as “no lien,” “no violation,” or “clean property.”
+
+## Legacy collector history
 
 Version 0.14 adds authorized contact-research CSV import with source,
 verification status, and confidence. Version 0.13 added a persistent acquisition workflow with lead stages, assignee,
