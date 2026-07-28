@@ -1847,7 +1847,7 @@ def _persist_underwriting_and_recommendations(
             market_cap_rate_base=None,
             market_cap_rate_high=None,
             building_area=county.get("building_area"),
-            public_unit_count_verified=isinstance(units, int) and units > 0,
+            public_unit_count_verified=verified_unit_count and units > 0,
             advertised_units=listing.get("units"),
         )
         underwriting = underwrite_commercial(inputs)
@@ -1890,6 +1890,19 @@ def _persist_underwriting_and_recommendations(
         serious_municipal = any(
             _is_serious_municipal_matter(item) for item in municipal
         )
+        municipal_search_required = any(
+            item.currently_active
+            and item.enrichment_state != "confirmed_enriched"
+            and item.enforcement_stage
+            not in {"hearing", "special_master", "itl", "lien"}
+            for item in municipal
+        )
+        violation_review_required = any(
+            item.currently_active
+            and item.enrichment_state == "confirmed_enriched"
+            and item.substantive_hazard == "unknown_hazard"
+            for item in municipal
+        )
         independent_motivation = scores.owner_motivation > 0
         in_scope = verified_unit_count and 10 <= units <= 80
         features = RecommendationFeatures(
@@ -1898,8 +1911,8 @@ def _persist_underwriting_and_recommendations(
             scores=scores,
             has_underwriting=underwriting.status == "complete",
             critical_documents_missing=bool(missing_fields),
-            violation_review_required=False,
-            municipal_search_required=False,
+            violation_review_required=violation_review_required,
+            municipal_search_required=municipal_search_required,
             why_now=tuple(
                 [
                     f"{item.case_type}: {item.category} ("

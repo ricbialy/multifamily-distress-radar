@@ -43,7 +43,11 @@ def is_unpaid_status(value: object) -> bool:
         status,
     ):
         return False
-    if re.search(r"\bnot\s+paid\b", status):
+    if re.search(
+        r"\b(?:not|no)\s+(?:currently\s+)?"
+        r"(?:paid|satisfied|released|redeemed|cancelled|canceled|closed)\b",
+        status,
+    ):
         return True
     if re.search(
         r"\b(?:paid|satisfied|released|redeemed|cancelled|canceled|closed)\b",

@@ -129,8 +129,17 @@ def _evidence_value_supports_action(
     if action == "order_municipal_search":
         return (
             field_name == "municipal_code_case"
-            and value_type == "unknown"
-            and bool((metadata or {}).get("reason"))
+            and (
+                (
+                    value_type == "unknown"
+                    and bool((metadata or {}).get("reason"))
+                )
+                or (
+                    isinstance(value, dict)
+                    and bool(value.get("currently_active"))
+                    and value.get("enrichment_state") != "confirmed_enriched"
+                )
+            )
         )
     if action == "investigate_owner":
         if not isinstance(value, dict):
