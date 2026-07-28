@@ -9,7 +9,6 @@ from pathlib import Path
 from distress_radar.models import TaxDelinquency
 from distress_radar.normalize import normalize_parcel
 
-
 ALIASES = {
     "folio": ("folio", "folio number", "folio_number", "parcel", "parcel number", "account"),
     "tax_year": ("tax year", "tax_year", "year", "roll year"),

@@ -51,27 +51,29 @@ class IntelligenceStoreTests(unittest.TestCase):
             municipality="Hialeah",
             jurisdiction="Miami-Dade",
         )
-        with tempfile.TemporaryDirectory() as temporary:
-            with IntelligenceStore(Path(temporary) / "radar.sqlite3") as store:
-                store.upsert_property(prop)
-                outcome = store.validate_watch_specification(
-                    prop.property_id,
-                    None,
-                    created_at="2026-07-24T12:00:00+00:00",
-                    reviewed_content_hash="a" * 64,
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            IntelligenceStore(Path(temporary) / "radar.sqlite3") as store,
+        ):
+            store.upsert_property(prop)
+            outcome = store.validate_watch_specification(
+                prop.property_id,
+                None,
+                created_at="2026-07-24T12:00:00+00:00",
+                reviewed_content_hash="a" * 64,
+            )
+            signal_columns = {
+                row["name"]
+                for row in store.connection.execute(
+                    "PRAGMA table_info(property_signals)"
                 )
-                signal_columns = {
-                    row["name"]
-                    for row in store.connection.execute(
-                        "PRAGMA table_info(property_signals)"
-                    )
-                }
-                observation_table = store.connection.execute(
-                    """
-                    SELECT 1 FROM sqlite_master
-                    WHERE type='table' AND name='signal_observations'
-                    """
-                ).fetchone()
+            }
+            observation_table = store.connection.execute(
+                """
+                SELECT 1 FROM sqlite_master
+                WHERE type='table' AND name='signal_observations'
+                """
+            ).fetchone()
 
         self.assertEqual(outcome.status, "legacy_incomplete_watch")
         self.assertTrue(
@@ -214,13 +216,15 @@ class IntelligenceStoreTests(unittest.TestCase):
             fetched_at="2026-07-24T12:00:00+00:00",
             source_url="email-attachment://renamed-export.csv",
         )
-        with tempfile.TemporaryDirectory() as temporary:
-            with IntelligenceStore(Path(temporary) / "radar.sqlite3") as store:
-                store.save_listing_snapshot(first)
-                changes = store.save_listing_snapshot(repeated)
-                snapshot_count = store.connection.execute(
-                    "SELECT COUNT(*) FROM listing_snapshots"
-                ).fetchone()[0]
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            IntelligenceStore(Path(temporary) / "radar.sqlite3") as store,
+        ):
+            store.save_listing_snapshot(first)
+            changes = store.save_listing_snapshot(repeated)
+            snapshot_count = store.connection.execute(
+                "SELECT COUNT(*) FROM listing_snapshots"
+            ).fetchone()[0]
 
         self.assertEqual(changes, ())
         self.assertEqual(snapshot_count, 1)
@@ -253,37 +257,39 @@ class IntelligenceStoreTests(unittest.TestCase):
             source_health={"matrix_csv": "healthy"},
             evidence=(),
         )
-        with tempfile.TemporaryDirectory() as temporary:
-            with IntelligenceStore(Path(temporary) / "radar.sqlite3") as store:
-                _migrate_pilot(store)
-                store.upsert_property(prop)
-                prior_id = store.record_disposition(
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            IntelligenceStore(Path(temporary) / "radar.sqlite3") as store,
+        ):
+            _migrate_pilot(store)
+            store.upsert_property(prop)
+            prior_id = store.record_disposition(
+                prop.property_id,
+                "dismiss",
+                "2026-07-24T12:00:00+00:00",
+                baseline_content_hash="a" * 64,
+            )
+            with patch.object(
+                store,
+                "validate_watch_specification",
+                return_value=validation,
+            ), self.assertRaisesRegex(
+                ValueError, "reviewed recommendation run"
+            ):
+                store.record_disposition(
                     prop.property_id,
-                    "dismiss",
-                    "2026-07-24T12:00:00+00:00",
-                    baseline_content_hash="a" * 64,
+                    "watch",
+                    "2026-07-24T13:00:00+00:00",
+                    baseline_content_hash="b" * 64,
+                    watch_specification=specification,
                 )
-                with patch.object(
-                    store,
-                    "validate_watch_specification",
-                    return_value=validation,
-                ), self.assertRaisesRegex(
-                    ValueError, "reviewed recommendation run"
-                ):
-                    store.record_disposition(
-                        prop.property_id,
-                        "watch",
-                        "2026-07-24T13:00:00+00:00",
-                        baseline_content_hash="b" * 64,
-                        watch_specification=specification,
-                    )
-                store.connection.commit()
-                rows = store.connection.execute(
-                    """
-                    SELECT disposition_id,disposition,active
-                    FROM human_dispositions ORDER BY decided_at
-                    """
-                ).fetchall()
+            store.connection.commit()
+            rows = store.connection.execute(
+                """
+                SELECT disposition_id,disposition,active
+                FROM human_dispositions ORDER BY decided_at
+                """
+            ).fetchall()
 
         self.assertEqual(
             [tuple(row) for row in rows],

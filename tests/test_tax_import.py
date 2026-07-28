@@ -3,9 +3,10 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from test_storage import sample_property
+
 from distress_radar.storage import RadarStore
 from distress_radar.tax_import import import_tax_csv, is_unpaid_status
-from test_storage import sample_property
 
 
 class TaxImportTests(unittest.TestCase):
