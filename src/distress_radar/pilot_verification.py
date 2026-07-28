@@ -114,7 +114,7 @@ def _evidence_value_supports_action(
                     "unsafe_life_safety",
                 }
                 or value.get("enforcement_stage")
-                in {"special_master", "itl", "lien"}
+                in {"hearing", "special_master", "itl", "lien"}
             )
         )
     if action == "human_violation_review":
