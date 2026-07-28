@@ -161,6 +161,23 @@ class EnrichedUnknownCodeCollector(BareMinorCodeCollector):
         return CollectionResult(enriched, (), ())
 
 
+class BareHearingCodeCollector(BareMinorCodeCollector):
+    def collect(self, statuses: tuple[str, ...], **kwargs: object) -> CollectionResult:
+        case = super().collect(statuses, **kwargs).records[0]
+        return CollectionResult(
+            (
+                replace(
+                    case,
+                    source_record_id="case-hearing",
+                    case_number="CE-HEARING",
+                    status="Notice of Hearing Sent",
+                ),
+            ),
+            (),
+            statuses,
+        )
+
+
 class MixedSeverityCodeCollector(BareMinorCodeCollector):
     def collect(self, statuses: tuple[str, ...], **kwargs: object) -> CollectionResult:
         minor = super().collect(statuses, **kwargs).records[0]
@@ -625,6 +642,35 @@ class PilotTests(unittest.TestCase):
         )
         self.assertEqual(off_market["recommended_action"], "human_violation_review")
         self.assertTrue(off_market["action_support"]["trigger_evidence_ids"])
+
+    def test_never_enriched_hearing_requires_municipal_review(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            matrix = root / "Agent Single Line - COM.csv"
+            matrix.write_text(self.csv_text, encoding="utf-8")
+            run_pilot(
+                matrix_path=matrix,
+                database_path=root / "pilot.sqlite",
+                output_dir=root / "output",
+                municipality="hialeah",
+                generated_at="2026-07-24T12:00:00+00:00",
+                property_collector=FakePropertyCollector(),
+                code_collector=BareHearingCodeCollector(),
+            )
+            recommendations = json.loads(
+                (root / "output/recommendations.json").read_text()
+            )
+
+        off_market = next(
+            item
+            for item in recommendations
+            if "off_market" in item["discovery_channels"]
+        )
+        self.assertEqual(off_market["recommended_action"], "human_municipal_review")
+        self.assertEqual(
+            off_market["municipal_cases"][0]["enforcement_stage"], "hearing"
+        )
+        self.assertIsNone(off_market["municipal_cases"][0]["severity_score"])
 
     def test_serious_case_outranks_independent_enrichment_gap(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
