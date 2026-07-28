@@ -5,13 +5,16 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from distress_radar.domain.owner import CanonicalOwner
+from distress_radar.domain.property import CanonicalProperty
+from distress_radar.intelligence_store import IntelligenceStore
 from distress_radar.models import (
     CodeCase,
     CollectionResult,
     PropertyCollectionResult,
     PropertyRecord,
 )
-from distress_radar.pilot import run_pilot
+from distress_radar.pilot import _save_owner, run_pilot
 
 
 def property_record(folio: str, address: str, units: int) -> PropertyRecord:
@@ -124,6 +127,87 @@ class PilotTests(unittest.TestCase):
         '1,A123,A,41,100 Test Ave,,"$2,500,000",3901,1970,COM/Sale,,'
         "Commercial/Residential Income,Income/MultiFamily,12000,,,,\n"
     )
+
+    def test_ambiguous_owner_creates_no_owner_relationship_or_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with IntelligenceStore(Path(temporary) / "pilot.sqlite") as store:
+                now = "2026-07-24T12:00:00+00:00"
+                owners = (
+                    CanonicalOwner("owner-llc", "Sunrise Holdings LLC", "llc"),
+                    CanonicalOwner("owner-lp", "Sunrise Holdings LP", "lp"),
+                )
+                store.connection.executemany(
+                    """
+                    INSERT INTO canonical_owners (
+                        owner_id,display_name,entity_type,created_at,updated_at
+                    ) VALUES (?,?,?,?,?)
+                    """,
+                    (
+                        (
+                            owner.owner_id,
+                            owner.display_name,
+                            owner.entity_type,
+                            now,
+                            now,
+                        )
+                        for owner in owners
+                    ),
+                )
+                prop = CanonicalProperty(
+                    property_id="property-owner-conflict",
+                    folio="0400000000099",
+                    address="900 TEST AVE, HIALEAH, FL 33010",
+                    municipality="HIALEAH",
+                    jurisdiction="Miami-Dade",
+                )
+                store.upsert_property(prop)
+                record = property_record(
+                    "0400000000099",
+                    "900 TEST AVE",
+                    12,
+                )
+                record = PropertyRecord(
+                    **{
+                        **record.__dict__,
+                        "owner_name": "SUNRISE HOLDINGS",
+                    }
+                )
+
+                resolution = _save_owner(store, prop, record)
+
+                self.assertTrue(resolution.conflicting)
+                self.assertIsNone(resolution.owner_id)
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT COUNT(*) FROM canonical_owners"
+                    ).fetchone()[0],
+                    2,
+                )
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT COUNT(*) FROM owner_aliases"
+                    ).fetchone()[0],
+                    0,
+                )
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT COUNT(*) FROM property_ownership"
+                    ).fetchone()[0],
+                    0,
+                )
+                ambiguity = store.connection.execute(
+                    """
+                    SELECT value_type,metadata_json FROM evidence_items
+                    WHERE property_id=? AND field_name='owner_identity_conflict'
+                    """,
+                    (prop.property_id,),
+                ).fetchone()
+                self.assertIsNotNone(ambiguity)
+                self.assertEqual(ambiguity["value_type"], "unknown")
+                self.assertEqual(
+                    json.loads(ambiguity["metadata_json"])["candidate_owner_ids"],
+                    ["owner-llc", "owner-lp"],
+                )
 
     def test_county_address_mismatch_requires_identity_verification(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

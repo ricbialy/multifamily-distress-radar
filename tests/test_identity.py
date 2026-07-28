@@ -67,6 +67,44 @@ class IdentityTests(unittest.TestCase):
         self.assertEqual(result.status, MatchStatus.CONFIRMED)
         self.assertEqual(result.method, "normalized_address")
 
+    def test_florida_directional_forms_normalize_identically(self) -> None:
+        equivalents = {
+            "nw": ("NW", "N.W.", "Northwest", "North West"),
+            "ne": ("NE", "N.E.", "Northeast", "North East"),
+            "sw": ("SW", "S.W.", "Southwest", "South West"),
+            "se": ("SE", "S.E.", "Southeast", "South East"),
+        }
+        for expected, forms in equivalents.items():
+            with self.subTest(direction=expected):
+                normalized = {
+                    normalize_address(f"1440 {form} 4th Street") for form in forms
+                }
+                self.assertEqual(normalized, {f"1440 {expected} 4 st"})
+
+        self.assertEqual(normalize_address("100 N Main St"), "100 n main st")
+        self.assertEqual(
+            normalize_address("100 Northwestern Ave"),
+            "100 northwestern ave",
+        )
+
+    def test_directional_variants_confirm_address_match(self) -> None:
+        existing = CanonicalProperty(
+            property_id="property-directional",
+            folio=None,
+            address="1440 NW 4 ST",
+            municipality="Hialeah",
+            jurisdiction="Miami-Dade",
+        )
+        result = MatchService().match(
+            folio=None,
+            address="1440 North West 4th Street",
+            municipality="Hialeah",
+            candidates=(existing,),
+        )
+        self.assertEqual(result.status, MatchStatus.CONFIRMED)
+        self.assertEqual(result.method, "normalized_address")
+        self.assertEqual(result.property_id, "property-directional")
+
     def test_fuzzy_address_is_review_only(self) -> None:
         existing = CanonicalProperty(
             property_id="property-1",
@@ -95,6 +133,24 @@ class IdentityTests(unittest.TestCase):
         self.assertEqual(result.owner_id, "owner-1")
         self.assertTrue(result.alias_match)
         self.assertFalse(result.beneficial_ownership_confirmed)
+
+    def test_owner_suffix_collision_is_explicit_and_order_independent(self) -> None:
+        owners = (
+            CanonicalOwner("owner-llc", "Sunrise Holdings LLC", "llc"),
+            CanonicalOwner("owner-lp", "Sunrise Holdings LP", "lp"),
+        )
+        forward = OwnerResolver(owners).resolve("SUNRISE HOLDINGS")
+        reverse = OwnerResolver(tuple(reversed(owners))).resolve("SUNRISE HOLDINGS")
+
+        for result in (forward, reverse):
+            self.assertIsNone(result.owner_id)
+            self.assertTrue(result.alias_match)
+            self.assertTrue(result.conflicting)
+            self.assertEqual(
+                result.candidate_owner_ids,
+                ("owner-llc", "owner-lp"),
+            )
+        self.assertEqual(forward, reverse)
 
 
 if __name__ == "__main__":

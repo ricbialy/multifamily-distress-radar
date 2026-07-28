@@ -82,6 +82,26 @@ class CountyAddressValidatorTests(unittest.TestCase):
         self.assertEqual(result.address, "101 PALM AVE, HIALEAH, FL 33010")
         self.assertIn("999 wrong st", result.details)
 
+    def test_florida_directional_variant_is_verified(self) -> None:
+        result = CountyAddressValidator(
+            (_county_record(address="1440 NW 4 ST"),)
+        ).validate(
+            folio="04-3101-001-0010",
+            candidates=(
+                AddressCandidate(
+                    source="matrix",
+                    street="1440 N.W. 4th Street",
+                    municipality="Hialeah",
+                    state="FL",
+                    postal_code="33010",
+                ),
+            ),
+            checked_at="2026-07-24T12:00:00+00:00",
+        )
+
+        self.assertEqual(result.status, AddressValidationStatus.VERIFIED)
+        self.assertEqual(result.address, "1440 NW 4 ST, HIALEAH, FL 33010")
+
     def test_two_non_authoritative_sources_are_only_corroborated(self) -> None:
         result = CountyAddressValidator(()).validate(
             folio="0431010010010",

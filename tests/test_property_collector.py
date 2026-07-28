@@ -66,8 +66,54 @@ class PropertyCollectorTests(unittest.TestCase):
 
         collector._request = request  # type: ignore[method-assign]
         collector.lookup_address("1440 SW 4th St")
-        self.assertIn("1440 SW 4", str(requests[0]["where"]))
-        self.assertIn("LIKE", str(requests[0]["where"]))
+        self.assertEqual(
+            requests[0]["where"],
+            "UPPER(TRUE_SITE_ADDR) LIKE '1440 SW 4 ST%'",
+        )
+
+    def test_address_lookup_sanitizes_apostrophe_and_query_syntax(self) -> None:
+        collector = ArcGisPropertyCollector(load_city_config("hialeah_fl", CONFIG_DIR))
+        requests: list[dict[str, object]] = []
+
+        def request(url: str, params: dict[str, object]) -> dict[str, object]:
+            requests.append(params)
+            return {"features": []}
+
+        collector._request = request  # type: ignore[method-assign]
+        collector.lookup_address("123 O'Brien Street")
+        self.assertEqual(
+            requests[-1]["where"],
+            "UPPER(TRUE_SITE_ADDR) LIKE '123 O BRIEN ST%'",
+        )
+
+        collector.lookup_address("123 Main St%_'; DROP TABLE x; --\nOR 1=1")
+        where = str(requests[-1]["where"])
+        self.assertEqual(
+            where,
+            "UPPER(TRUE_SITE_ADDR) LIKE '123 MAIN ST DROP TABLE X OR 1 1%'",
+        )
+        literal = where.removeprefix("UPPER(TRUE_SITE_ADDR) LIKE '").removesuffix(
+            "%'"
+        )
+        self.assertNotIn("%", literal)
+        self.assertNotIn("_", literal)
+        self.assertNotIn(";", literal)
+        self.assertNotIn("--", literal)
+        self.assertNotIn("\n", literal)
+        self.assertEqual(where.count("'"), 2)
+
+    def test_address_lookup_rejects_empty_sanitized_stem(self) -> None:
+        collector = ArcGisPropertyCollector(load_city_config("hialeah_fl", CONFIG_DIR))
+        requests: list[dict[str, object]] = []
+
+        def request(url: str, params: dict[str, object]) -> dict[str, object]:
+            requests.append(params)
+            return {"features": []}
+
+        collector._request = request  # type: ignore[method-assign]
+        with self.assertRaisesRegex(ValueError, "address is required"):
+            collector.lookup_address("%_;--\x00")
+        self.assertEqual(requests, [])
 
 
 if __name__ == "__main__":
