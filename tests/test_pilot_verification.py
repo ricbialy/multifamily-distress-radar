@@ -302,6 +302,17 @@ class PilotVerificationTests(unittest.TestCase):
                 metadata={"reason": "municipal_source_not_run"},
             )
         )
+        self.assertTrue(
+            _evidence_value_supports_action(
+                "order_municipal_search",
+                "municipal_code_case",
+                {
+                    "case_number": "C-5",
+                    "currently_active": True,
+                    "enrichment_state": "never_enriched",
+                },
+            )
+        )
         self.assertFalse(
             _evidence_value_supports_action(
                 "order_municipal_search",

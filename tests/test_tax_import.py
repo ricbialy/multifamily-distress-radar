@@ -28,6 +28,15 @@ class TaxImportTests(unittest.TestCase):
         for status in ("unpaid", "delinquent", "past due", "not paid"):
             with self.subTest(status=status):
                 self.assertTrue(is_unpaid_status(status))
+        for status in (
+            "lien not satisfied",
+            "not released",
+            "not currently redeemed",
+            "case not closed",
+            "not cancelled",
+        ):
+            with self.subTest(status=status):
+                self.assertTrue(is_unpaid_status(status))
 
     def test_aliases_normalization_and_financial_score(self) -> None:
         with TemporaryDirectory() as temp:

@@ -4,6 +4,7 @@ import csv
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from distress_radar.domain.owner import CanonicalOwner
@@ -77,6 +78,12 @@ class UnknownUnitsPropertyCollector(FakePropertyCollector):
         self.matrix = property_record("0400000000001", "100 TEST AVE", None)
 
 
+class BooleanUnitsPropertyCollector(FakePropertyCollector):
+    def __init__(self) -> None:
+        super().__init__()
+        self.matrix = property_record("0400000000001", "100 TEST AVE", True)
+
+
 class FolioFallbackPropertyCollector(FakePropertyCollector):
     def __init__(self) -> None:
         super().__init__()
@@ -112,6 +119,46 @@ class FakeCodeCollector:
             fetched_at="2026-07-24T12:00:00+00:00",
         )
         return CollectionResult((case,), (), statuses)
+
+    def enrich_records(
+        self, records: tuple[CodeCase, ...], **kwargs: object
+    ) -> CollectionResult:
+        return CollectionResult(records, (), ())
+
+
+class BareMinorCodeCollector:
+    def collect(self, statuses: tuple[str, ...], **kwargs: object) -> CollectionResult:
+        case = CodeCase(
+            city_slug="hialeah_fl",
+            source_name="hialeah_tyler_energov",
+            source_record_id="case-minor",
+            case_number="CE-MINOR",
+            case_type="Code Enforcement",
+            status="Warning",
+            opened_date="2026-01-01",
+            closed_date=None,
+            address="200 TEST AVE",
+            parcel_number="0400000000002",
+            description=None,
+            project_name=None,
+            assigned_to=None,
+            violation_count=0,
+            violations=(),
+            source_url="https://example.test/case-minor",
+            fetched_at="2026-07-24T12:00:00+00:00",
+        )
+        return CollectionResult((case,), (), statuses)
+
+
+class EnrichedUnknownCodeCollector(BareMinorCodeCollector):
+    def enrich_records(
+        self, records: tuple[CodeCase, ...], **kwargs: object
+    ) -> CollectionResult:
+        enriched = tuple(
+            replace(record, description="Exterior finish condition requires review")
+            for record in records
+        )
+        return CollectionResult(enriched, (), ())
 
 
 class IntentToLienCodeCollector:
@@ -226,6 +273,35 @@ class PilotTests(unittest.TestCase):
                     property_collector=FakePropertyCollector(),
                     code_collector=FakeCodeCollector(),
                 )
+
+    def test_boolean_unit_count_is_not_publicly_verified(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            matrix = root / "Agent Single Line - COM.csv"
+            matrix.write_text(self.csv_text, encoding="utf-8")
+            database = root / "pilot.sqlite"
+            run_pilot(
+                matrix_path=matrix,
+                database_path=database,
+                output_dir=root / "output",
+                municipality="hialeah",
+                generated_at="2026-07-24T12:00:00+00:00",
+                property_collector=BooleanUnitsPropertyCollector(),
+                code_collector=FakeCodeCollector(),
+            )
+            with IntelligenceStore(database) as store:
+                underwriting = store.connection.execute(
+                    """
+                    SELECT inputs_json FROM underwriting_runs
+                    JOIN listing_snapshots USING(property_id)
+                    WHERE listing_snapshots.mls_number='A123'
+                    ORDER BY underwriting_runs.rowid DESC LIMIT 1
+                    """
+                ).fetchone()
+
+        self.assertFalse(
+            json.loads(underwriting["inputs_json"])["public_unit_count_verified"]
+        )
 
     def test_submitted_folio_falls_back_to_authoritative_exact_lookup(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -467,6 +543,58 @@ class PilotTests(unittest.TestCase):
             "unknown_hazard",
         )
         self.assertEqual(off_market["recommended_action"], "human_municipal_review")
+
+    def test_never_enriched_minor_case_orders_municipal_search(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            matrix = root / "Agent Single Line - COM.csv"
+            matrix.write_text(self.csv_text, encoding="utf-8")
+            run_pilot(
+                matrix_path=matrix,
+                database_path=root / "pilot.sqlite",
+                output_dir=root / "output",
+                municipality="hialeah",
+                generated_at="2026-07-24T12:00:00+00:00",
+                property_collector=FakePropertyCollector(),
+                code_collector=BareMinorCodeCollector(),
+            )
+            recommendations = json.loads(
+                (root / "output/recommendations.json").read_text()
+            )
+
+        off_market = next(
+            item
+            for item in recommendations
+            if "off_market" in item["discovery_channels"]
+        )
+        self.assertEqual(off_market["recommended_action"], "order_municipal_search")
+        self.assertTrue(off_market["action_support"]["trigger_evidence_ids"])
+
+    def test_enriched_unknown_hazard_requires_violation_review(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            matrix = root / "Agent Single Line - COM.csv"
+            matrix.write_text(self.csv_text, encoding="utf-8")
+            run_pilot(
+                matrix_path=matrix,
+                database_path=root / "pilot.sqlite",
+                output_dir=root / "output",
+                municipality="hialeah",
+                generated_at="2026-07-24T12:00:00+00:00",
+                property_collector=FakePropertyCollector(),
+                code_collector=EnrichedUnknownCodeCollector(),
+            )
+            recommendations = json.loads(
+                (root / "output/recommendations.json").read_text()
+            )
+
+        off_market = next(
+            item
+            for item in recommendations
+            if "off_market" in item["discovery_channels"]
+        )
+        self.assertEqual(off_market["recommended_action"], "human_violation_review")
+        self.assertTrue(off_market["action_support"]["trigger_evidence_ids"])
 
     def test_one_run_persists_workflow_and_generates_database_reports(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
