@@ -41,10 +41,10 @@ def _action(features: RecommendationFeatures) -> str:
     scores = features.scores
     if features.is_synthetic:
         return "excluded"
-    if not features.in_scope:
-        return "excluded"
     if not features.identity_verified:
         return "verify_identity"
+    if not features.in_scope:
+        return "excluded"
     if features.serious_municipal_matter:
         return "human_municipal_review"
     if scores.economics is not None and scores.economics < 0:
