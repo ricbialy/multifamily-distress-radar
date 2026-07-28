@@ -4,11 +4,26 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from distress_radar.storage import RadarStore
-from distress_radar.tax_import import import_tax_csv
+from distress_radar.tax_import import import_tax_csv, is_unpaid_status
 from test_storage import sample_property
 
 
 class TaxImportTests(unittest.TestCase):
+    def test_negated_and_compound_cleared_statuses_are_not_unpaid(self) -> None:
+        for status in (
+            "not delinquent",
+            "no outstanding balance",
+            "paid - formerly delinquent",
+            "released / outstanding record",
+            "satisfied lien",
+        ):
+            with self.subTest(status=status):
+                self.assertFalse(is_unpaid_status(status))
+
+        for status in ("unpaid", "delinquent", "past due", "not paid"):
+            with self.subTest(status=status):
+                self.assertTrue(is_unpaid_status(status))
+
     def test_aliases_normalization_and_financial_score(self) -> None:
         with TemporaryDirectory() as temp:
             path = Path(temp) / "tax.csv"

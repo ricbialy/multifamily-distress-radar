@@ -16,6 +16,39 @@ from distress_radar.pilot import _migrate_pilot
 
 
 class PilotDispositionCliTests(unittest.TestCase):
+    def test_real_pilot_commands_reject_unsupported_municipalities(self) -> None:
+        parser = build_parser()
+        for command in ("pilot-run", "pilot-verify"):
+            with self.subTest(command=command), self.assertRaises(SystemExit):
+                parser.parse_args(
+                    [
+                        command,
+                        "--matrix",
+                        "matrix.csv",
+                        "--db",
+                        "pilot.sqlite",
+                        "--output-dir",
+                        "outputs",
+                        "--municipality",
+                        "surfside",
+                    ]
+                )
+
+        args = parser.parse_args(
+            [
+                "pilot-run",
+                "--matrix",
+                "matrix.csv",
+                "--db",
+                "pilot.sqlite",
+                "--output-dir",
+                "outputs",
+                "--municipality",
+                "HIALEAH",
+            ]
+        )
+        self.assertEqual(args.municipality, "hialeah")
+
     def test_pilot_run_command_reports_complete_result(self) -> None:
         result = SimpleNamespace(
             run_id="run-1",

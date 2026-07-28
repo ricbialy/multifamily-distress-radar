@@ -128,6 +128,39 @@ class CountyAddressValidatorTests(unittest.TestCase):
         self.assertEqual(result.source, "matrix + off_market_csv")
         self.assertFalse(result.is_authoritatively_verified)
 
+    def test_corroborated_result_uses_the_matching_candidate_address(self) -> None:
+        result = CountyAddressValidator(()).validate(
+            folio=None,
+            candidates=(
+                AddressCandidate(
+                    source="matrix",
+                    street="999 Unrelated St",
+                    municipality="Hialeah",
+                    state="FL",
+                    postal_code="33010",
+                ),
+                AddressCandidate(
+                    source="off_market_csv",
+                    street="101 Palm Avenue",
+                    municipality="Hialeah",
+                    state="FL",
+                    postal_code="33010",
+                ),
+                AddressCandidate(
+                    source="analyst",
+                    street="101 Palm Ave",
+                    municipality="Hialeah",
+                    state="FL",
+                    postal_code="33010",
+                ),
+            ),
+            checked_at="2026-07-24T12:00:00+00:00",
+        )
+
+        self.assertEqual(result.status, AddressValidationStatus.CORROBORATED)
+        self.assertEqual(result.address, "101 Palm Avenue, Hialeah, FL 33010")
+        self.assertEqual(result.source, "analyst + off_market_csv")
+
     def test_single_source_without_county_record_is_unverified(self) -> None:
         result = CountyAddressValidator(()).validate(
             folio=None,

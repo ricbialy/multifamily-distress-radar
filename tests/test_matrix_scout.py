@@ -125,6 +125,45 @@ class MatrixScoutTests(unittest.TestCase):
         self.assertEqual(len(groups), 1)
         self.assertEqual({item.source_record_id for item in groups[0]}, {"A1001", "C2001"})
 
+    def test_invalid_non_finite_and_fractional_integer_values_are_rejected(
+        self,
+    ) -> None:
+        payload = (
+            "MLS Number,Address,City,State,Zip Code,List Price,Units,DOM\n"
+            "NAN1,100 Test Ave,Hialeah,FL,33010,NaN,4,10\n"
+            "INF1,101 Test Ave,Hialeah,FL,33010,Infinity,4,10\n"
+            "FRACTION1,102 Test Ave,Hialeah,FL,33010,1000000,2.5,10\n"
+        )
+        batch = MatrixCsvImporter().import_reader(
+            StringIO(payload),
+            fetched_at="2026-07-24T12:00:00+00:00",
+            source_url="manual-import://invalid-numbers.csv",
+        )
+
+        self.assertEqual(batch.accepted, ())
+        self.assertEqual(
+            [row.status for row in batch.ledger],
+            ["rejected", "rejected", "rejected"],
+        )
+
+    def test_unknown_locality_uses_source_identity_for_deduplication(self) -> None:
+        first = MatrixCsvImporter().import_file(
+            FIXTURE, fetched_at="2026-07-24T12:00:00+00:00"
+        )[0]
+        first = replace(
+            first,
+            source_record_id="A-LOCALITY-1",
+            folio=None,
+            municipality="",
+            state=None,
+            postal_code=None,
+        )
+        second = replace(first, source_record_id="A-LOCALITY-2")
+
+        groups = deduplicate_candidates((first, second))
+
+        self.assertEqual(len(groups), 2)
+
     def test_local_inbox_reads_csv_and_eml_attachments(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             inbox = Path(temporary)

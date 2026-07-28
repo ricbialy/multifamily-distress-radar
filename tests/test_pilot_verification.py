@@ -281,6 +281,36 @@ class PilotVerificationTests(unittest.TestCase):
                 metadata={},
             )
         )
+        self.assertTrue(
+            _evidence_value_supports_action(
+                "human_violation_review",
+                "municipal_code_case",
+                {
+                    "case_number": "C-4",
+                    "currently_active": True,
+                    "enforcement_stage": "warning",
+                    "substantive_hazard": "unknown_hazard",
+                },
+            )
+        )
+        self.assertTrue(
+            _evidence_value_supports_action(
+                "order_municipal_search",
+                "municipal_code_case",
+                None,
+                value_type="unknown",
+                metadata={"reason": "municipal_source_not_run"},
+            )
+        )
+        self.assertFalse(
+            _evidence_value_supports_action(
+                "order_municipal_search",
+                "municipal_code_case",
+                None,
+                value_type="unknown",
+                metadata={},
+            )
+        )
 
     def test_g7_validates_hash_bound_active_dispositions(self) -> None:
         connection = sqlite3.connect(":memory:")
