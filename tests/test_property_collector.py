@@ -1,9 +1,8 @@
-from pathlib import Path
 import unittest
+from pathlib import Path
 
 from distress_radar.collectors.arcgis_property import ArcGisPropertyCollector
 from distress_radar.config import load_city_config
-
 
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "config" / "cities"
 
@@ -92,9 +91,7 @@ class PropertyCollectorTests(unittest.TestCase):
             where,
             "UPPER(TRUE_SITE_ADDR) LIKE '123 MAIN ST DROP TABLE X OR 1 1%'",
         )
-        literal = where.removeprefix("UPPER(TRUE_SITE_ADDR) LIKE '").removesuffix(
-            "%'"
-        )
+        literal = where.removeprefix("UPPER(TRUE_SITE_ADDR) LIKE '").removesuffix("%'")
         self.assertNotIn("%", literal)
         self.assertNotIn("_", literal)
         self.assertNotIn(";", literal)

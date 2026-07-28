@@ -25,7 +25,11 @@ from distress_radar.identity.address_validation import (
 )
 from distress_radar.identity.folio_resolver import FolioResolver, normalize_folio
 from distress_radar.identity.match_service import MatchService, MatchStatus
-from distress_radar.identity.owner_resolver import OwnerResolver, normalize_owner_name
+from distress_radar.identity.owner_resolver import (
+    OwnerResolution,
+    OwnerResolver,
+    normalize_owner_name,
+)
 from distress_radar.intelligence_store import IntelligenceStore
 from distress_radar.models import CodeCase, PropertyRecord, RawDocument
 from distress_radar.municipal_severity import (
@@ -358,15 +362,38 @@ def _save_raw_document(
 
 def _save_owner(
     store: IntelligenceStore, prop: CanonicalProperty, record: PropertyRecord
-) -> None:
+) -> OwnerResolution:
     if not record.owner_name:
-        return
+        return OwnerResolution(owner_id=None, alias_match=False)
     owners = _canonical_owners(store)
     resolution = OwnerResolver(owners).resolve(record.owner_name)
+    if resolution.conflicting:
+        store.add_evidence(
+            prop.property_id,
+            EvidenceItem(
+                field="owner_identity_conflict",
+                value=None,
+                source=record.source_name,
+                source_record_id=record.folio
+                or normalize_owner_name(record.owner_name),
+                source_url=record.source_url,
+                fetched_at=record.fetched_at,
+                freshness_status=FreshnessStatus.UNAVAILABLE,
+                confidence=None,
+                value_type=ValueType.UNKNOWN,
+                metadata={
+                    "reason": "ambiguous_normalized_owner_alias",
+                    "normalized_alias": normalize_owner_name(record.owner_name),
+                    "candidate_owner_ids": list(resolution.candidate_owner_ids),
+                },
+            ),
+        )
+        return resolution
     owner_id = resolution.owner_id
     if owner_id is None:
         key = normalize_owner_name(record.owner_name)
         owner_id = "owner-" + hashlib.sha256(key.encode()).hexdigest()[:20]
+        resolution = OwnerResolution(owner_id=owner_id, alias_match=False)
         now = utc_now()
         store.connection.execute(
             """
@@ -399,6 +426,7 @@ def _save_owner(
         (prop.property_id, owner_id, None, None, record.folio, 1.0),
     )
     store.connection.commit()
+    return resolution
 
 
 _CLOCK_ONLY_KEYS = {
@@ -507,6 +535,7 @@ def _apply_disposition_action(
     broker_contact_available: bool = False,
     watch_status: str | None = None,
     watch_triggered_action: str | None = None,
+    owner_identity_conflicting: bool = False,
 ) -> str:
     if not disposition:
         return default_action
@@ -521,6 +550,7 @@ def _apply_disposition_action(
         or not in_scope
         or serious_municipal
         or not underwriting_complete
+        or owner_identity_conflicting
     ):
         return default_action
     return {
@@ -1758,12 +1788,37 @@ def _persist_underwriting_and_recommendations(
                 CoverageState.UNKNOWN_STALE.value,
             }
         )
+        owner_conflict_evidence_ids = tuple(
+            row["evidence_id"]
+            for row in store.connection.execute(
+                """
+                SELECT evidence_id FROM evidence_items
+                WHERE property_id=? AND field_name='owner_identity_conflict'
+                  AND pilot_run_id=?
+                ORDER BY rowid
+                """,
+                (property_id, pilot_run_id),
+            ).fetchall()
+        )
+        owner_identity_conflicting = bool(owner_conflict_evidence_ids)
         missing_fields = list(MISSING_DILIGENCE)
         if listing.get("noi") is not None:
             missing_fields.remove("NOI")
         if listing.get("expenses") is not None:
             missing_fields.remove("expenses")
-        missing = tuple(dict.fromkeys((*missing_fields, *source_gaps)))
+        missing = tuple(
+            dict.fromkeys(
+                (
+                    *missing_fields,
+                    *source_gaps,
+                    *(
+                        ("owner_identity_conflict",)
+                        if owner_identity_conflicting
+                        else ()
+                    ),
+                )
+            )
+        )
 
         source_gap_evidence_ids: list[str] = []
         for row in coverage:
@@ -1982,6 +2037,7 @@ def _persist_underwriting_and_recommendations(
             "municipal": material_municipal,
             "official_records": material_official,
             "tax_records": material_tax,
+            "owner_identity_conflicting": owner_identity_conflicting,
             "investment_criteria": (
                 {
                     "unit": "decimal_rate",
@@ -2028,7 +2084,19 @@ def _persist_underwriting_and_recommendations(
                 else None
             ),
             current_content_hash=content_hash,
-            default_action=result.action,
+            default_action=(
+                result.action
+                if not owner_identity_conflicting
+                or result.action
+                in {
+                    "excluded",
+                    "verify_identity",
+                    "human_municipal_review",
+                    "reject",
+                    "reject_high_risk",
+                }
+                else "manual_triage"
+            ),
             listing_present=listing_row is not None,
             identity_verified=identity_verified,
             in_scope=in_scope,
@@ -2037,6 +2105,7 @@ def _persist_underwriting_and_recommendations(
             broker_contact_available=False,
             watch_status=watch_status,
             watch_triggered_action=watch_triggered_action,
+            owner_identity_conflicting=owner_identity_conflicting,
         )
 
         evidence_rows = store.connection.execute(
@@ -2097,6 +2166,8 @@ def _persist_underwriting_and_recommendations(
             action_ids = tuple(
                 json.loads(disposition_row["watch_evidence_ids_json"] or "[]")
             )
+        elif action == "manual_triage" and owner_conflict_evidence_ids:
+            action_ids = owner_conflict_evidence_ids
         elif action in {"insufficient_data", "manual_triage"}:
             action_ids = diligence_evidence_ids
         elif action == "watch" and disposition_row:
@@ -2203,6 +2274,7 @@ def _persist_underwriting_and_recommendations(
                     or identity_ids
                 ),
                 "identity": identity_ids,
+                "owner_identity": owner_conflict_evidence_ids,
                 "owner_motivation": motivation_ids,
                 "property_risk": by_field["municipal_code_case"],
                 "missing_source_data": tuple(source_gap_evidence_ids),

@@ -24,15 +24,36 @@ def normalize_owner_name(value: str | None) -> str:
 class OwnerResolution:
     owner_id: str | None
     alias_match: bool
+    conflicting: bool = False
+    candidate_owner_ids: tuple[str, ...] = ()
     beneficial_ownership_confirmed: bool = False
 
 
 class OwnerResolver:
     def __init__(self, owners: tuple[CanonicalOwner, ...]) -> None:
+        owner_ids_by_alias: dict[str, set[str]] = {}
+        for owner in owners:
+            owner_ids_by_alias.setdefault(
+                normalize_owner_name(owner.display_name), set()
+            ).add(owner.owner_id)
         self._owners = {
-            normalize_owner_name(owner.display_name): owner.owner_id for owner in owners
+            alias: tuple(sorted(owner_ids))
+            for alias, owner_ids in owner_ids_by_alias.items()
         }
 
     def resolve(self, name: str | None) -> OwnerResolution:
-        owner_id = self._owners.get(normalize_owner_name(name))
-        return OwnerResolution(owner_id=owner_id, alias_match=owner_id is not None)
+        owner_ids = self._owners.get(normalize_owner_name(name), ())
+        if len(owner_ids) == 1:
+            return OwnerResolution(
+                owner_id=owner_ids[0],
+                alias_match=True,
+                candidate_owner_ids=owner_ids,
+            )
+        if len(owner_ids) > 1:
+            return OwnerResolution(
+                owner_id=None,
+                alias_match=True,
+                conflicting=True,
+                candidate_owner_ids=owner_ids,
+            )
+        return OwnerResolution(owner_id=None, alias_match=False)

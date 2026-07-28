@@ -81,7 +81,12 @@ class IdentityTests(unittest.TestCase):
                 }
                 self.assertEqual(normalized, {f"1440 {expected} 4 st"})
 
-        self.assertEqual(normalize_address("100 N Main St"), "100 n main st")
+        for direction in ("N", "S", "E", "W"):
+            with self.subTest(single_letter=direction):
+                self.assertEqual(
+                    normalize_address(f"100 {direction} Main St"),
+                    f"100 {direction.casefold()} main st",
+                )
         self.assertEqual(
             normalize_address("100 Northwestern Ave"),
             "100 northwestern ave",

@@ -130,11 +130,13 @@ class PilotTests(unittest.TestCase):
 
     def test_ambiguous_owner_creates_no_owner_relationship_or_alias(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            with IntelligenceStore(Path(temporary) / "pilot.sqlite") as store:
+            root = Path(temporary)
+            database = root / "pilot.sqlite"
+            with IntelligenceStore(database) as store:
                 now = "2026-07-24T12:00:00+00:00"
                 owners = (
-                    CanonicalOwner("owner-llc", "Sunrise Holdings LLC", "llc"),
-                    CanonicalOwner("owner-lp", "Sunrise Holdings LP", "lp"),
+                    CanonicalOwner("owner-llc", "Test Owner LLC", "llc"),
+                    CanonicalOwner("owner-lp", "Test Owner LP", "lp"),
                 )
                 store.connection.executemany(
                     """
@@ -169,7 +171,7 @@ class PilotTests(unittest.TestCase):
                 record = PropertyRecord(
                     **{
                         **record.__dict__,
-                        "owner_name": "SUNRISE HOLDINGS",
+                        "owner_name": "TEST OWNER",
                     }
                 )
 
@@ -207,6 +209,47 @@ class PilotTests(unittest.TestCase):
                 self.assertEqual(
                     json.loads(ambiguity["metadata_json"])["candidate_owner_ids"],
                     ["owner-llc", "owner-lp"],
+                )
+
+            matrix = root / "Agent Single Line - COM.csv"
+            matrix.write_text(self.csv_text, encoding="utf-8")
+            output = root / "output"
+            run_pilot(
+                matrix_path=matrix,
+                database_path=database,
+                output_dir=output,
+                municipality="hialeah",
+                generated_at="2026-07-24T12:00:00+00:00",
+                property_collector=FakePropertyCollector(),
+                code_collector=FakeCodeCollector(),
+            )
+            recommendations = json.loads((output / "recommendations.json").read_text())
+            manual_triage = json.loads(
+                (output / "manual_triage_queue.json").read_text()
+            )
+            listed = next(
+                item for item in recommendations if "mls" in item["discovery_channels"]
+            )
+            self.assertEqual(listed["recommended_action"], "manual_triage")
+            self.assertIn("owner_identity_conflict", listed["missing_data"])
+            self.assertTrue(
+                any(
+                    item["property_id"] == listed["property_id"]
+                    for item in manual_triage
+                )
+            )
+            with IntelligenceStore(database) as store:
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT COUNT(*) FROM property_ownership"
+                    ).fetchone()[0],
+                    0,
+                )
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT COUNT(*) FROM owner_aliases"
+                    ).fetchone()[0],
+                    0,
                 )
 
     def test_county_address_mismatch_requires_identity_verification(self) -> None:

@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from distress_radar.config import CityConfig, PropertySourceConfig
+from distress_radar.identity.address_normalizer import normalize_address
 from distress_radar.models import PropertyCollectionResult, PropertyRecord, RawDocument
 from distress_radar.normalize import clean_text, normalize_parcel
 
@@ -178,12 +179,15 @@ class ArcGisPropertyCollector:
         # Matrix street addresses commonly use ordinal suffixes and unit markers
         # that the county layer omits. Keep the house number and street stem,
         # then validate any returned record locally before confirming identity.
-        stem = re.split(r"\b(?:UNIT|APT|#)\b", address.upper(), maxsplit=1)[0]
-        stem = re.sub(r"(\d)(?:ST|ND|RD|TH)\b", r"\1", stem)
-        stem = re.sub(r"\bSTREET\b", "ST", stem)
-        stem = re.sub(r"\bAVENUE\b", "AVE", stem)
-        stem = re.sub(r"\bDRIVE\b", "DR", stem)
-        stem = re.sub(r"\s+", " ", stem).strip().replace("'", "''")
+        without_unit = re.split(
+            r"(?:\b(?:UNIT|APT)\b|#)",
+            address,
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0]
+        stem = normalize_address(without_unit).upper()
+        stem = re.sub(r"[^A-Z0-9 ]", " ", stem)
+        stem = re.sub(r"\s+", " ", stem).strip()
         if not stem:
             raise ValueError("address is required for lookup")
         return self._lookup(
