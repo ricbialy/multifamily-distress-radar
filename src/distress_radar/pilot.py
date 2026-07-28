@@ -2054,15 +2054,17 @@ def _persist_underwriting_and_recommendations(
                 pilot_run_id=pilot_run_id,
             )
         default_action = result.action
-        if identity_verified and not verified_unit_count:
-            default_action = "manual_triage"
-        elif owner_identity_conflicting and default_action not in {
-            "excluded",
-            "verify_identity",
-            "human_municipal_review",
-            "reject",
-            "reject_high_risk",
-        }:
+        if (identity_verified and not verified_unit_count) or (
+            owner_identity_conflicting
+            and default_action
+            not in {
+                "excluded",
+                "verify_identity",
+                "human_municipal_review",
+                "reject",
+                "reject_high_risk",
+            }
+        ):
             default_action = "manual_triage"
         action = _apply_disposition_action(
             disposition=(
