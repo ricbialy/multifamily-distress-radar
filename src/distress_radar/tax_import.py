@@ -35,7 +35,7 @@ def _money(value: object) -> float:
 def is_unpaid_status(value: object) -> bool:
     status = str(value or "").casefold().strip()
     if not status:
-        return False
+        return True
     if re.search(
         r"\b(?:not|no)\s+(?:currently\s+)?"
         r"(?:delinquent|outstanding(?:\s+balance)?|past\s+due|open)\b",

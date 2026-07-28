@@ -1066,11 +1066,16 @@ def _record_for_matrix(
             for record in address_result.records
             if normalize_address(record.address) == normalize_address(listing.address)
         )
+        folio: str | None = None
         if candidates:
             resolution = FolioResolver().resolve(
                 listing.folio, tuple(record.folio for record in candidates)
             )
             folio = resolution.folio
+        elif listing.folio:
+            folio = normalize_folio(listing.folio)
+        if folio:
+            query_scope = f"folio:{folio}"
             exact_result = collector.lookup_exact_folio(folio or "")
             exact_documents = exact_result.raw_documents
             for document in exact_documents:
@@ -1769,6 +1774,9 @@ def _persist_underwriting_and_recommendations(
         )
         owner_identity_conflicting = bool(owner_conflict_evidence_ids)
         missing_fields = list(MISSING_DILIGENCE)
+        verified_unit_count = isinstance(units, int) and not isinstance(units, bool)
+        if not verified_unit_count:
+            missing_fields.append("verified_unit_count")
         if listing.get("noi") is not None:
             missing_fields.remove("NOI")
         if listing.get("expenses") is not None:
@@ -1879,7 +1887,7 @@ def _persist_underwriting_and_recommendations(
             _is_serious_municipal_matter(item) for item in municipal
         )
         independent_motivation = scores.owner_motivation > 0
-        in_scope = units is None or 10 <= units <= 80
+        in_scope = verified_unit_count and 10 <= units <= 80
         features = RecommendationFeatures(
             property_id=property_id,
             discovery_channels=channels,
@@ -3581,6 +3589,9 @@ def run_pilot(
 ) -> PilotRunResult:
     if not matrix_path.is_file():
         raise FileNotFoundError(matrix_path)
+    municipality = municipality.casefold().strip()
+    if municipality != "hialeah":
+        raise ValueError("REAL-PILOT-02 currently supports only Hialeah")
     generated_at = generated_at or utc_now()
     execution_started_at = utc_now()
     matrix_sha = _sha256(matrix_path)
