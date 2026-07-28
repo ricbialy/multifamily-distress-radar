@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import isfinite
 
 
 @dataclass(frozen=True)
@@ -35,6 +36,10 @@ class SmallMultifamilyResult:
     price_per_square_foot_at_base_value: float | None = None
 
 
+def _valid_decimal_rate(value: float | None) -> bool:
+    return value is not None and isfinite(value) and 0 <= value <= 1
+
+
 def underwrite_small_multifamily(
     inputs: SmallMultifamilyInputs,
 ) -> SmallMultifamilyResult:
@@ -56,6 +61,16 @@ def underwrite_small_multifamily(
         missing.append("legal_unit_verification")
     if inputs.units is not None and not 2 <= inputs.units <= 4:
         missing.append("two_to_four_unit_segment")
+    if (
+        inputs.vacancy_rate is not None
+        and not _valid_decimal_rate(inputs.vacancy_rate)
+    ):
+        missing.append("valid_vacancy_rate")
+    if (
+        inputs.management_rate is not None
+        and not _valid_decimal_rate(inputs.management_rate)
+    ):
+        missing.append("valid_management_rate")
     if missing:
         return SmallMultifamilyResult("insufficient_data", tuple(missing))
 

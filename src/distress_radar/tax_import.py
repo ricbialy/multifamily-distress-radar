@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -36,7 +37,18 @@ def is_unpaid_status(value: object) -> bool:
     status = str(value or "").casefold().strip()
     if not status:
         return False
-    if status in {"paid", "satisfied", "released", "redeemed", "cancelled", "canceled"}:
+    if re.search(
+        r"\b(?:not|no)\s+(?:currently\s+)?"
+        r"(?:delinquent|outstanding(?:\s+balance)?|past\s+due|open)\b",
+        status,
+    ):
+        return False
+    if re.search(r"\bnot\s+paid\b", status):
+        return True
+    if re.search(
+        r"\b(?:paid|satisfied|released|redeemed|cancelled|canceled|closed)\b",
+        status,
+    ):
         return False
     return any(
         marker in status

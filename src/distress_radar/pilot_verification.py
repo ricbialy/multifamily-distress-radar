@@ -117,6 +117,21 @@ def _evidence_value_supports_action(
                 in {"special_master", "itl", "lien"}
             )
         )
+    if action == "human_violation_review":
+        return (
+            isinstance(value, dict)
+            and field_name == "municipal_code_case"
+            and bool(value.get("currently_active"))
+            and bool(value.get("case_number"))
+            and bool(value.get("enforcement_stage"))
+            and bool(value.get("substantive_hazard"))
+        )
+    if action == "order_municipal_search":
+        return (
+            field_name == "municipal_code_case"
+            and value_type == "unknown"
+            and bool((metadata or {}).get("reason"))
+        )
     if action == "investigate_owner":
         if not isinstance(value, dict):
             return False
@@ -701,6 +716,8 @@ def verify_real_pilot(
         expected_action_fields = {
             "verify_identity": {"validated_address", "public_property_record"},
             "human_municipal_review": {"municipal_code_case"},
+            "human_violation_review": {"municipal_code_case"},
+            "order_municipal_search": {"municipal_code_case"},
             "contact_broker_for_documents": {
                 "matrix_listing",
                 "diligence:rent_roll",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import math
 from collections import OrderedDict
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -91,12 +92,18 @@ def _number(row: dict[str, str], column: str | None) -> float | None:
     negative = cleaned.startswith("(") and cleaned.endswith(")")
     cleaned = cleaned.strip("()")
     parsed = float(cleaned)
+    if not math.isfinite(parsed):
+        raise ValueError("number must be finite")
     return -parsed if negative else parsed
 
 
 def _integer(row: dict[str, str], column: str | None) -> int | None:
     value = _number(row, column)
-    return int(value) if value is not None else None
+    if value is None:
+        return None
+    if not value.is_integer():
+        raise ValueError("integer field must not contain a fractional value")
+    return int(value)
 
 
 class MatrixCsvImporter:
@@ -287,10 +294,18 @@ def deduplicate_candidates(
 ) -> tuple[tuple[ListingSnapshot, ...], ...]:
     groups: OrderedDict[str, list[ListingSnapshot]] = OrderedDict()
     for listing in listings:
-        key = (
-            f"folio:{listing.folio}"
-            if listing.folio
-            else f"address:{normalize_address(listing.address)}|{listing.municipality.casefold()}"
-        )
+        if listing.folio:
+            key = f"folio:{listing.folio}"
+        elif listing.municipality and (listing.state or listing.postal_code):
+            key = "|".join(
+                (
+                    f"address:{normalize_address(listing.address)}",
+                    listing.municipality.casefold().strip(),
+                    (listing.state or "").casefold().strip(),
+                    (listing.postal_code or "").casefold().strip(),
+                )
+            )
+        else:
+            key = f"source:{listing.source_name}:{listing.source_record_id}"
         groups.setdefault(key, []).append(listing)
     return tuple(tuple(group) for group in groups.values())

@@ -146,23 +146,26 @@ class CountyAddressValidator:
                 longitude=county.longitude,
             )
 
-        sources_by_key: dict[str, set[str]] = {}
+        candidates_by_key: dict[str, list[AddressCandidate]] = {}
         for candidate in candidates:
-            sources_by_key.setdefault(candidate.normalized_key, set()).add(
-                candidate.source
+            candidates_by_key.setdefault(candidate.normalized_key, []).append(
+                candidate
             )
-        corroborated_sources = next(
+        corroborated = next(
             (
-                sorted(sources)
-                for sources in sources_by_key.values()
-                if len(sources) >= 2
+                matching
+                for matching in candidates_by_key.values()
+                if len({candidate.source for candidate in matching}) >= 2
             ),
             None,
         )
-        if corroborated_sources:
+        if corroborated:
+            corroborated_sources = sorted(
+                {candidate.source for candidate in corroborated}
+            )
             return AddressValidationResult(
                 status=AddressValidationStatus.CORROBORATED,
-                address=candidates[0].address,
+                address=corroborated[0].address,
                 source=" + ".join(corroborated_sources),
                 source_record_id=normalized_folio,
                 source_url=None,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import math
 import os
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -145,13 +146,6 @@ def _migrate_pilot(store: IntelligenceStore) -> None:
             created_at TEXT NOT NULL,
             UNIQUE(pilot_run_id,property_id,alert_type)
         );
-        CREATE TABLE IF NOT EXISTS signal_observations (
-            observation_id TEXT PRIMARY KEY,
-            pilot_run_id TEXT NOT NULL REFERENCES pilot_runs(run_id),
-            signal_id TEXT NOT NULL REFERENCES property_signals(signal_id),
-            status TEXT NOT NULL,
-            observed_at TEXT NOT NULL
-        );
         """
     )
     pilot_run_columns = {
@@ -169,57 +163,6 @@ def _migrate_pilot(store: IntelligenceStore) -> None:
         store.connection.execute(
             "ALTER TABLE pilot_runs ADD COLUMN effective_at TEXT"
         )
-    recommendation_columns = {
-        row["name"]
-        for row in store.connection.execute("PRAGMA table_info(recommendations)")
-    }
-    for column, definition in (
-        ("pilot_run_id", "TEXT"),
-        ("content_hash", "TEXT"),
-        ("change_type", "TEXT"),
-    ):
-        if column not in recommendation_columns:
-            store.connection.execute(
-                f"ALTER TABLE recommendations ADD COLUMN {column} {definition}"
-            )
-    signal_columns = {
-        row["name"]
-        for row in store.connection.execute("PRAGMA table_info(property_signals)")
-    }
-    if "pilot_run_id" not in signal_columns:
-        store.connection.execute(
-            "ALTER TABLE property_signals ADD COLUMN pilot_run_id TEXT"
-        )
-    if "confirmation_status" not in signal_columns:
-        store.connection.execute(
-            """
-            ALTER TABLE property_signals
-            ADD COLUMN confirmation_status TEXT NOT NULL DEFAULT 'confirmed'
-            """
-        )
-    if "source_name" not in signal_columns:
-        store.connection.execute(
-            "ALTER TABLE property_signals ADD COLUMN source_name TEXT"
-        )
-    store.connection.execute(
-        """
-        UPDATE property_signals
-        SET source_name=CASE
-            WHEN signal_type='off_market_live_code_case' THEN ?
-            WHEN signal_type IN ('lien','recorded_liens','lis_pendens') THEN ?
-            WHEN signal_type='tax_delinquency' THEN ?
-            ELSE source_name
-        END
-        WHERE source_name IS NULL
-        """,
-        (CODE_SOURCE, CLERK_SOURCE, TAX_SOURCE),
-    )
-    source_run_columns = {
-        row["name"]
-        for row in store.connection.execute("PRAGMA table_info(source_runs)")
-    }
-    if "pilot_run_id" not in source_run_columns:
-        store.connection.execute("ALTER TABLE source_runs ADD COLUMN pilot_run_id TEXT")
     store.connection.commit()
 
 
@@ -730,16 +673,28 @@ def _evaluate_watch(
                 """,
                 (property_id, generated_at),
             ).fetchone()
+            before = (
+                json.loads(price_change["before_json"])
+                if price_change
+                else None
+            )
+            after = (
+                json.loads(price_change["after_json"])
+                if price_change
+                else None
+            )
+            before_price = _listing_change_price(before)
+            after_price = _listing_change_price(after)
             if (
-                price_change
-                and json.loads(price_change["before_json"])
-                > json.loads(price_change["after_json"])
+                before_price is not None
+                and after_price is not None
+                and before_price > after_price
             ):
                 event_payload = {
                     "trigger_type": specification.trigger_type,
                     "source_name": source_name,
-                    "before": json.loads(price_change["before_json"]),
-                    "after": json.loads(price_change["after_json"]),
+                    "before": before,
+                    "after": after,
                 }
         elif specification.trigger_type == "new_record":
             watched_signal_type = event.get("signal_type")
@@ -1061,14 +1016,26 @@ def _price_reduction_count(
         try:
             before = json.loads(row["before_json"])
             after = json.loads(row["after_json"])
-            before_price = (
-                before.get("list_price") if isinstance(before, dict) else before
+            before_price = _listing_change_price(before)
+            after_price = _listing_change_price(after)
+            reductions += int(
+                before_price is not None
+                and after_price is not None
+                and after_price < before_price
             )
-            after_price = after.get("list_price") if isinstance(after, dict) else after
-            reductions += int(float(after_price) < float(before_price))
-        except (TypeError, ValueError, json.JSONDecodeError):
+        except json.JSONDecodeError:
             continue
     return reductions
+
+
+def _listing_change_price(value: Any) -> float | None:
+    if isinstance(value, dict):
+        value = value.get("list_price")
+    try:
+        price = float(value)
+    except (TypeError, ValueError):
+        return None
+    return price if math.isfinite(price) else None
 
 
 def _record_for_matrix(
@@ -2150,7 +2117,11 @@ def _persist_underwriting_and_recommendations(
             *by_field["public_property_record"],
         )
         motivation_ids = (*by_field["official_record"], *by_field["tax_delinquency"])
-        if action == "human_municipal_review":
+        if action in {
+            "human_municipal_review",
+            "human_violation_review",
+            "order_municipal_search",
+        }:
             action_ids = by_field["municipal_code_case"]
         elif action == "verify_identity":
             action_ids = identity_ids
@@ -2194,6 +2165,12 @@ def _persist_underwriting_and_recommendations(
                 "human_municipal_review": (
                     "A current serious, ambiguous, or unknown municipal matter needs judgment."
                 ),
+                "human_violation_review": (
+                    "A current municipal violation requires human classification."
+                ),
+                "order_municipal_search": (
+                    "Municipal evidence is unavailable and requires a bounded search."
+                ),
                 "contact_broker_for_documents": (
                     "An active listing has a validated broker path and named missing documents."
                 ),
@@ -2219,6 +2196,8 @@ def _persist_underwriting_and_recommendations(
                 "excluded": "Do not advance; resolve the failed scope or identity gate.",
                 "verify_identity": "Validate the folio, address, and unit count against the county record.",
                 "human_municipal_review": "Review the cited case detail and violation text.",
+                "human_violation_review": "Review and classify the cited violation text.",
+                "order_municipal_search": "Run the named municipal-record search and retain its result.",
                 "contact_broker_for_documents": "Use the validated broker path to request the named documents.",
                 "request_documents": "Obtain the named missing documents before underwriting.",
                 "investigate_owner": "Review the cited objective public record and confirm it remains unresolved.",

@@ -33,6 +33,11 @@ class ListingSnapshot:
         result.pop("raw_payload")
         return result
 
+    def material_dict(self) -> dict[str, Any]:
+        result = self.stable_dict()
+        result.pop("source_url")
+        return result
+
 
 @dataclass(frozen=True)
 class ListingChange:

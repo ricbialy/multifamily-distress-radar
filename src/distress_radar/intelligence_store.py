@@ -87,7 +87,7 @@ class IntelligenceStore:
                 started_at TEXT NOT NULL, completed_at TEXT, state TEXT NOT NULL,
                 records_examined INTEGER NOT NULL DEFAULT 0,
                 records_changed INTEGER NOT NULL DEFAULT 0,
-                error_message TEXT
+                error_message TEXT, pilot_run_id TEXT
             );
             CREATE TABLE IF NOT EXISTS source_health (
                 source_name TEXT PRIMARY KEY, state TEXT NOT NULL,
@@ -128,7 +128,16 @@ class IntelligenceStore:
                     REFERENCES canonical_properties(property_id),
                 signal_type TEXT NOT NULL, observed_at TEXT NOT NULL,
                 value_json TEXT, evidence_ids_json TEXT NOT NULL,
-                status TEXT NOT NULL
+                status TEXT NOT NULL, pilot_run_id TEXT,
+                confirmation_status TEXT NOT NULL DEFAULT 'confirmed',
+                source_name TEXT
+            );
+            CREATE TABLE IF NOT EXISTS signal_observations (
+                observation_id TEXT PRIMARY KEY,
+                pilot_run_id TEXT NOT NULL,
+                signal_id TEXT NOT NULL REFERENCES property_signals(signal_id),
+                status TEXT NOT NULL,
+                observed_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS signal_evidence_links (
                 signal_id TEXT NOT NULL REFERENCES property_signals(signal_id),
@@ -147,7 +156,8 @@ class IntelligenceStore:
                 recommendation_id TEXT PRIMARY KEY, property_id TEXT NOT NULL
                     REFERENCES canonical_properties(property_id),
                 generated_at TEXT NOT NULL, action TEXT NOT NULL,
-                scores_json TEXT NOT NULL, explanation_json TEXT NOT NULL
+                scores_json TEXT NOT NULL, explanation_json TEXT NOT NULL,
+                pilot_run_id TEXT, content_hash TEXT, change_type TEXT
             );
             CREATE TABLE IF NOT EXISTS human_decisions (
                 decision_id TEXT PRIMARY KEY, property_id TEXT NOT NULL
@@ -248,6 +258,58 @@ class IntelligenceStore:
             self.connection.execute(
                 "ALTER TABLE evidence_items ADD COLUMN pilot_run_id TEXT"
             )
+        source_run_columns = {
+            row["name"]
+            for row in self.connection.execute("PRAGMA table_info(source_runs)")
+        }
+        if "pilot_run_id" not in source_run_columns:
+            self.connection.execute(
+                "ALTER TABLE source_runs ADD COLUMN pilot_run_id TEXT"
+            )
+        signal_columns = {
+            row["name"]
+            for row in self.connection.execute(
+                "PRAGMA table_info(property_signals)"
+            )
+        }
+        for column, definition in (
+            ("pilot_run_id", "TEXT"),
+            (
+                "confirmation_status",
+                "TEXT NOT NULL DEFAULT 'confirmed'",
+            ),
+            ("source_name", "TEXT"),
+        ):
+            if column not in signal_columns:
+                self.connection.execute(
+                    f"ALTER TABLE property_signals ADD COLUMN {column} {definition}"
+                )
+        self.connection.execute(
+            """
+            UPDATE property_signals
+            SET source_name=CASE
+                WHEN signal_type='off_market_live_code_case'
+                    THEN 'hialeah_tyler_energov'
+                WHEN signal_type IN ('lien','recorded_liens','lis_pendens')
+                    THEN 'miami_dade_clerk_official_records'
+                WHEN signal_type='tax_delinquency'
+                    THEN 'authorized_tax_csv'
+                ELSE source_name
+            END
+            WHERE source_name IS NULL
+            """
+        )
+        recommendation_columns = {
+            row["name"]
+            for row in self.connection.execute(
+                "PRAGMA table_info(recommendations)"
+            )
+        }
+        for column in ("pilot_run_id", "content_hash", "change_type"):
+            if column not in recommendation_columns:
+                self.connection.execute(
+                    f"ALTER TABLE recommendations ADD COLUMN {column} TEXT"
+                )
         listing_columns = {
             row["name"]
             for row in self.connection.execute(
@@ -502,7 +564,10 @@ class IntelligenceStore:
                 fetched_at=previous_row["fetched_at"],
                 raw_payload=json.loads(previous_row["raw_payload_json"]),
             )
-        if previous is not None and previous.stable_dict() == snapshot.stable_dict():
+        if (
+            previous is not None
+            and previous.material_dict() == snapshot.material_dict()
+        ):
             self.connection.execute(
                 """
                 UPDATE listing_snapshots
@@ -624,86 +689,108 @@ class IntelligenceStore:
                     f"{watch_status}: {outcome.reason}"
                 )
         disposition_id = str(uuid4())
-        self.connection.execute(
-            """
-            UPDATE human_dispositions SET active=0
-            WHERE property_id=? AND active=1
-            """,
-            (property_id,),
-        )
-        self.connection.execute(
-            """
-            INSERT INTO human_dispositions (
-                disposition_id,property_id,disposition,decided_at,notes,
-                baseline_content_hash,active,watch_reason,watch_evidence_ids_json,
-                watch_trigger_type,watch_recheck_condition_json,watch_recheck_at,
-                watch_event_trigger_json,watch_expected_next_action,creator,
-                watch_validation_status
-            ) VALUES (?,?,?,?,?,?,1,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                disposition_id,
-                property_id,
-                disposition,
-                decided_at,
-                notes,
-                baseline_content_hash,
-                watch_specification.watch_reason if watch_specification else None,
-                (
-                    json.dumps(watch_specification.evidence_ids)
-                    if watch_specification
-                    else None
-                ),
-                watch_specification.trigger_type if watch_specification else None,
-                (
-                    json.dumps(
-                        watch_specification.recheck_condition, sort_keys=True
-                    )
-                    if watch_specification
-                    else None
-                ),
-                watch_specification.recheck_at if watch_specification else None,
-                (
-                    json.dumps(
-                        watch_specification.evidence_event_trigger, sort_keys=True
-                    )
-                    if watch_specification
-                    else None
-                ),
-                (
-                    watch_specification.expected_next_action
-                    if watch_specification
-                    else None
-                ),
-                watch_specification.creator if watch_specification else None,
-                watch_status,
-            ),
-        )
-        if disposition == "watch":
-            pilot_run = self.connection.execute(
+        try:
+            self.connection.execute(
                 """
-                SELECT r.pilot_run_id
-                FROM recommendations r
-                JOIN pilot_runs p ON p.run_id=r.pilot_run_id
-                WHERE r.property_id=? AND r.content_hash=?
-                  AND r.pilot_run_id IS NOT NULL
-                ORDER BY p.rowid DESC,r.rowid DESC LIMIT 1
+                UPDATE human_dispositions SET active=0
+                WHERE property_id=? AND active=1
                 """,
-                (property_id, baseline_content_hash),
-            ).fetchone()
-            if pilot_run is None:
-                raise ValueError(
-                    "watch creation requires a reviewed recommendation run"
-                )
-            self.record_watch_validation_event(
-                disposition_id=disposition_id,
-                property_id=property_id,
-                pilot_run_id=str(pilot_run["pilot_run_id"]),
-                validated_at=decided_at,
-                outcome=outcome,
+                (property_id,),
             )
-        else:
-            self.connection.commit()
+            self.connection.execute(
+                """
+                INSERT INTO human_dispositions (
+                    disposition_id,property_id,disposition,decided_at,notes,
+                    baseline_content_hash,active,watch_reason,
+                    watch_evidence_ids_json,watch_trigger_type,
+                    watch_recheck_condition_json,watch_recheck_at,
+                    watch_event_trigger_json,watch_expected_next_action,creator,
+                    watch_validation_status
+                ) VALUES (?,?,?,?,?,?,1,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    disposition_id,
+                    property_id,
+                    disposition,
+                    decided_at,
+                    notes,
+                    baseline_content_hash,
+                    (
+                        watch_specification.watch_reason
+                        if watch_specification
+                        else None
+                    ),
+                    (
+                        json.dumps(watch_specification.evidence_ids)
+                        if watch_specification
+                        else None
+                    ),
+                    (
+                        watch_specification.trigger_type
+                        if watch_specification
+                        else None
+                    ),
+                    (
+                        json.dumps(
+                            watch_specification.recheck_condition,
+                            sort_keys=True,
+                        )
+                        if watch_specification
+                        else None
+                    ),
+                    (
+                        watch_specification.recheck_at
+                        if watch_specification
+                        else None
+                    ),
+                    (
+                        json.dumps(
+                            watch_specification.evidence_event_trigger,
+                            sort_keys=True,
+                        )
+                        if watch_specification
+                        else None
+                    ),
+                    (
+                        watch_specification.expected_next_action
+                        if watch_specification
+                        else None
+                    ),
+                    (
+                        watch_specification.creator
+                        if watch_specification
+                        else None
+                    ),
+                    watch_status,
+                ),
+            )
+            if disposition == "watch":
+                pilot_run = self.connection.execute(
+                    """
+                    SELECT pilot_run_id
+                    FROM recommendations
+                    WHERE property_id=? AND content_hash=?
+                      AND pilot_run_id IS NOT NULL
+                    ORDER BY rowid DESC LIMIT 1
+                    """,
+                    (property_id, baseline_content_hash),
+                ).fetchone()
+                if pilot_run is None:
+                    raise ValueError(
+                        "watch creation requires a reviewed recommendation run"
+                    )
+                self.record_watch_validation_event(
+                    disposition_id=disposition_id,
+                    property_id=property_id,
+                    pilot_run_id=str(pilot_run["pilot_run_id"]),
+                    validated_at=decided_at,
+                    outcome=outcome,
+                )
+            else:
+                self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
         return disposition_id
 
     def effective_disposition(
@@ -826,11 +913,10 @@ class IntelligenceStore:
                 elif coverage["state"] in _UNKNOWN_COVERAGE_STATES:
                     previous = self.connection.execute(
                         """
-                        SELECT r.explanation_json
-                        FROM recommendations r
-                        JOIN pilot_runs p ON p.run_id=r.pilot_run_id
-                        WHERE r.property_id=?
-                        ORDER BY p.rowid DESC,r.rowid DESC
+                        SELECT explanation_json
+                        FROM recommendations
+                        WHERE property_id=?
+                        ORDER BY rowid DESC
                         LIMIT 1
                         """,
                         (property_id,),
@@ -961,11 +1047,10 @@ class IntelligenceStore:
         if effective_run_id is None:
             latest = self.connection.execute(
                 """
-                SELECT r.pilot_run_id
-                FROM recommendations r
-                JOIN pilot_runs p ON p.run_id=r.pilot_run_id
-                WHERE r.property_id=? AND r.pilot_run_id IS NOT NULL
-                ORDER BY p.rowid DESC,r.rowid DESC LIMIT 1
+                SELECT pilot_run_id
+                FROM recommendations
+                WHERE property_id=? AND pilot_run_id IS NOT NULL
+                ORDER BY rowid DESC LIMIT 1
                 """,
                 (property_id,),
             ).fetchone()
