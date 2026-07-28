@@ -1198,7 +1198,11 @@ def _record_for_matrix(
                 AddressCandidate(
                     source="matrix_csv",
                     street=listing.address,
-                    municipality=county_record.city or municipality,
+                    municipality=(
+                        listing.municipality
+                        or county_record.city
+                        or municipality
+                    ),
                     state=listing.state,
                     postal_code=listing.postal_code,
                 ),
@@ -2049,6 +2053,17 @@ def _persist_underwriting_and_recommendations(
                 generated_at=generated_at,
                 pilot_run_id=pilot_run_id,
             )
+        default_action = result.action
+        if identity_verified and not verified_unit_count:
+            default_action = "manual_triage"
+        elif owner_identity_conflicting and default_action not in {
+            "excluded",
+            "verify_identity",
+            "human_municipal_review",
+            "reject",
+            "reject_high_risk",
+        }:
+            default_action = "manual_triage"
         action = _apply_disposition_action(
             disposition=(
                 str(disposition_row["disposition"]) if disposition_row else None
@@ -2059,19 +2074,7 @@ def _persist_underwriting_and_recommendations(
                 else None
             ),
             current_content_hash=content_hash,
-            default_action=(
-                result.action
-                if not owner_identity_conflicting
-                or result.action
-                in {
-                    "excluded",
-                    "verify_identity",
-                    "human_municipal_review",
-                    "reject",
-                    "reject_high_risk",
-                }
-                else "manual_triage"
-            ),
+            default_action=default_action,
             listing_present=listing_row is not None,
             identity_verified=identity_verified,
             in_scope=in_scope,
@@ -2280,6 +2283,13 @@ def _persist_underwriting_and_recommendations(
             "county_identity_coverage_state": county_coverage_state,
             "county_identity_material_state": material_county_state,
             "in_scope": in_scope,
+            "unit_scope_status": (
+                "verified_in_scope"
+                if in_scope
+                else "verified_out_of_scope"
+                if verified_unit_count
+                else "unknown"
+            ),
             "acquisition_qualified": bool(
                 is_acquisition_qualified(
                     scores,

@@ -207,7 +207,7 @@ class PilotTests(unittest.TestCase):
                 for row in manual_triage_csv
             )
         )
-        self.assertIn(listed["property_id"], manual_triage_md)
+        self.assertIn(listed["address"], manual_triage_md)
 
     def test_run_pilot_rejects_unsupported_municipality_for_direct_callers(
         self,

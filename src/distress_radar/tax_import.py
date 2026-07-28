@@ -38,7 +38,8 @@ def is_unpaid_status(value: object) -> bool:
         return True
     if re.search(
         r"\b(?:not|no)\s+(?:currently\s+)?"
-        r"(?:delinquent|outstanding(?:\s+balance)?|past\s+due|open)\b",
+        r"(?:delinquent|unpaid(?:\s+balance)?|"
+        r"outstanding(?:\s+balance)?|past\s+due|open)\b",
         status,
     ):
         return False
