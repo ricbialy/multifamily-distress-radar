@@ -17,7 +17,7 @@ from distress_radar.models import (
 from distress_radar.pilot import _save_owner, run_pilot
 
 
-def property_record(folio: str, address: str, units: int) -> PropertyRecord:
+def property_record(folio: str, address: str, units: int | None) -> PropertyRecord:
     return PropertyRecord(
         city_slug="hialeah_fl",
         source_name="miami_dade_property_point_view",
@@ -68,6 +68,25 @@ class MismatchPropertyCollector(FakePropertyCollector):
     def __init__(self) -> None:
         super().__init__()
         self.matrix = property_record("0400000000001", "999 OTHER AVE", 12)
+
+
+class UnknownUnitsPropertyCollector(FakePropertyCollector):
+    def __init__(self) -> None:
+        super().__init__()
+        self.matrix = property_record("0400000000001", "100 TEST AVE", None)
+
+
+class FolioFallbackPropertyCollector(FakePropertyCollector):
+    def __init__(self) -> None:
+        super().__init__()
+        self.exact_folios: list[str] = []
+
+    def lookup_address(self, address: str) -> PropertyCollectionResult:
+        return PropertyCollectionResult((), ())
+
+    def lookup_exact_folio(self, folio: str) -> PropertyCollectionResult:
+        self.exact_folios.append(folio)
+        return PropertyCollectionResult((self.matrix,), ())
 
 
 class FakeCodeCollector:
@@ -127,6 +146,87 @@ class PilotTests(unittest.TestCase):
         '1,A123,A,41,100 Test Ave,,"$2,500,000",3901,1970,COM/Sale,,'
         "Commercial/Residential Income,Income/MultiFamily,12000,,,,\n"
     )
+
+    def test_unknown_verified_units_fail_acquisition_scope_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            matrix = root / "Agent Single Line - COM.csv"
+            matrix.write_text(self.csv_text, encoding="utf-8")
+            run_pilot(
+                matrix_path=matrix,
+                database_path=root / "pilot.sqlite",
+                output_dir=root / "output",
+                municipality="hialeah",
+                generated_at="2026-07-24T12:00:00+00:00",
+                property_collector=UnknownUnitsPropertyCollector(),
+                code_collector=FakeCodeCollector(),
+            )
+            recommendations = json.loads(
+                (root / "output/recommendations.json").read_text()
+            )
+            acquisition_queue = json.loads(
+                (root / "output/acquisition_queue.json").read_text()
+            )
+
+        listed = next(
+            item for item in recommendations if "mls" in item["discovery_channels"]
+        )
+        self.assertFalse(listed["in_scope"])
+        self.assertFalse(listed["acquisition_qualified"])
+        self.assertEqual(listed["recommended_action"], "excluded")
+        self.assertIn("verified_unit_count", listed["missing_data"])
+        self.assertFalse(
+            any(item["property_id"] == listed["property_id"] for item in acquisition_queue)
+        )
+
+    def test_run_pilot_rejects_unsupported_municipality_for_direct_callers(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            matrix = root / "Agent Single Line - COM.csv"
+            matrix.write_text(self.csv_text, encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "only Hialeah"):
+                run_pilot(
+                    matrix_path=matrix,
+                    database_path=root / "pilot.sqlite",
+                    output_dir=root / "output",
+                    municipality="surfside",
+                    generated_at="2026-07-24T12:00:00+00:00",
+                    property_collector=FakePropertyCollector(),
+                    code_collector=FakeCodeCollector(),
+                )
+
+    def test_submitted_folio_falls_back_to_authoritative_exact_lookup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            matrix = root / "Agent Single Line - COM.csv"
+            matrix.write_text(
+                "MLS # Link,St,Address,Folio Number,Current Price,Type of Property\n"
+                "A123,A,100 Test Ave,04-0000-000-0001,2500000,"
+                "Income/MultiFamily\n",
+                encoding="utf-8",
+            )
+            collector = FolioFallbackPropertyCollector()
+            run_pilot(
+                matrix_path=matrix,
+                database_path=root / "pilot.sqlite",
+                output_dir=root / "output",
+                municipality="hialeah",
+                generated_at="2026-07-24T12:00:00+00:00",
+                property_collector=collector,
+                code_collector=FakeCodeCollector(),
+            )
+            recommendations = json.loads(
+                (root / "output/recommendations.json").read_text()
+            )
+
+        listed = next(
+            item for item in recommendations if "mls" in item["discovery_channels"]
+        )
+        self.assertEqual(collector.exact_folios, ["0400000000001"])
+        self.assertEqual(listed["folio"], "0400000000001")
+        self.assertTrue(listed["identity_verified"])
 
     def test_ambiguous_owner_creates_no_owner_relationship_or_alias(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
