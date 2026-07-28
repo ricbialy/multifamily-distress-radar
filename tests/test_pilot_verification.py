@@ -232,6 +232,18 @@ class PilotVerificationTests(unittest.TestCase):
                 },
             )
         )
+        self.assertTrue(
+            _evidence_value_supports_action(
+                "human_municipal_review",
+                "municipal_code_case",
+                {
+                    "case_number": "C-2-HEARING",
+                    "currently_active": True,
+                    "enforcement_stage": "hearing",
+                    "substantive_hazard": "cosmetic",
+                },
+            )
+        )
         self.assertFalse(
             _evidence_value_supports_action(
                 "human_municipal_review",
