@@ -264,6 +264,18 @@ class BridgeResoTests(unittest.TestCase):
                 SourceHealthState.DEGRADED,
                 True,
             ),
+            (
+                400,
+                CollectionErrorKind.VALIDATION,
+                SourceHealthState.SCHEMA_CHANGED,
+                False,
+            ),
+            (
+                404,
+                CollectionErrorKind.VALIDATION,
+                SourceHealthState.SCHEMA_CHANGED,
+                False,
+            ),
         ):
             with self.subTest(status=status):
 
