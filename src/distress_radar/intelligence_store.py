@@ -547,6 +547,8 @@ class IntelligenceStore:
         *,
         pilot_run_id: str | None = None,
     ) -> tuple[ListingChange, ...]:
+        if snapshot.synthetic:
+            raise ValueError("Synthetic listing snapshots cannot be persisted as evidence")
         effective_pilot_run_id = pilot_run_id or self.current_pilot_run_id
         previous_row = self.connection.execute(
             """

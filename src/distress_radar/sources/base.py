@@ -7,6 +7,7 @@ from enum import StrEnum
 class AuthorizationMode(StrEnum):
     PUBLIC = "public"
     AUTHORIZED_EXPORT = "authorized_export"
+    AUTHORIZED_API = "authorized_api"
     PAID_API = "paid_api"
     MANUAL = "manual"
     DISABLED = "disabled"

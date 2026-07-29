@@ -130,6 +130,37 @@ No credential is used by the fixture demo. See
 [`docs/AUTOMATION_RUNBOOK.md`](docs/AUTOMATION_RUNBOOK.md) for live and
 fixture workflows.
 
+## Bridge RESO Test dataset
+
+Every Bridge application is automatically approved for a machine-generated
+Test dataset. Copy its dataset code and the application's Server token from the
+Bridge dashboard into local or deployment secrets:
+
+```bash
+export BRIDGE_DATASET_ID="your-test-dataset-code"
+export BRIDGE_API_TOKEN="your-server-token"
+
+PYTHONPATH=src .venv/bin/python -m distress_radar bridge-test \
+  --output exports/bridge-test.json \
+  --top 20 \
+  --max-pages 1
+```
+
+The command uses the RESO `Property` resource, sends the token only in the
+`Authorization` header, preserves returned fields as raw record evidence, and
+exports normalized `ListingSnapshot` records with machine-readable
+`synthetic: true` provenance. `--top` is bounded to 1–200 and ordinary
+pagination is capped at 10,000 records. Pagination uses stable Bridge
+modification and listing-key ordering. Incomplete Test records are excluded
+from normalized output and disclosed in the export's rejection ledger; a page
+with no usable records still fails closed.
+
+The Test dataset is synthetic, static development data. It is useful for
+connector validation but is not evidence, must not enter acquisition rankings,
+and does not establish access to a real MLS. Production use requires the
+specific MLS dataset, feed type, fields, storage/display rights, and replication
+permission approved in Bridge.
+
 ## Evidence boundary
 
 Every new intelligence field is modeled as reported, calculated, inferred, or
