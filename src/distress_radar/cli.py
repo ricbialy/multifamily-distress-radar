@@ -162,6 +162,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="ISO-8601 timestamp for deterministic fixture output",
     )
+    bridge_test = subparsers.add_parser(
+        "bridge-test",
+        help="Fetch and normalize an approved Bridge RESO dataset",
+    )
+    bridge_test.add_argument(
+        "--dataset",
+        help="Bridge dataset code; defaults to BRIDGE_DATASET_ID",
+    )
+    bridge_test.add_argument("--output", type=Path, required=True)
+    bridge_test.add_argument("--top", type=int, default=20)
+    bridge_test.add_argument("--max-pages", type=int, default=1)
     pilot_run = subparsers.add_parser(
         "pilot-run",
         help="Run the persisted REAL-PILOT-02 qualified acquisition workflow",
@@ -401,6 +412,54 @@ def main(argv: list[str] | None = None) -> None:
                         "json_path": str(result.json_path),
                         "csv_path": str(result.csv_path),
                         "brief_path": str(result.brief_path),
+                    },
+                    indent=2,
+                )
+            )
+            return
+
+        if args.command == "bridge-test":
+            from dataclasses import asdict
+
+            from distress_radar.sources.mls.bridge_reso import BridgeResoCollector
+
+            token = os.environ.get("BRIDGE_API_TOKEN", "")
+            dataset_id = args.dataset or os.environ.get("BRIDGE_DATASET_ID", "")
+            if not dataset_id:
+                raise ValueError(
+                    "Bridge dataset is required via --dataset or BRIDGE_DATASET_ID"
+                )
+            fetched_at = datetime.now(timezone.utc).isoformat()
+            result = BridgeResoCollector(
+                dataset_id=dataset_id,
+                token=token,
+            ).collect(
+                top=args.top,
+                max_pages=args.max_pages,
+                fetched_at=fetched_at,
+            )
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(
+                json.dumps(
+                    {
+                        "source": "bridge_reso",
+                        "dataset_id": dataset_id,
+                        "fetched_at": fetched_at,
+                        "listing_count": len(result.listings),
+                        "page_count": len(result.raw_pages),
+                        "listings": [asdict(listing) for listing in result.listings],
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            print(
+                json.dumps(
+                    {
+                        "dataset_id": dataset_id,
+                        "listing_count": len(result.listings),
+                        "page_count": len(result.raw_pages),
+                        "output": str(args.output),
                     },
                     indent=2,
                 )
