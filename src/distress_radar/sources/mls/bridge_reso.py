@@ -108,6 +108,12 @@ def _http_error(status: int) -> CollectionError:
         return CollectionError(CollectionErrorKind.RATE_LIMIT, "HTTP 429", True)
     if status == 408:
         return CollectionError(CollectionErrorKind.TIMEOUT, "HTTP 408", True)
+    if 400 <= status < 500:
+        return CollectionError(
+            CollectionErrorKind.VALIDATION,
+            f"HTTP {status}",
+            False,
+        )
     return CollectionError(
         CollectionErrorKind.NETWORK,
         f"HTTP {status}",
