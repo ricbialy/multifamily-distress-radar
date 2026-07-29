@@ -448,7 +448,11 @@ def main(argv: list[str] | None = None) -> None:
                         "fetched_at": fetched_at,
                         "listing_count": len(result.listings),
                         "page_count": len(result.raw_pages),
+                        "rejection_count": len(result.rejections),
                         "listings": [asdict(listing) for listing in result.listings],
+                        "rejections": [
+                            asdict(rejection) for rejection in result.rejections
+                        ],
                     },
                     indent=2,
                 ),
@@ -460,6 +464,7 @@ def main(argv: list[str] | None = None) -> None:
                         "dataset_id": dataset_id,
                         "listing_count": len(result.listings),
                         "page_count": len(result.raw_pages),
+                        "rejection_count": len(result.rejections),
                         "output": str(args.output),
                     },
                     indent=2,

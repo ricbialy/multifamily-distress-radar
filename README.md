@@ -151,7 +151,9 @@ The command uses the RESO `Property` resource, sends the token only in the
 exports normalized `ListingSnapshot` records with machine-readable
 `synthetic: true` provenance. `--top` is bounded to 1–200 and ordinary
 pagination is capped at 10,000 records. Pagination uses stable Bridge
-modification and listing-key ordering.
+modification and listing-key ordering. Incomplete Test records are excluded
+from normalized output and disclosed in the export's rejection ledger; a page
+with no usable records still fails closed.
 
 The Test dataset is synthetic, static development data. It is useful for
 connector validation but is not evidence, must not enter acquisition rankings,

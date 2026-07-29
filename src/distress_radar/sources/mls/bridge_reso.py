@@ -35,9 +35,16 @@ class BridgeApiError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class BridgeRecordRejection:
+    listing_key: str | None
+    reason: str
+
+
+@dataclass(frozen=True)
 class BridgeCollectionResult:
     listings: tuple[ListingSnapshot, ...]
     raw_pages: tuple[dict[str, Any], ...]
+    rejections: tuple[BridgeRecordRejection, ...] = ()
     synthetic: bool = True
 
 
@@ -263,17 +270,35 @@ class BridgeResoCollector:
         observed_at = fetched_at or datetime.now(UTC).isoformat()
         raw_pages: list[dict[str, Any]] = []
         listings: list[ListingSnapshot] = []
+        rejections: list[BridgeRecordRejection] = []
         seen_keys: set[str] = set()
         for page in range(max_pages):
             payload = self._request_page(top=top, skip=page * top)
             raw_pages.append(payload)
             records = payload["value"]
             for record in records:
-                listing = self._normalize(record, fetched_at=observed_at)
+                try:
+                    listing = self._normalize(record, fetched_at=observed_at)
+                except BridgeSchemaChangedError as exc:
+                    rejections.append(
+                        BridgeRecordRejection(
+                            listing_key=_text(record.get("ListingKey")),
+                            reason=str(exc),
+                        )
+                    )
+                    continue
                 listing_key = str(record["ListingKey"])
                 if listing_key not in seen_keys:
                     seen_keys.add(listing_key)
                     listings.append(listing)
             if len(records) < top:
                 break
-        return BridgeCollectionResult(tuple(listings), tuple(raw_pages))
+        if rejections and not listings:
+            raise BridgeSchemaChangedError(
+                f"All {len(rejections)} Bridge Properties failed normalization"
+            )
+        return BridgeCollectionResult(
+            tuple(listings),
+            tuple(raw_pages),
+            tuple(rejections),
+        )
