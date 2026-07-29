@@ -250,6 +250,33 @@ class BridgeResoTests(unittest.TestCase):
                 with self.assertRaises(BridgeSchemaChangedError):
                     collector.collect(top=20, max_pages=1)
 
+    def test_mixed_valid_and_incomplete_records_are_ledgered(self) -> None:
+        collector = BridgeResoCollector(
+            dataset_id="test",
+            token="server-token",
+            opener=lambda request, timeout: FakeResponse(
+                {
+                    "value": [
+                        reso_listing(ListingKey="valid-key"),
+                        reso_listing(
+                            ListingKey="incomplete-key",
+                            UnparsedAddress=None,
+                        ),
+                    ]
+                }
+            ),
+        )
+
+        result = collector.collect(top=20, max_pages=1)
+
+        self.assertEqual(
+            [listing.source_record_id for listing in result.listings],
+            ["valid-key"],
+        )
+        self.assertEqual(len(result.rejections), 1)
+        self.assertEqual(result.rejections[0].listing_key, "incomplete-key")
+        self.assertIn("usable address", result.rejections[0].reason)
+
     def test_http_failures_are_classified_without_exposing_token(self) -> None:
         for status, kind, health, retryable in (
             (
@@ -366,14 +393,18 @@ class BridgeResoTests(unittest.TestCase):
 
             exported = output_path.read_text(encoding="utf-8")
             summary = json.loads(stdout.getvalue())
+            payload = json.loads(exported)
             self.assertEqual(summary["listing_count"], 1)
             self.assertEqual(summary["page_count"], 1)
             self.assertEqual(summary["dataset_id"], "test")
+            self.assertEqual(summary["rejection_count"], 0)
             self.assertNotIn("server-token", exported)
-            self.assertTrue(json.loads(exported)["synthetic"])
-            self.assertTrue(json.loads(exported)["listings"][0]["synthetic"])
+            self.assertTrue(payload["synthetic"])
+            self.assertEqual(payload["rejection_count"], 0)
+            self.assertEqual(payload["rejections"], [])
+            self.assertTrue(payload["listings"][0]["synthetic"])
             self.assertEqual(
-                json.loads(exported)["listings"][0]["source_record_id"],
+                payload["listings"][0]["source_record_id"],
                 "bridge-key-1",
             )
 
