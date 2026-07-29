@@ -38,6 +38,7 @@ class BridgeApiError(RuntimeError):
 class BridgeCollectionResult:
     listings: tuple[ListingSnapshot, ...]
     raw_pages: tuple[dict[str, Any], ...]
+    synthetic: bool = True
 
 
 def _text(value: object) -> str | None:
@@ -115,7 +116,7 @@ def _http_error(status: int) -> CollectionError:
 
 
 class BridgeResoCollector:
-    source_name = "bridge_reso"
+    source_name = "bridge_reso_test"
 
     def __init__(
         self,
@@ -126,10 +127,12 @@ class BridgeResoCollector:
     ) -> None:
         if not _DATASET_ID.fullmatch(dataset_id):
             raise ValueError("Bridge dataset must contain only letters, numbers, _ or -")
+        if any(ord(character) < 32 or ord(character) == 127 for character in token):
+            raise ValueError("BRIDGE_API_TOKEN contains invalid control characters")
         if not token.strip():
             raise ValueError("BRIDGE_API_TOKEN is required")
         self.dataset_id = dataset_id
-        self._token = token
+        self._token = token.strip()
         self._opener = opener
         self.spec = SourceSpec(
             name=self.source_name,
@@ -167,7 +170,7 @@ class BridgeResoCollector:
         )
         try:
             with self._opener(
-                request, self.spec.request_timeout_seconds
+                request, timeout=self.spec.request_timeout_seconds
             ) as response:
                 payload = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
@@ -196,17 +199,14 @@ class BridgeResoCollector:
         self, record: dict[str, Any], *, fetched_at: str
     ) -> ListingSnapshot:
         listing_key = _text(record.get("ListingKey"))
-        source_record_id = _text(record.get("ListingId")) or listing_key
         address = _address(record)
         if not listing_key:
             raise BridgeSchemaChangedError("Bridge Property is missing ListingKey")
-        if not source_record_id:
-            raise BridgeSchemaChangedError("Bridge Property is missing listing identity")
         if not address:
             raise BridgeSchemaChangedError("Bridge Property is missing a usable address")
         source_key = urllib.parse.quote(listing_key, safe="")
         return ListingSnapshot(
-            source_record_id=source_record_id,
+            source_record_id=listing_key,
             source_name=self.source_name,
             fetched_at=fetched_at,
             address=address,
@@ -236,6 +236,7 @@ class BridgeResoCollector:
             state=_text(record.get("StateOrProvince")),
             postal_code=_text(record.get("PostalCode")),
             raw_payload=dict(record),
+            synthetic=True,
         )
 
     def collect(
@@ -249,6 +250,10 @@ class BridgeResoCollector:
             raise ValueError("Bridge top must be between 1 and 200")
         if isinstance(max_pages, bool) or max_pages < 1:
             raise ValueError("Bridge max_pages must be at least one")
+        if top * max_pages > 10_000:
+            raise ValueError(
+                "Bridge ordinary pagination is limited to 10,000 records"
+            )
         observed_at = fetched_at or datetime.now(UTC).isoformat()
         raw_pages: list[dict[str, Any]] = []
         listings: list[ListingSnapshot] = []

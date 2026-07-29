@@ -442,7 +442,8 @@ def main(argv: list[str] | None = None) -> None:
             args.output.write_text(
                 json.dumps(
                     {
-                        "source": "bridge_reso",
+                        "source": "bridge_reso_test",
+                        "synthetic": result.synthetic,
                         "dataset_id": dataset_id,
                         "fetched_at": fetched_at,
                         "listing_count": len(result.listings),

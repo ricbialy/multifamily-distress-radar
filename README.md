@@ -148,8 +148,10 @@ PYTHONPATH=src .venv/bin/python -m distress_radar bridge-test \
 
 The command uses the RESO `Property` resource, sends the token only in the
 `Authorization` header, preserves returned fields as raw record evidence, and
-exports normalized `ListingSnapshot` records. `--top` is bounded to 1–200.
-Pagination uses stable Bridge modification and listing-key ordering.
+exports normalized `ListingSnapshot` records with machine-readable
+`synthetic: true` provenance. `--top` is bounded to 1–200 and ordinary
+pagination is capped at 10,000 records. Pagination uses stable Bridge
+modification and listing-key ordering.
 
 The Test dataset is synthetic, static development data. It is useful for
 connector validation but is not evidence, must not enter acquisition rankings,

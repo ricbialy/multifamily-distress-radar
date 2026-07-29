@@ -26,6 +26,7 @@ class ListingSnapshot:
     state: str | None = None
     postal_code: str | None = None
     raw_payload: dict[str, Any] = field(default_factory=dict)
+    synthetic: bool = False
 
     def stable_dict(self) -> dict[str, Any]:
         result = asdict(self)
