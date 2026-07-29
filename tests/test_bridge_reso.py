@@ -12,6 +12,7 @@ from typing import Self
 from unittest.mock import patch
 
 from distress_radar.cli import build_parser, main
+from distress_radar.intelligence_store import IntelligenceStore
 from distress_radar.sources.base import (
     AuthorizationMode,
     CollectionErrorKind,
@@ -82,6 +83,10 @@ class BridgeResoTests(unittest.TestCase):
             BridgeResoCollector(dataset_id="test", token="")
         with self.assertRaisesRegex(ValueError, "dataset"):
             BridgeResoCollector(dataset_id="../other", token="server-token")
+        secret = "do-not-leak-this-token"
+        with self.assertRaises(ValueError) as caught:
+            BridgeResoCollector(dataset_id="test", token=f"{secret}\n")
+        self.assertNotIn(secret, str(caught.exception))
 
     def test_normalizes_reso_property_without_inventing_missing_values(self) -> None:
         collector = BridgeResoCollector(
@@ -100,8 +105,10 @@ class BridgeResoTests(unittest.TestCase):
 
         self.assertEqual(len(result.listings), 1)
         listing = result.listings[0]
-        self.assertEqual(listing.source_name, "bridge_reso")
-        self.assertEqual(listing.source_record_id, "A123")
+        self.assertEqual(listing.source_name, "bridge_reso_test")
+        self.assertEqual(listing.source_record_id, "bridge-key-1")
+        self.assertTrue(listing.synthetic)
+        self.assertTrue(result.synthetic)
         self.assertEqual(listing.address, "100 NW 1st St")
         self.assertEqual(listing.municipality, "Hialeah")
         self.assertEqual(listing.folio, "0431010010010")
@@ -117,9 +124,11 @@ class BridgeResoTests(unittest.TestCase):
 
     def test_paginates_with_stable_order_and_authorization_header(self) -> None:
         requests = []
+        timeouts = []
 
-        def opener(request: object, timeout: float) -> FakeResponse:
+        def opener(request: object, *, timeout: float) -> FakeResponse:
             requests.append(request)
+            timeouts.append(timeout)
             query = urllib.parse.parse_qs(
                 urllib.parse.urlsplit(request.full_url).query
             )
@@ -151,9 +160,10 @@ class BridgeResoTests(unittest.TestCase):
 
         self.assertEqual(
             [listing.source_record_id for listing in result.listings],
-            ["A1", "A2", "A3"],
+            ["key-1", "key-2", "key-3"],
         )
         self.assertEqual(len(requests), 2)
+        self.assertEqual(timeouts, [30, 30])
         for index, request in enumerate(requests):
             query = urllib.parse.parse_qs(
                 urllib.parse.urlsplit(request.full_url).query
@@ -168,6 +178,59 @@ class BridgeResoTests(unittest.TestCase):
                 request.get_header("Authorization"), "Bearer server-token"
             )
             self.assertNotIn("server-token", request.full_url)
+
+    def test_listing_key_prevents_duplicate_listing_id_collisions(self) -> None:
+        collector = BridgeResoCollector(
+            dataset_id="test",
+            token="server-token",
+            opener=lambda request, timeout: FakeResponse(
+                {
+                    "value": [
+                        reso_listing(ListingKey="key-one", ListingId="DUPLICATE"),
+                        reso_listing(ListingKey="key-two", ListingId="DUPLICATE"),
+                    ]
+                }
+            ),
+        )
+
+        result = collector.collect(top=20, max_pages=1)
+
+        self.assertEqual(
+            [listing.source_record_id for listing in result.listings],
+            ["key-one", "key-two"],
+        )
+        self.assertEqual(
+            [listing.raw_payload["ListingId"] for listing in result.listings],
+            ["DUPLICATE", "DUPLICATE"],
+        )
+
+    def test_ordinary_pagination_cannot_cross_bridge_limit(self) -> None:
+        collector = BridgeResoCollector(
+            dataset_id="test",
+            token="server-token",
+            opener=lambda request, timeout: FakeResponse({"value": []}),
+        )
+
+        with self.assertRaisesRegex(ValueError, "10,000"):
+            collector.collect(top=200, max_pages=51)
+
+    def test_synthetic_records_cannot_enter_persistent_evidence(self) -> None:
+        collector = BridgeResoCollector(
+            dataset_id="test",
+            token="server-token",
+            opener=lambda request, timeout: FakeResponse(
+                {"value": [reso_listing()]}
+            ),
+        )
+        listing = collector.collect(top=20, max_pages=1).listings[0]
+
+        self.assertTrue(listing.synthetic)
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            IntelligenceStore(Path(temporary) / "radar.sqlite3") as store,
+            self.assertRaisesRegex(ValueError, "Synthetic"),
+        ):
+            store.save_listing_snapshot(listing)
 
     def test_schema_and_nonfinite_values_fail_visibly(self) -> None:
         for payload in (
@@ -295,8 +358,11 @@ class BridgeResoTests(unittest.TestCase):
             self.assertEqual(summary["page_count"], 1)
             self.assertEqual(summary["dataset_id"], "test")
             self.assertNotIn("server-token", exported)
+            self.assertTrue(json.loads(exported)["synthetic"])
+            self.assertTrue(json.loads(exported)["listings"][0]["synthetic"])
             self.assertEqual(
-                json.loads(exported)["listings"][0]["source_record_id"], "A123"
+                json.loads(exported)["listings"][0]["source_record_id"],
+                "bridge-key-1",
             )
 
 
