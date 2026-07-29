@@ -8,6 +8,7 @@ import urllib.error
 import urllib.parse
 from contextlib import redirect_stdout
 from pathlib import Path
+from typing import Self
 from unittest.mock import patch
 
 from distress_radar.cli import build_parser, main
@@ -28,7 +29,7 @@ class FakeResponse:
     def __init__(self, payload: dict[str, object]) -> None:
         self.payload = payload
 
-    def __enter__(self) -> FakeResponse:
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *args: object) -> None:
@@ -203,10 +204,14 @@ class BridgeResoTests(unittest.TestCase):
         ):
             with self.subTest(status=status):
 
-                def opener(request: object, timeout: float) -> FakeResponse:
+                def opener(
+                    request: object,
+                    timeout: float,
+                    response_status: int = status,
+                ) -> FakeResponse:
                     raise urllib.error.HTTPError(
                         request.full_url,
-                        status,
+                        response_status,
                         "failure",
                         {},
                         io.BytesIO(b'{"error":{"message":"request rejected"}}'),

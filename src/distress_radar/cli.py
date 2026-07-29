@@ -5,7 +5,7 @@ import json
 import logging
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from pathlib import Path
 
 from distress_radar.alerts import deliver_webhook
@@ -429,7 +429,7 @@ def main(argv: list[str] | None = None) -> None:
                 raise ValueError(
                     "Bridge dataset is required via --dataset or BRIDGE_DATASET_ID"
                 )
-            fetched_at = datetime.now(timezone.utc).isoformat()
+            fetched_at = datetime.now(UTC).isoformat()
             result = BridgeResoCollector(
                 dataset_id=dataset_id,
                 token=token,

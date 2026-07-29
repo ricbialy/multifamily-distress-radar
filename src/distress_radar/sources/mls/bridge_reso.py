@@ -8,7 +8,7 @@ import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from distress_radar.domain.listing import ListingSnapshot
@@ -249,7 +249,7 @@ class BridgeResoCollector:
             raise ValueError("Bridge top must be between 1 and 200")
         if isinstance(max_pages, bool) or max_pages < 1:
             raise ValueError("Bridge max_pages must be at least one")
-        observed_at = fetched_at or datetime.now(timezone.utc).isoformat()
+        observed_at = fetched_at or datetime.now(UTC).isoformat()
         raw_pages: list[dict[str, Any]] = []
         listings: list[ListingSnapshot] = []
         seen_keys: set[str] = set()
